@@ -27,7 +27,8 @@ alloy-eip2930 = { version = "0.1", default-features = false }
 alloy-eip7702 = { version = "0.5", default-features = false, features = [
     "k256",
 ] }
-alloy-primitives = { version = "0.8", default-features = false, features = [
+# Need to pin this at the moment as 0.8.22 has a breaking change with `derive_more`.
+alloy-primitives = { version = "<=0.8.21", default-features = false, features = [
     "rlp",
     "map",
 ] }
