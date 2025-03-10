@@ -11,13 +11,10 @@ use arbutil::{
     Bytes20, Bytes32,
 };
 use revm_interpreter::{Contract, Gas, Host, InterpreterAction, InterpreterResult};
-use stylus::{
-    native::NativeInstance,
-    prover::programs::{
+use stylus::{native::{self, NativeInstance}, prover::programs::{
         config::{CompileConfig, StylusConfig},
         meter::MeteredMachine,
-    },
-    run::RunProgram,
+    }, run::RunProgram
 };
 
 use crate::{
@@ -99,15 +96,8 @@ impl StylusInterpreter {
 
         let bytecode = bytecode.strip_prefix(&[0xEF, 0xF0, 0x00, 0x00]).unwrap();
 
-        let mut instance = NativeInstance::from_bytes(
-            bytecode,
-            evm_api,
-            evm_data,
-            &compile_config,
-            stylus_config,
-            wasmer_types::compilation::target::Target::default(),
-        )
-        .unwrap();
+        let serialized = native::compile(bytecode, compile_config.version, false, wasmer_types::compilation::target::Target::default()).unwrap();
+        let mut instance = unsafe { NativeInstance::deserialize(serialized.as_slice(), compile_config, evm_api, evm_data).unwrap() };
 
         let ink_limit = stylus_config
             .pricing
