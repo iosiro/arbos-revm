@@ -181,10 +181,10 @@ pub(crate) fn request<EXT, DB: Database>(
             let calldata = buffer::take_rest(&mut data);
 
             let is_static = matches!(req_type, EvmApiMethod::StaticCall) || inputs.is_static;
-            let target_address = if matches!(req_type, EvmApiMethod::DelegateCall) {
-                inputs.target_address
+            let (target_address, caller) = if matches!(req_type, EvmApiMethod::DelegateCall) {
+                (inputs.target_address, inputs.caller)
             } else {
-                bytecode_address
+                (bytecode_address, inputs.target_address)
             };
 
             if is_static && !value.is_zero() {
@@ -212,7 +212,7 @@ pub(crate) fn request<EXT, DB: Database>(
                     gas_limit,
                     bytecode_address,
                     target_address,
-                    caller: inputs.caller,
+                    caller,
                     value: crate::interpreter::CallValue::Transfer(value),
                     scheme: crate::interpreter::CallScheme::Call,
                     is_static,
