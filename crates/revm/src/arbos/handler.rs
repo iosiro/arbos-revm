@@ -180,11 +180,18 @@ pub(crate) fn request<EXT, DB: Database>(
             let gas_limit = buffer::take_u64(&mut data);
             let calldata = buffer::take_rest(&mut data);
 
-            let is_static = matches!(req_type, EvmApiMethod::StaticCall) || inputs.is_static;
-            let (target_address, caller) = if matches!(req_type, EvmApiMethod::DelegateCall) {
-                (inputs.target_address, inputs.caller)
-            } else {
-                (bytecode_address, inputs.target_address)
+            let (target_address, caller, is_static, value, scheme) = match req_type {
+                EvmApiMethod::ContractCall => {
+                    (bytecode_address, inputs.target_address, inputs.is_static, value, interpreter::CallScheme::Call)
+                }
+                EvmApiMethod::DelegateCall => {
+                    // copy value as stylus uses zero for all delegate calls
+                    (inputs.target_address, inputs.caller, inputs.is_static, inputs.call_value, interpreter::CallScheme::DelegateCall)
+                }
+                EvmApiMethod::StaticCall => {
+                    (bytecode_address, inputs.target_address, true, value, interpreter::CallScheme::StaticCall)
+                }
+                _ => unreachable!(),
             };
 
             if is_static && !value.is_zero() {
@@ -214,7 +221,7 @@ pub(crate) fn request<EXT, DB: Database>(
                     target_address,
                     caller,
                     value: crate::interpreter::CallValue::Transfer(value),
-                    scheme: crate::interpreter::CallScheme::Call,
+                    scheme,
                     is_static,
                     is_eof: false,
                 }),
