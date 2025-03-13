@@ -4,43 +4,23 @@ use arbutil::evm::{
     api::{EvmApiMethod, Gas, VecReader},
     req::RequestHandler,
 };
-use revm_interpreter::CreateInputs;
+use revm_interpreter::{
+    opcode::{self, InstructionTables},
+    CreateInputs, Interpreter, SharedMemory,
+};
 
 use crate::{
-    primitives::{Address, Bytecode, Bytes, SpecId, U256},
-    Context, Evm, FrameOrResult, FrameResult, Handler,
+    primitives::{Address, SpecId, U256},
+    Context, Evm, Frame, FrameOrResult, FrameResult, Handler,
 };
 
 use super::buffer;
-use crate::Database;
-use crate::{
-    interpreter::{
-        self,
-        gas::{sload_cost, sstore_cost, Gas as RevmGas},
-        CallInputs, CreateScheme, Host,
-    },
-    primitives::Log,
+use crate::interpreter::{
+    self,
+    gas::{sload_cost, sstore_cost, Gas as RevmGas},
+    CallInputs, CreateScheme, Host,
 };
-
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub(crate) struct StylusFrameInputs {
-    /// Calldata
-    pub input: Bytes,
-    /// Bytecode contains contract code, size of original code, analysis with gas block and jump table.
-    /// Note that current code is extended with push padding and STOP at end.
-    pub bytecode: Bytecode,
-    /// Target address of the account. Storage of this address is going to be modified.
-    pub target_address: Address,
-    /// Caller of the EVM.
-    pub caller: Address,
-    /// Value send to contract from transaction or from CALL opcodes.
-    pub call_value: U256,
-    /// If the call is static.
-    pub is_static: bool,
-    /// The gas state.
-    pub gas_limit: u64,
-}
+use crate::Database;
 
 pub(crate) type HostCallFunc = dyn Fn(
     arbutil::evm::api::EvmApiMethod,
@@ -84,10 +64,23 @@ fn wasm_account_touch<EXT, DB: Database>(
     code_cost + revm_interpreter::gas::warm_cold_cost(is_cold)
 }
 
+#[inline]
+fn step<FN, H: Host + ?Sized>(
+    opcode: usize,
+    interpeter: &mut Interpreter,
+    instruction_table: &[FN; 256],
+    host: &mut H,
+) where
+    FN: Fn(&mut Interpreter, &mut H),
+{
+    // execute instruction.
+    (instruction_table[opcode])(interpeter, host)
+}
+
 pub(crate) fn request<EXT, DB: Database>(
     context: &mut Context<EXT, DB>,
     handler: &Handler<'_, Context<EXT, DB>, EXT, DB>,
-    inputs: StylusFrameInputs,
+    stack_frame: &mut Frame,
     req_type: EvmApiMethod,
     data: Vec<u8>,
 ) -> (Vec<u8>, VecReader, Gas) {
@@ -96,7 +89,9 @@ pub(crate) fn request<EXT, DB: Database>(
     match req_type {
         EvmApiMethod::GetBytes32 => {
             let slot = buffer::take_u256(&mut data);
-            if let Some(result) = context.sload(inputs.target_address, slot) {
+            if let Some(result) =
+                context.sload(stack_frame.interpreter().contract().target_address, slot)
+            {
                 let gas = sload_cost(context.evm.spec_id(), result.is_cold);
                 (result.to_be_bytes_vec(), VecReader::new(vec![]), Gas(gas))
             } else {
@@ -107,7 +102,7 @@ pub(crate) fn request<EXT, DB: Database>(
         EvmApiMethod::SetTrieSlots => {
             let gas_left = buffer::take_u64(&mut data);
 
-            if inputs.is_static {
+            if stack_frame.interpreter().is_static {
                 return (
                     Status::WriteProtection.into(),
                     VecReader::new(vec![]),
@@ -119,7 +114,11 @@ pub(crate) fn request<EXT, DB: Database>(
             while !data.is_empty() {
                 let (key, value) = (buffer::take_u256(&mut data), buffer::take_u256(&mut data));
 
-                match context.sstore(inputs.target_address, key, value) {
+                match context.sstore(
+                    stack_frame.interpreter().contract().target_address,
+                    key,
+                    value,
+                ) {
                     Some(result) => {
                         total_cost += sstore_cost(
                             context.evm.spec_id(),
@@ -155,12 +154,12 @@ pub(crate) fn request<EXT, DB: Database>(
 
         EvmApiMethod::GetTransientBytes32 => {
             let slot = buffer::take_u256(&mut data);
-            let result = context.tload(inputs.target_address, slot);
+            let result = context.tload(stack_frame.interpreter().contract().target_address, slot);
             (result.to_be_bytes_vec(), VecReader::new(vec![]), Gas(0))
         }
 
         EvmApiMethod::SetTransientBytes32 => {
-            if inputs.is_static {
+            if stack_frame.interpreter().is_static {
                 return (
                     Status::WriteProtection.into(),
                     VecReader::new(vec![]),
@@ -169,7 +168,11 @@ pub(crate) fn request<EXT, DB: Database>(
             }
             let key = buffer::take_u256(&mut data);
             let value = buffer::take_u256(&mut data);
-            context.tstore(inputs.target_address, key, value);
+            context.tstore(
+                stack_frame.interpreter().contract().target_address,
+                key,
+                value,
+            );
             (Status::Success.into(), VecReader::new(vec![]), Gas(0))
         }
 
@@ -181,16 +184,30 @@ pub(crate) fn request<EXT, DB: Database>(
             let calldata = buffer::take_rest(&mut data);
 
             let (target_address, caller, is_static, value, scheme) = match req_type {
-                EvmApiMethod::ContractCall => {
-                    (bytecode_address, inputs.target_address, inputs.is_static, value, interpreter::CallScheme::Call)
-                }
+                EvmApiMethod::ContractCall => (
+                    bytecode_address,
+                    stack_frame.interpreter().contract().target_address,
+                    stack_frame.interpreter().is_static,
+                    value,
+                    interpreter::CallScheme::Call,
+                ),
                 EvmApiMethod::DelegateCall => {
                     // copy value as stylus uses zero for all delegate calls
-                    (inputs.target_address, inputs.caller, inputs.is_static, inputs.call_value, interpreter::CallScheme::DelegateCall)
+                    (
+                        stack_frame.interpreter().contract().target_address,
+                        stack_frame.interpreter().contract().caller,
+                        stack_frame.interpreter().is_static,
+                        stack_frame.interpreter().contract().call_value,
+                        interpreter::CallScheme::DelegateCall,
+                    )
                 }
-                EvmApiMethod::StaticCall => {
-                    (bytecode_address, inputs.target_address, true, value, interpreter::CallScheme::StaticCall)
-                }
+                EvmApiMethod::StaticCall => (
+                    bytecode_address,
+                    stack_frame.interpreter().contract().target_address,
+                    true,
+                    value,
+                    interpreter::CallScheme::StaticCall,
+                ),
                 _ => unreachable!(),
             };
 
@@ -242,6 +259,12 @@ pub(crate) fn request<EXT, DB: Database>(
 
             match result {
                 Ok(FrameResult::Call(result)) => {
+                    _ = handler.execution().insert_call_outcome(
+                        context,
+                        stack_frame,
+                        &mut SharedMemory::new(),
+                        result.clone(),
+                    );
                     gas.erase_cost(result.gas().remaining());
                     (
                         Status::Success.into(),
@@ -260,7 +283,7 @@ pub(crate) fn request<EXT, DB: Database>(
             let salt = is_create_2.then(|| buffer::take_u256(&mut data));
             let init_code = buffer::take_rest(&mut data);
 
-            if inputs.is_static {
+            if stack_frame.interpreter().is_static {
                 return (
                     [vec![0x00], "write protection".as_bytes().to_vec()].concat(),
                     VecReader::new(vec![]),
@@ -326,7 +349,7 @@ pub(crate) fn request<EXT, DB: Database>(
             let result = handler.execution().create(
                 context,
                 Box::new(CreateInputs {
-                    caller: inputs.target_address,
+                    caller: stack_frame.interpreter().contract().target_address,
                     scheme,
                     value,
                     init_code,
@@ -385,8 +408,56 @@ pub(crate) fn request<EXT, DB: Database>(
             for _ in 0..topic_count {
                 topics.push(buffer::take_bytes32(&mut data));
             }
+
+            topics.reverse();
+
             let data = buffer::take_rest(&mut data);
-            context.log(Log::new_unchecked(inputs.target_address, topics, data));
+
+            // push the logs to the evm stack
+            // this is to allow the inspector to detect the logs
+            stack_frame
+                .interpreter_mut()
+                .shared_memory
+                .resize(data.len());
+            stack_frame
+                .interpreter_mut()
+                .shared_memory
+                .set_data(0, 0, data.len(), &data.0);
+
+            for topic in topics {
+                _ = stack_frame.interpreter_mut().stack.push(topic.into());
+            }
+
+            _ = stack_frame
+                .interpreter_mut()
+                .stack
+                .push(U256::from(data.len()));
+            _ = stack_frame.interpreter_mut().stack.push(U256::ZERO);
+
+            let opcode = match topic_count {
+                0 => opcode::LOG0,
+                1 => opcode::LOG1,
+                2 => opcode::LOG2,
+                3 => opcode::LOG3,
+                4 => opcode::LOG4,
+                _ => unreachable!(),
+            };
+
+            match &handler.instruction_table {
+                InstructionTables::Plain(table) => step(
+                    opcode as usize,
+                    stack_frame.interpreter_mut(),
+                    table,
+                    context,
+                ),
+                InstructionTables::Boxed(table) => step(
+                    opcode as usize,
+                    stack_frame.interpreter_mut(),
+                    table,
+                    context,
+                ),
+            };
+
             (vec![], VecReader::new(vec![]), Gas(0))
         }
 

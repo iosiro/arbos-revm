@@ -104,13 +104,7 @@ impl<'a, EXT, DB: Database> Evm<'a, EXT, DB> {
                 .original_bytes()
                 .starts_with(STYLUS_MAGIC_BYTES)
             {
-                let stylus_interpreter = arbos::StylusInterpreter::new(
-                    stack_frame.interpreter().contract.clone(),
-                    stack_frame.interpreter().gas().limit(),
-                    stack_frame.interpreter().is_static,
-                );
-
-                stylus_interpreter.run(context, handler)
+                arbos::run_stylus_interpreter(context, handler, stack_frame)
             } else {
                 handler.execute_frame(stack_frame, &mut shared_memory, context)?
             };
@@ -160,26 +154,27 @@ impl<'a, EXT, DB: Database> Evm<'a, EXT, DB> {
                         // Break the loop if there are no more frames.
                         return Ok(result);
                     };
+
                     stack_frame = top_frame;
 
                     // Insert result to the top frame.
                     match result {
-                        FrameResult::Call(outcome) => {
+                        FrameResult::Call(ref outcome) => {
                             // return_call
                             exec.insert_call_outcome(
                                 context,
                                 stack_frame,
                                 &mut shared_memory,
-                                outcome,
+                                outcome.clone(),
                             )?
                         }
-                        FrameResult::Create(outcome) => {
+                        FrameResult::Create(ref outcome) => {
                             // return_create
-                            exec.insert_create_outcome(context, stack_frame, outcome)?
+                            exec.insert_create_outcome(context, stack_frame, outcome.clone())?
                         }
-                        FrameResult::EOFCreate(outcome) => {
+                        FrameResult::EOFCreate(ref outcome) => {
                             // return_eofcreate
-                            exec.insert_eofcreate_outcome(context, stack_frame, outcome)?
+                            exec.insert_eofcreate_outcome(context, stack_frame, outcome.clone())?
                         }
                     }
                 }

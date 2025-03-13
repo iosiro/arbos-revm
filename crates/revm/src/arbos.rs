@@ -2,6 +2,5 @@ mod buffer;
 mod handler;
 mod interpreter;
 
-pub(crate) use interpreter::StylusInterpreter;
-
+pub use interpreter::run_stylus_interpreter;
 pub use interpreter::STYLUS_MAGIC_BYTES;
