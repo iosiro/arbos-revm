@@ -403,6 +403,14 @@ pub(crate) fn request<EXT, DB: Database>(
         }
 
         EvmApiMethod::EmitLog => {
+            if stack_frame.interpreter().is_static {
+                return (
+                    "write protection".as_bytes().to_vec(),
+                    VecReader::new(vec![]),
+                    Gas(0),
+                );
+            }
+
             let topic_count = buffer::take_u32(&mut data);
             let mut topics = Vec::with_capacity(topic_count as usize);
             for _ in 0..topic_count {
