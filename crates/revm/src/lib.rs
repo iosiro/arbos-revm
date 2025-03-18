@@ -45,7 +45,7 @@ pub use journaled_state::{JournalCheckpoint, JournalEntry, JournaledState};
 #[cfg(feature = "optimism")]
 pub use optimism::{L1BlockInfo, BASE_FEE_RECIPIENT, L1_BLOCK_CONTRACT, L1_FEE_RECIPIENT};
 
-pub use arbos::STYLUS_MAGIC_BYTES;
+pub use arbos::is_stylus_bytecode;
 
 // Reexport libraries
 

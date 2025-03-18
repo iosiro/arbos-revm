@@ -1,17 +1,13 @@
 use crate::{
-    db::Database,
-    interpreter::{
+    arbos, db::Database, interpreter::{
         analysis::to_analysed, gas, return_ok, AccountLoad, InstructionResult, InterpreterResult,
         SStoreResult, SelfDestructResult, StateLoad,
-    },
-    journaled_state::JournaledState,
-    primitives::{
+    }, journaled_state::JournaledState, primitives::{
         AccessListItem, Account, Address, AnalysisKind, Bytecode, Bytes, CfgEnv, EVMError, Env,
         Eof, HashSet, Spec,
         SpecId::{self, *},
         B256, EIP7702_MAGIC_BYTES, EIP7702_MAGIC_HASH, EOF_MAGIC_BYTES, EOF_MAGIC_HASH, U256,
-    },
-    JournalCheckpoint, STYLUS_MAGIC_BYTES,
+    }, JournalCheckpoint
 };
 use std::{boxed::Box, sync::Arc};
 
@@ -340,7 +336,7 @@ impl<DB: Database> InnerEvmContext<DB> {
         // EIP-3541: Reject new contract code starting with the 0xEF byte
         if SPEC::enabled(LONDON)
             && interpreter_result.output.first() == Some(&0xEF)
-            && !interpreter_result.output.starts_with(STYLUS_MAGIC_BYTES)
+            && !arbos::is_stylus_bytecode(interpreter_result.output.as_ref())
         {
             self.journaled_state.checkpoint_revert(journal_checkpoint);
             interpreter_result.result = InstructionResult::CreateContractStartingWithEF;

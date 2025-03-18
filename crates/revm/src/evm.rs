@@ -12,7 +12,7 @@ use crate::{
         specification::SpecId, BlockEnv, CfgEnv, EVMError, EVMResult, EnvWithHandlerCfg,
         ExecutionResult, HandlerCfg, ResultAndState, TxEnv, TxKind, EOF_MAGIC_BYTES,
     },
-    Context, ContextWithHandlerCfg, Frame, FrameOrResult, FrameResult, STYLUS_MAGIC_BYTES,
+    Context, ContextWithHandlerCfg, Frame, FrameOrResult, FrameResult,
 };
 use core::fmt;
 use std::{boxed::Box, vec::Vec};
@@ -97,12 +97,11 @@ impl<'a, EXT, DB: Database> Evm<'a, EXT, DB> {
         let mut stack_frame = call_stack.last_mut().unwrap();
         loop {
             // Execute the frame.
-            let next_action = if stack_frame
+            let next_action = if arbos::is_stylus_bytecode(stack_frame
                 .interpreter()
                 .contract()
                 .bytecode
-                .original_bytes()
-                .starts_with(STYLUS_MAGIC_BYTES)
+                .original_bytes().as_ref())
             {
                 arbos::run_stylus_interpreter(context, handler, stack_frame)
             } else {

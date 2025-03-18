@@ -12,12 +12,10 @@ use arbutil::{
 };
 use revm_interpreter::{Gas, Host, Interpreter, InterpreterAction, InterpreterResult};
 use stylus::{
-    native::{self, NativeInstance},
-    prover::programs::{
+    brotli::{self, Dictionary}, native::{self, NativeInstance}, prover::programs::{
         config::{CompileConfig, StylusConfig},
         meter::MeteredMachine,
-    },
-    run::RunProgram,
+    }, run::RunProgram
 };
 
 use crate::{
@@ -30,34 +28,19 @@ use super::handler::StylusHandler;
 type EvmApiHandler<'a> =
     Arc<Box<dyn Fn(EvmApiMethod, Vec<u8>) -> (Vec<u8>, VecReader, arbutil::evm::api::Gas) + 'a>>;
 
-pub static STYLUS_MAGIC_BYTES: &[u8] = &[0xEF, 0xF0, 0x00, 0x00];
+const STYLUS_EOF_MAGIC: u8 = 0xEF;
+const STYLUS_EOF_MAGIC_SUFFIX: u8 = 0xF0;
+const STYLUS_EOF_VERSION: u8 = 0x00;
 
-// #[derive(Debug)]
-// #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-// pub(crate) struct StylusInterpreter {
-//     pub inputs: StylusFrameInputs,
-// }
+pub const STYLUS_DISCRIMINANT: &[u8] = &[
+    STYLUS_EOF_MAGIC,
+    STYLUS_EOF_MAGIC_SUFFIX,
+    STYLUS_EOF_VERSION,
+];
 
-// impl Default for StylusInterpreter {
-//     fn default() -> Self {
-//         Self::new(Contract::default(), u64::MAX, false)
-//     }
-// }
-
-//impl StylusInterpreter {
-// pub(crate) fn new(contract: Contract, gas_limit: u64, is_static: bool) -> Self {
-//     Self {
-//         inputs: StylusFrameInputs {
-//             input: contract.input,
-//             bytecode: contract.bytecode,
-//             target_address: contract.target_address,
-//             caller: contract.caller,
-//             call_value: contract.call_value,
-//             is_static,
-//             gas_limit,
-//         },
-//     }
-// }
+pub fn is_stylus_bytecode(bytecode: &[u8]) -> bool {
+    bytecode.starts_with(STYLUS_DISCRIMINANT) && bytecode.len() > STYLUS_DISCRIMINANT.len() + 1
+}
 
 pub fn run_stylus_interpreter<EXT, DB: Database>(
     context: &mut crate::Context<EXT, DB>,
@@ -74,13 +57,29 @@ pub fn run_stylus_interpreter<EXT, DB: Database>(
         arbos_cfg.ink_price,
     );
 
-    let bytecode = stack_frame
+    let prefixed_bytecode = stack_frame
         .interpreter()
         .contract()
         .bytecode
         .original_bytes();
 
-    let bytecode = bytecode.strip_prefix(&[0xEF, 0xF0, 0x00, 0x00]).unwrap();
+    let bytecode = prefixed_bytecode.strip_prefix(STYLUS_DISCRIMINANT).unwrap();
+
+    let (dictionary, compressed_bytecode) = bytecode.split_at(1);
+
+    let dictionary = match dictionary[0] {
+        0x00 => Dictionary::Empty,
+        0x01 => Dictionary::StylusProgram,
+        _ => unreachable!(),
+    };
+
+    let bytecode = brotli::decompress(compressed_bytecode, dictionary).or_else(|err| {
+        if dictionary == Dictionary::Empty {
+            Ok(compressed_bytecode.to_vec())
+        } else {
+            Err(err)
+        }
+    }).unwrap();
 
     let calldata = stack_frame.interpreter().contract().input.clone();
 
@@ -113,7 +112,7 @@ pub fn run_stylus_interpreter<EXT, DB: Database>(
     let evm_api = EvmApiRequestor::new(StylusHandler::new(unsafe_callback.clone()));
 
     let serialized = native::compile(
-        bytecode,
+        bytecode.as_slice(),
         compile_config.version,
         false,
         wasmer_types::compilation::target::Target::default(),
