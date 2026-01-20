@@ -1,0 +1,151 @@
+use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+use revm::{
+    context::LocalContextTr,
+    primitives::{B256, U256},
+};
+
+pub trait ArbitrumLocalContextTr: LocalContextTr {
+    fn stylus_pages_ever(&self) -> u16;
+    fn stylus_pages_open(&self) -> u16;
+    fn add_stylus_pages_open(&mut self, pages: u16);
+    fn set_stylus_pages_open(&mut self, pages: u16);
+    fn insert_recent_wasm(&mut self, code_hash: B256, retain: u16) -> bool;
+
+    /// Get the cached L1 transaction cost (set during validation, used during reward)
+    fn tx_l1_cost(&self) -> Option<U256>;
+    /// Set the L1 transaction cost
+    fn set_tx_l1_cost(&mut self, cost: Option<U256>);
+    /// Get the cached poster gas (L1 cost converted to L2 gas units)
+    fn poster_gas(&self) -> Option<u64>;
+    /// Set the poster gas
+    fn set_poster_gas(&mut self, gas: Option<u64>);
+}
+
+/// Local context that is filled by execution.
+#[derive(Clone, Debug)]
+pub struct ArbitrumLocalContext {
+    /// Interpreter shared memory buffer. A reused memory buffer for calls.
+    pub shared_memory_buffer: Rc<RefCell<Vec<u8>>>,
+    /// Optional precompile error message to bubble up.
+    pub precompile_error_message: Option<String>,
+    /// Stylus pages ever used in this transaction.
+    pub stylus_pages_ever: u16,
+    /// Stylus pages currently open.
+    pub stylus_pages_open: u16,
+    /// Recently invoked Stylus wasm code hashes (block-local LRU).
+    pub recent_wasms: VecDeque<B256>,
+    /// Cached L1 transaction cost (set during validation, cleared after execution)
+    pub tx_l1_cost: Option<U256>,
+    /// Cached poster gas (L1 cost converted to L2 gas units)
+    pub poster_gas: Option<u64>,
+}
+
+impl Default for ArbitrumLocalContext {
+    fn default() -> Self {
+        Self {
+            shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(1024 * 4))),
+            precompile_error_message: None,
+            stylus_pages_ever: 0,
+            stylus_pages_open: 0,
+            recent_wasms: VecDeque::new(),
+            tx_l1_cost: None,
+            poster_gas: None,
+        }
+    }
+}
+
+impl LocalContextTr for ArbitrumLocalContext {
+    fn clear(&mut self) {
+        // Sets len to 0 but it will not shrink to drop the capacity.
+        unsafe { self.shared_memory_buffer.borrow_mut().set_len(0) };
+
+        // Clear L1 fee related fields
+        self.tx_l1_cost = None;
+        self.poster_gas = None;
+    }
+
+    fn shared_memory_buffer(&self) -> &Rc<RefCell<Vec<u8>>> {
+        &self.shared_memory_buffer
+    }
+
+    fn set_precompile_error_context(&mut self, output: String) {
+        self.precompile_error_message = Some(output);
+    }
+
+    fn take_precompile_error_context(&mut self) -> Option<String> {
+        self.precompile_error_message.take()
+    }
+}
+
+impl ArbitrumLocalContextTr for ArbitrumLocalContext {
+    fn stylus_pages_ever(&self) -> u16 {
+        self.stylus_pages_ever
+    }
+
+    fn stylus_pages_open(&self) -> u16 {
+        self.stylus_pages_open
+    }
+
+    fn add_stylus_pages_open(&mut self, pages: u16) {
+        self.stylus_pages_open = self.stylus_pages_open.saturating_add(pages);
+        if self.stylus_pages_open > self.stylus_pages_ever {
+            self.stylus_pages_ever = self.stylus_pages_open;
+        }
+    }
+
+    fn set_stylus_pages_open(&mut self, pages: u16) {
+        self.stylus_pages_open = pages;
+        if self.stylus_pages_open > self.stylus_pages_ever {
+            self.stylus_pages_ever = self.stylus_pages_open;
+        }
+    }
+
+    fn insert_recent_wasm(&mut self, code_hash: B256, retain: u16) -> bool {
+        if let Some(pos) = self
+            .recent_wasms
+            .iter()
+            .position(|existing| *existing == code_hash)
+        {
+            // Move existing entry to the back to track recency.
+            if pos + 1 != self.recent_wasms.len()
+                && let Some(found) = self.recent_wasms.remove(pos)
+            {
+                self.recent_wasms.push_back(found);
+            }
+            return true;
+        }
+
+        self.recent_wasms.push_back(code_hash);
+
+        let retain = retain as usize;
+        if retain > 0 && self.recent_wasms.len() > retain {
+            self.recent_wasms.pop_front();
+        }
+
+        false
+    }
+
+    fn tx_l1_cost(&self) -> Option<U256> {
+        self.tx_l1_cost
+    }
+
+    fn set_tx_l1_cost(&mut self, cost: Option<U256>) {
+        self.tx_l1_cost = cost;
+    }
+
+    fn poster_gas(&self) -> Option<u64> {
+        self.poster_gas
+    }
+
+    fn set_poster_gas(&mut self, gas: Option<u64>) {
+        self.poster_gas = gas;
+    }
+}
+
+impl ArbitrumLocalContext {
+    /// Creates a new local context, initcodes are hashes and added to the mapping.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
