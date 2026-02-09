@@ -853,7 +853,7 @@ mod tests {
         Journal,
         context::{BlockEnv, ContextTr},
         database::EmptyDBTyped,
-        primitives::{hex::FromHex, keccak256},
+        primitives::keccak256,
         state::Bytecode,
     };
     use stylus::brotli;
@@ -907,42 +907,104 @@ mod tests {
     }
 
     #[test]
-    fn activate_program() {
+    fn test_activate_codehash_version_and_asm_size() {
+        use crate::state::{ArbState, ArbStateGetter, arbos_state::ArbosStateParams};
+
         let mut context = setup();
+        context.cfg.disable_auto_activate = true;
+        context.cfg.disable_auto_cache = true;
+
+        // Initialize ArbOS state with default params
+        context
+            .arb_state(None, false)
+            .initialize(&ArbosStateParams::default())
+            .expect("failed to initialize ArbOS state");
 
         let wat = include_bytes!("../../test-data/memory.wat");
         let program_address = deploy_program(&mut context, wat);
 
+        // Get the code hash for later queries
+        let code_hash = context
+            .arb_state(None, false)
+            .code_hash(program_address)
+            .expect("failed to get code hash");
+
+        // Activate the program via ArbWasm precompile
+        let arb_wasm_addr = address!("0x0000000000000000000000000000000000000071");
+        let call_value = U256::from(100_000_000_000_000u64);
+        context
+            .journal_mut()
+            .balance_incr(arb_wasm_addr, call_value)
+            .unwrap();
+
         let input = IArbWasm::activateProgramCall::abi_encode(&IArbWasm::activateProgramCall {
             program: program_address,
         });
-        let call_value = U256::try_from_be_slice(
-            Bytes::from_hex("0x27c652da8f88")
-                .unwrap()
-                .to_vec()
-                .as_slice(),
-        )
-        .unwrap();
-
-        context
-            .journal_mut()
-            .balance_incr(
-                address!("0x0000000000000000000000000000000000000071"),
-                call_value,
-            )
-            .unwrap();
 
         let result = ArbWasmPrecompile::run(
             &mut context,
             &input,
-            &address!("0x0000000000000000000000000000000000000071"),
+            &arb_wasm_addr,
             address!("0x000000000000000000000000000000000000c0de"),
             call_value,
             false,
             10_000_000,
         )
         .unwrap();
+        assert!(result.is_ok(), "activation failed: {:?}", result.result);
 
-        assert!(result.is_ok());
+        // Decode activation result to get the version
+        let activation = IArbWasm::activateProgramCall::abi_decode_returns(&result.output)
+            .expect("decode activation result");
+        assert!(activation.version > 0, "activated version should be > 0");
+
+        // Query codehashVersion and verify it matches the activation version
+        let input = IArbWasm::codehashVersionCall::abi_encode(&IArbWasm::codehashVersionCall {
+            codehash: code_hash,
+        });
+        let result = ArbWasmPrecompile::run(
+            &mut context,
+            &input,
+            &arb_wasm_addr,
+            address!("0x000000000000000000000000000000000000c0de"),
+            U256::ZERO,
+            true,
+            10_000_000,
+        )
+        .unwrap();
+        assert!(
+            result.is_ok(),
+            "codehashVersion failed: {:?}",
+            result.result
+        );
+        let version = IArbWasm::codehashVersionCall::abi_decode_returns(&result.output)
+            .expect("decode codehashVersion");
+        assert_eq!(
+            version, activation.version,
+            "codehashVersion should match activation version"
+        );
+
+        // Query codehashAsmSize and verify it is non-zero
+        let input = IArbWasm::codehashAsmSizeCall::abi_encode(&IArbWasm::codehashAsmSizeCall {
+            codehash: code_hash,
+        });
+        let result = ArbWasmPrecompile::run(
+            &mut context,
+            &input,
+            &arb_wasm_addr,
+            address!("0x000000000000000000000000000000000000c0de"),
+            U256::ZERO,
+            true,
+            10_000_000,
+        )
+        .unwrap();
+        assert!(
+            result.is_ok(),
+            "codehashAsmSize failed: {:?}",
+            result.result
+        );
+        let asm_size = IArbWasm::codehashAsmSizeCall::abi_decode_returns(&result.output)
+            .expect("decode codehashAsmSize");
+        assert!(asm_size > 0, "asm size should be non-zero");
     }
 }
