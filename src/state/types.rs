@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use alloy_sol_types::{SolError, sol};
 use revm::{
     context::JournalTr,
     interpreter::{
@@ -16,6 +17,12 @@ use revm::{
 
 use crate::{ArbitrumContextTr, constants::ARBOS_STATE_ADDRESS};
 use tracing::trace;
+
+sol! {
+    error ProgramNotActivated();
+    error ProgramNeedsUpgrade(uint16 version, uint16 stylusVersion);
+    error ProgramExpired(uint64 ageInSeconds);
+}
 #[derive(Debug)]
 pub enum ArbosStateError {
     OutOfGas,
@@ -76,7 +83,21 @@ impl From<ArbosStateError> for String {
 
 impl From<ArbosStateError> for Bytes {
     fn from(error: ArbosStateError) -> Self {
-        Self::from(error.to_string().into_bytes())
+        match error {
+            ArbosStateError::ProgramNotActivated => ProgramNotActivated {}.abi_encode().into(),
+            ArbosStateError::ProgramNeedsUpgrade(version, stylus_version) => ProgramNeedsUpgrade {
+                version,
+                stylusVersion: stylus_version,
+            }
+            .abi_encode()
+            .into(),
+            ArbosStateError::ProgramExpired(age) => ProgramExpired {
+                ageInSeconds: age as u64,
+            }
+            .abi_encode()
+            .into(),
+            _ => Self::from(error.to_string().into_bytes()),
+        }
     }
 }
 
@@ -128,10 +149,10 @@ impl From<ArbosStateError> for InterpreterResult {
                     output: Bytes::from(description.clone().into_bytes()),
                 }
             }
-            _ => Self {
+            other => Self {
                 result: InstructionResult::Revert,
                 gas: Gas::default(),
-                output: Bytes::default(),
+                output: Bytes::from(other),
             },
         };
 
