@@ -391,17 +391,24 @@ mod tests {
     use alloy_sol_types::SolCall;
     use revm::{
         Journal,
-        context::{BlockEnv, JournalTr},
+        context::{BlockEnv, ContextTr, JournalTr},
         database::EmptyDBTyped,
-        primitives::{U256, address},
+        primitives::{Address, Bytes, U256, address, keccak256},
+        state::Bytecode,
     };
+    use stylus::brotli;
+    use wasmer::wat2wasm;
 
     use crate::{
         ArbitrumContext, ArbitrumTransaction,
         config::ArbitrumConfig,
+        constants::STYLUS_DISCRIMINANT,
         local_context::ArbitrumLocalContext,
         precompiles::{ArbPrecompileLogic, arb_wasm_cache::ArbWasmCache},
+        state::{ArbState, ArbStateGetter, arbos_state::ArbosStateParams},
     };
+
+    use super::*;
 
     fn setup() -> ArbitrumContext<EmptyDBTyped<Infallible>> {
         let db = EmptyDBTyped::<Infallible>::default();
@@ -417,6 +424,32 @@ mod tests {
         }
     }
 
+    fn deploy_program(
+        context: &mut ArbitrumContext<EmptyDBTyped<Infallible>>,
+        wat: &[u8],
+    ) -> Address {
+        let wasm_bytes = wat2wasm(wat).unwrap();
+
+        let wasm = brotli::compress(&wasm_bytes, 11, 22, brotli::Dictionary::Empty).unwrap();
+        let wasm = {
+            let mut v = Vec::with_capacity(STYLUS_DISCRIMINANT.len() + wasm.len() + 1);
+            v.extend_from_slice(STYLUS_DISCRIMINANT);
+            v.extend_from_slice(&[0]);
+            v.extend_from_slice(&wasm);
+            v
+        };
+
+        let code_address = Address::from_slice(&keccak256(&wasm)[12..32]);
+
+        context.journal_mut().load_account(code_address).unwrap();
+
+        context
+            .journal_mut()
+            .set_code(code_address, Bytecode::new_raw(Bytes::from(wasm)));
+
+        code_address
+    }
+
     #[test]
     fn test_wasm_cache_code_hash_is_cached() {
         let mut context = setup();
@@ -424,19 +457,15 @@ mod tests {
         let codehash = [0u8; 32];
 
         let input =
-            crate::precompiles::arb_wasm_cache::IArbWasmCache::codehashIsCachedCall::abi_encode(
-                &crate::precompiles::arb_wasm_cache::IArbWasmCache::codehashIsCachedCall {
-                    codehash: codehash.into(),
-                },
-            );
+            IArbWasmCache::codehashIsCachedCall::abi_encode(&IArbWasmCache::codehashIsCachedCall {
+                codehash: codehash.into(),
+            });
 
         let result = ArbWasmCache::run(
             &mut context,
             &input,
-            &crate::precompiles::arb_wasm_cache::arb_wasm_cache_precompile::<
-                ArbitrumContext<EmptyDBTyped<Infallible>>,
-            >()
-            .address,
+            &super::arb_wasm_cache_precompile::<ArbitrumContext<EmptyDBTyped<Infallible>>>()
+                .address,
             address!("0x0000000000000000000000000000000000000001"),
             U256::ZERO,
             true,
@@ -444,8 +473,107 @@ mod tests {
         )
         .unwrap();
         let output = result.output;
-        let decoded = crate::precompiles::arb_wasm_cache::IArbWasmCache::codehashIsCachedCall::abi_decode_returns(&output)
+        let decoded = IArbWasmCache::codehashIsCachedCall::abi_decode_returns(&output)
             .expect("decode precompile output");
         assert!(!decoded);
+    }
+
+    #[test]
+    fn test_caching_flow() {
+        let mut context = setup();
+        context.cfg.disable_auto_activate = true;
+        context.cfg.disable_auto_cache = true;
+
+        // Initialize ArbOS state with default params
+        context
+            .arb_state(None, false)
+            .initialize(&ArbosStateParams::default())
+            .expect("failed to initialize ArbOS state");
+
+        let wat = include_bytes!("../../test-data/memory.wat");
+        let program_address = deploy_program(&mut context, wat);
+
+        // Get code hash
+        let code_hash = context
+            .arb_state(None, false)
+            .code_hash(program_address)
+            .expect("failed to get code hash");
+
+        // Activate the program directly (not cached)
+        let wasm_bytes = wat2wasm(wat).unwrap();
+        crate::state::program::activate_program(
+            &mut context,
+            code_hash,
+            &Bytes::from(wasm_bytes.to_vec()),
+            false,
+        )
+        .expect("activation should succeed");
+
+        let arb_wasm_cache_addr = address!("0x0000000000000000000000000000000000000072");
+        let caller = address!("0x000000000000000000000000000000000000c0de");
+
+        // Verify program is NOT cached
+        let input =
+            IArbWasmCache::codehashIsCachedCall::abi_encode(&IArbWasmCache::codehashIsCachedCall {
+                codehash: code_hash,
+            });
+        let result = ArbWasmCache::run(
+            &mut context,
+            &input,
+            &arb_wasm_cache_addr,
+            caller,
+            U256::ZERO,
+            true,
+            1_000_000,
+        )
+        .unwrap();
+        assert!(result.is_ok());
+        let is_cached = IArbWasmCache::codehashIsCachedCall::abi_decode_returns(&result.output)
+            .expect("decode codehashIsCached");
+        assert!(!is_cached, "program should not be cached initially");
+
+        // Add caller as cache manager so they can cache programs
+        context
+            .arb_state(None, false)
+            .programs()
+            .cache_managers()
+            .add(caller)
+            .expect("failed to add cache manager");
+
+        // Cache the program via cacheProgram precompile
+        let input = IArbWasmCache::cacheProgramCall::abi_encode(&IArbWasmCache::cacheProgramCall {
+            addr: program_address,
+        });
+        let result = ArbWasmCache::run(
+            &mut context,
+            &input,
+            &arb_wasm_cache_addr,
+            caller,
+            U256::ZERO,
+            false,
+            10_000_000,
+        )
+        .unwrap();
+        assert!(result.is_ok(), "cacheProgram failed: {:?}", result.result);
+
+        // Verify program IS now cached
+        let input =
+            IArbWasmCache::codehashIsCachedCall::abi_encode(&IArbWasmCache::codehashIsCachedCall {
+                codehash: code_hash,
+            });
+        let result = ArbWasmCache::run(
+            &mut context,
+            &input,
+            &arb_wasm_cache_addr,
+            caller,
+            U256::ZERO,
+            true,
+            1_000_000,
+        )
+        .unwrap();
+        assert!(result.is_ok());
+        let is_cached = IArbWasmCache::codehashIsCachedCall::abi_decode_returns(&result.output)
+            .expect("decode codehashIsCached");
+        assert!(is_cached, "program should be cached after cacheProgram");
     }
 }

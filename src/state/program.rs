@@ -375,8 +375,8 @@ where
             let init_cost = u16::from_be_bytes([data[2], data[3]]);
             let cached_cost = u16::from_be_bytes([data[4], data[5]]);
             let footprint = u16::from_be_bytes([data[6], data[7]]);
-            let activated_at = u32::from_be_bytes([0, data[8], data[9], data[10]]);
-            let asm_estimated_kb = u32::from_be_bytes([0, data[11], data[12], data[13]]);
+            let asm_estimated_kb = u32::from_be_bytes([0, data[8], data[9], data[10]]);
+            let activated_at = u32::from_be_bytes([0, data[11], data[12], data[13]]);
             let cached = data[14] != 0;
 
             return Ok(Some(ProgramInfo {
