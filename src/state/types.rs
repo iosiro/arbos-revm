@@ -368,6 +368,13 @@ where
             .sstore(ARBOS_STATE_ADDRESS, self.slot.into(), value)
             .unwrap();
 
+        // Mark ARBOS_STATE_ADDRESS as touched so CacheDB::commit persists its storage changes.
+        // Without this, sstore modifies the journal but the account remains untouched,
+        // causing CacheDB::commit to skip the account and discard all storage writes.
+        self.context
+            .journal_mut()
+            .touch_account(ARBOS_STATE_ADDRESS);
+
         Ok(())
     }
 }
