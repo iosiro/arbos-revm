@@ -330,6 +330,61 @@ fn test_e2e_massive_gas_limit() {
     }
 }
 
+/// Test that u64::MAX gas limit (as used by `arbos-cast call --trace`) does not
+/// inflate gas_used due to lossy gas→ink→gas roundtrip. The gas_to_ink conversion
+/// saturates at u64::MAX, so converting ink_left back to gas loses most of the
+/// original value. The fix computes gas_used from ink_used (a small delta) instead.
+#[test]
+fn test_e2e_gas_used_not_inflated_with_u64_max_gas_limit() {
+    // First, run with a normal gas limit to get baseline gas_used
+    let baseline_gas_used = {
+        let mut context = setup_context_with_arbos_state();
+        let wat = include_bytes!("../test-data/add.wat");
+        let program_address = deploy_wat_program(&mut context, wat);
+        let caller = Address::repeat_byte(0x01);
+        fund_account(&mut context, caller, U256::from(1_000_000_000_u64));
+        let mut evm = create_evm(context);
+        let tx = create_call_tx(program_address, vec![], 10_000_000);
+        let result = execute_tx(&mut evm, tx);
+        match result {
+            ExecutionResult::Success { gas_used, .. } => gas_used,
+            other => panic!("baseline execution failed: {:?}", other),
+        }
+    };
+
+    // Now run the same program with u64::MAX gas limit (simulating --trace)
+    let mut context = setup_context_with_arbos_state();
+    let wat = include_bytes!("../test-data/add.wat");
+    let program_address = deploy_wat_program(&mut context, wat);
+    let caller = Address::repeat_byte(0x01);
+    fund_account(&mut context, caller, U256::MAX);
+    let mut evm = create_evm(context);
+    let tx = create_call_tx(program_address, vec![], u64::MAX);
+    let result = execute_tx(&mut evm, tx);
+
+    match result {
+        ExecutionResult::Success { gas_used, .. } => {
+            // Gas used should be in the same ballpark as the baseline, not massive.
+            // A simple add program should use well under 1M gas regardless of limit.
+            assert!(
+                gas_used < 1_000_000,
+                "gas_used with u64::MAX limit should not be inflated, got: {gas_used}"
+            );
+            // Should be reasonably close to the baseline
+            assert!(
+                gas_used <= baseline_gas_used * 2,
+                "gas_used ({gas_used}) should be close to baseline ({baseline_gas_used})"
+            );
+        }
+        ExecutionResult::Revert { output, .. } => {
+            panic!("execution reverted: {:?}", output);
+        }
+        ExecutionResult::Halt { reason, .. } => {
+            panic!("execution halted: {:?}", reason);
+        }
+    }
+}
+
 /// Test execution with gas limit at the exact overflow boundary.
 #[test]
 fn test_e2e_gas_limit_at_ink_overflow_boundary() {

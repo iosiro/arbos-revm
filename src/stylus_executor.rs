@@ -552,9 +552,10 @@ where
                 .unwrap()
         };
 
+        let gas_before_stylus = gas.remaining();
         let ink_limit = stylus_config
             .pricing
-            .gas_to_ink(arbutil::evm::api::Gas(gas.remaining()));
+            .gas_to_ink(arbutil::evm::api::Gas(gas_before_stylus));
         gas.spend_all();
 
         let bytecode = match inputs.input() {
@@ -576,8 +577,16 @@ where
             Ok(outcome) => outcome,
         };
 
-        let ink_left = instance.ink_left().into();
-        let mut gas_left = stylus_config.pricing.ink_to_gas(ink_left).0;
+        let ink_left: Ink = instance.ink_left().into();
+        // Compute gas_left from ink_used rather than ink_left to avoid precision
+        // loss from saturating gas→ink conversion. When gas_limit is very large
+        // (e.g. u64::MAX from `--trace`), gas_to_ink saturates to u64::MAX and
+        // ink_to_gas(ink_left) produces a much smaller value, inflating gas_used.
+        // By computing ink_used (a small delta) and converting that, we get an
+        // accurate gas consumption regardless of the gas_limit magnitude.
+        let ink_used = ink_limit.0.saturating_sub(ink_left.0);
+        let gas_used_by_wasm = ink_to_gas_ceil(stylus_config.pricing, Ink(ink_used));
+        let mut gas_left = gas_before_stylus.saturating_sub(gas_used_by_wasm);
 
         let (kind, data) = outcome.into_data();
 
