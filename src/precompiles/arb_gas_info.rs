@@ -296,17 +296,6 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
                 interpreter_return!(gas, Bytes::from(output));
             }
             ArbGasInfo::getL1PricingSurplusCall::SELECTOR => {
-                let l1_pricing_surplus = {
-                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
-                    try_state!(gas, arb_state.l1_pricing().last_surplus().get())
-                };
-
-                let output =
-                    ArbGasInfo::getL1PricingSurplusCall::abi_encode_returns(&l1_pricing_surplus);
-
-                interpreter_return!(gas, Bytes::from(output));
-            }
-            ArbGasInfo::getLastL1PricingSurplusCall::SELECTOR => {
                 let funds_due_for_refund = {
                     let mut arb_state = context.arb_state(Some(&mut gas), is_static);
                     try_state!(
@@ -338,7 +327,18 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
 
                 let surplus = I256::from(have_funds) - need_funds;
 
-                let output = ArbGasInfo::getLastL1PricingSurplusCall::abi_encode_returns(&surplus);
+                let output = ArbGasInfo::getL1PricingSurplusCall::abi_encode_returns(&surplus);
+
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbGasInfo::getLastL1PricingSurplusCall::SELECTOR => {
+                let last_surplus = {
+                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
+                    try_state!(gas, arb_state.l1_pricing().last_surplus().get())
+                };
+
+                let output =
+                    ArbGasInfo::getLastL1PricingSurplusCall::abi_encode_returns(&last_surplus);
 
                 interpreter_return!(gas, Bytes::from(output));
             }
@@ -490,6 +490,11 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
 
                 let l2_gas_price = { context.block().basefee() };
 
+                let min_base_fee = {
+                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
+                    try_state!(gas, arb_state.l2_pricing().min_base_fee_wei().get())
+                };
+
                 let wei_for_l1_calldata = l1_gas_price.saturating_mul(U256::from(
                     revm::interpreter::gas::NON_ZERO_BYTE_MULTIPLIER_ISTANBUL,
                 ));
@@ -497,9 +502,14 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
                 let wei_per_l2_tx = wei_for_l1_calldata
                     .saturating_mul(U256::from(ARBOS_GAS_INFO_ASSUMED_SIMPLE_TX_SIZE));
 
-                let per_arb_gas_base = l2_gas_price;
-                let per_arb_gas_congestion = U256::ZERO;
-                let per_arb_gas_total = l2_gas_price;
+                let l2_gas_price_u256 = U256::from(l2_gas_price);
+                let per_arb_gas_base = if min_base_fee < l2_gas_price_u256 {
+                    min_base_fee
+                } else {
+                    l2_gas_price_u256
+                };
+                let per_arb_gas_congestion = l2_gas_price_u256.saturating_sub(per_arb_gas_base);
+                let per_arb_gas_total = l2_gas_price_u256;
 
                 let wei_for_l2_storage = U256::from(revm::interpreter::gas::SSTORE_SET)
                     .saturating_mul(U256::from(l2_gas_price));
@@ -509,9 +519,9 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
                         wei_per_l2_tx,
                         wei_for_l1_calldata,
                         wei_for_l2_storage,
-                        U256::from(per_arb_gas_base),
+                        per_arb_gas_base,
                         per_arb_gas_congestion,
-                        U256::from(per_arb_gas_total),
+                        per_arb_gas_total,
                     )),
                 );
 
@@ -525,6 +535,11 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
 
                 let l2_gas_price = { context.block().basefee() };
 
+                let min_base_fee = {
+                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
+                    try_state!(gas, arb_state.l2_pricing().min_base_fee_wei().get())
+                };
+
                 let wei_for_l1_calldata = l1_gas_price.saturating_mul(U256::from(
                     revm::interpreter::gas::NON_ZERO_BYTE_MULTIPLIER_ISTANBUL,
                 ));
@@ -532,9 +547,14 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
                 let wei_per_l2_tx = wei_for_l1_calldata
                     .saturating_mul(U256::from(ARBOS_GAS_INFO_ASSUMED_SIMPLE_TX_SIZE));
 
-                let per_arb_gas_base = l2_gas_price;
-                let per_arb_gas_congestion = U256::ZERO;
-                let per_arb_gas_total = l2_gas_price;
+                let l2_gas_price_u256 = U256::from(l2_gas_price);
+                let per_arb_gas_base = if min_base_fee < l2_gas_price_u256 {
+                    min_base_fee
+                } else {
+                    l2_gas_price_u256
+                };
+                let per_arb_gas_congestion = l2_gas_price_u256.saturating_sub(per_arb_gas_base);
+                let per_arb_gas_total = l2_gas_price_u256;
 
                 let wei_for_l2_storage = U256::from(revm::interpreter::gas::SSTORE_SET)
                     .saturating_mul(U256::from(l2_gas_price));
@@ -544,9 +564,9 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
                         wei_per_l2_tx,
                         wei_for_l1_calldata,
                         wei_for_l2_storage,
-                        U256::from(per_arb_gas_base),
+                        per_arb_gas_base,
                         per_arb_gas_congestion,
-                        U256::from(per_arb_gas_total),
+                        per_arb_gas_total,
                     )),
                 );
 
@@ -554,6 +574,17 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
             }
             ArbGasInfo::getCurrentTxL1GasFeesCall::SELECTOR => {
                 let output = ArbGasInfo::getCurrentTxL1GasFeesCall::abi_encode_returns(&U256::ZERO);
+
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbGasInfo::getGasBacklogToleranceCall::SELECTOR => {
+                let backlog_tolerance = {
+                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
+                    try_state!(gas, arb_state.l2_pricing().backlog_tolerance().get())
+                };
+
+                let output =
+                    ArbGasInfo::getGasBacklogToleranceCall::abi_encode_returns(&backlog_tolerance);
 
                 interpreter_return!(gas, Bytes::from(output));
             }

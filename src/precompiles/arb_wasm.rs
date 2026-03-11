@@ -668,8 +668,10 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                         .get_active_program(&params, &code_hash)
                 );
 
-                let output =
-                    IArbWasm::programTimeLeftCall::abi_encode_returns(&(program_info.age as u64));
+                let expiry_seconds = (params.expiry_days as u64).saturating_mul(86400);
+                let time_left = expiry_seconds.saturating_sub(program_info.age as u64);
+
+                let output = IArbWasm::programTimeLeftCall::abi_encode_returns(&time_left);
 
                 interpreter_return!(gas, Bytes::from(output));
             }

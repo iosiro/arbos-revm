@@ -230,7 +230,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
                 let requested_block: u64 = call.arbBlockNum.saturating_to();
 
                 if requested_block >= current_block || requested_block + 256 < current_block {
-                    if context.cfg().arbos_version() >= 33 {
+                    if context.cfg().arbos_version() >= 11 {
                         interpreter_revert!(
                             gas,
                             ArbSys::InvalidBlockNumber {

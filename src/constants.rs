@@ -74,7 +74,7 @@ pub const ARBOS_BATCH_POSTER_ADDRESS: Address =
 pub const ARBOS_L1_PRICER_FUNDS_ADDRESS: Address =
     address!("0xA4B00000000000000000000000000000000000f6");
 
-pub const ARBOS_GENESIS_TIMESTAMP: u32 = 1672531200; // January 1, 2023 00:00:00 GMT
+pub const ARBOS_GENESIS_TIMESTAMP: u32 = 1421388000; // January 16, 2015 (Arbitrum start time, matches nitro ArbitrumStartTime)
 
 // Arbitrum Transaction Types (EIP-2718 style)
 pub const ARBITRUM_DEPOSIT_TX_TYPE: u8 = 0x64;
