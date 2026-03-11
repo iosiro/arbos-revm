@@ -273,9 +273,18 @@ where
         self.demand().set(demand)?;
         self.last_update_time().set(time)?;
 
-        let exponent = (demand as f64) / (inertia as f64);
-        let multiplier = f64::exp(exponent);
-        let cost_per_byte = (min_price as f64 * multiplier).floor() as u64;
+        // Match nitro: exponent in basis points, then ApproxExpBasisPoints with accuracy=12
+        let exponent_bips = ONE_IN_BIPS
+            .saturating_mul(demand as i64)
+            .checked_div(inertia as i64)
+            .unwrap_or(0);
+        let multiplier = approx_exp_basis_points(exponent_bips, 12);
+        // UintSaturatingMulByBips: value * bips / OneInBips
+        let cost_per_byte = if multiplier <= 0 {
+            0u64
+        } else {
+            (min_price as u64).saturating_mul(multiplier as u64) / (ONE_IN_BIPS as u64)
+        };
         Ok(cost_per_byte.saturating_mul(temp_bytes as u64))
     }
 
@@ -586,4 +595,31 @@ pub fn activate_program<CTX: ArbitrumContextTr>(
         data_fee,
         module_hash,
     })
+}
+
+/// Basis points constant: 1.0 = 10000 bips
+const ONE_IN_BIPS: i64 = 10000;
+
+/// Approximates b * e^(x/b) using the Maclaurin series with Horner's method,
+/// where x is in basis points and b = ONE_IN_BIPS (10000).
+/// Matches nitro's `arbmath.ApproxExpBasisPoints`.
+fn approx_exp_basis_points(value: i64, accuracy: u64) -> i64 {
+    let negative = value < 0;
+    let x = if negative { -value } else { value } as u64;
+    let b = ONE_IN_BIPS as u64;
+
+    // Horner's method: res = b + x/accuracy, then iterate
+    let mut res = b + x / accuracy;
+    let mut i = accuracy - 1;
+    while i > 0 {
+        res = b + res.saturating_mul(x) / (i * b);
+        i -= 1;
+    }
+
+    if negative {
+        // e^(-x) = b^2 / res (in bips representation)
+        (b.saturating_mul(b) / res) as i64
+    } else {
+        res as i64
+    }
 }

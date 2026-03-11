@@ -5,17 +5,11 @@ use crate::{
         StorageBackedU64, StorageBackedU256, map_address, substorage,
     },
 };
-use alloy_rlp::{BufMut, Decodable, Encodable, Error, Header};
+use alloy_rlp::{Decodable, Encodable};
 use revm::{
     interpreter::Gas,
     primitives::{Address, B256, Bytes, U256},
 };
-
-#[derive(Debug, Clone)]
-enum RLPItem {
-    Address(Address),
-    Index(u64),
-}
 
 pub struct AddressTable<'a, CTX>
 where
@@ -181,74 +175,44 @@ where
         .map(Some)
     }
 
+    /// Compress an address to RLP format matching nitro's encoding:
+    /// - Known address: RLP-encoded uint64 index
+    /// - Unknown address: RLP-encoded 20-byte address
     pub fn compress(&mut self, address: Address) -> Result<Bytes, ArbosStateError> {
         if let Some(index) = self.lookup(address)? {
-            // encode as index
-            let item = RLPItem::Index(index); // stored as 1-based
             let mut out = Vec::new();
-            item.encode(&mut out);
+            index.encode(&mut out);
             Ok(Bytes::from(out))
         } else {
-            // encode as address
-            let item = RLPItem::Address(address);
             let mut out = Vec::new();
-            item.encode(&mut out);
+            address.as_slice().encode(&mut out);
             Ok(Bytes::from(out))
         }
     }
 
+    /// Decompress RLP data matching nitro's decoding:
+    /// - If decoded bytes have length 20, it's an address
+    /// - Otherwise, re-decode as uint64 index and look up
     pub fn decompress(&mut self, data: &[u8]) -> Result<(Address, u64), ArbosStateError> {
         let mut remaining = data;
-        let item = RLPItem::decode(&mut remaining)
+        let decoded_bytes = <Vec<u8>>::decode(&mut remaining)
             .map_err(|e| ArbosStateError::DecompressError(format!("RLP decode error: {e:?}")))?;
-        let consumed = data.len().saturating_sub(remaining.len()) as u64;
+        let consumed = (data.len() - remaining.len()) as u64;
 
-        match item {
-            RLPItem::Address(addr) => Ok((addr, consumed)),
-            RLPItem::Index(idx) => {
-                let addr = self.lookup_index(idx)?.ok_or_else(|| {
-                    ArbosStateError::DecompressError(
-                        "invalid index in compressed address".to_string(),
-                    )
-                })?;
-                Ok((addr, consumed))
-            }
-        }
-    }
-}
-
-impl Encodable for RLPItem {
-    fn encode(&self, out: &mut dyn BufMut) {
-        let mut payload = Vec::new();
-        match self {
-            Self::Address(addr) => {
-                // prefix discriminant then the address RLP
-                0u8.encode(&mut payload);
-                addr.encode(&mut payload);
-            }
-            Self::Index(idx) => {
-                // prefix discriminant then the index RLP
-                1u8.encode(&mut payload);
-                idx.encode(&mut payload);
-            }
-        }
-        // wrap the payload with a bytes header so decode_bytes can parse it
-        let header = Header {
-            list: false,
-            payload_length: payload.len(),
-        };
-        header.encode(out);
-        out.put_slice(&payload);
-    }
-}
-
-impl Decodable for RLPItem {
-    fn decode(data: &mut &[u8]) -> Result<Self, Error> {
-        let mut payload = Header::decode_bytes(data, true)?;
-        match u8::decode(&mut payload)? {
-            0 => Ok(Self::Address(Address::decode(&mut payload)?)),
-            1 => Ok(Self::Index(u64::decode(&mut payload)?)),
-            _ => Err(Error::Custom("unknown type")),
+        if decoded_bytes.len() == 20 {
+            let addr = Address::from_slice(&decoded_bytes);
+            Ok((addr, consumed))
+        } else {
+            // re-decode from the start as a uint64 index
+            let mut buf = data;
+            let index = u64::decode(&mut buf).map_err(|e| {
+                ArbosStateError::DecompressError(format!("RLP index decode error: {e:?}"))
+            })?;
+            let consumed = (data.len() - buf.len()) as u64;
+            let addr = self.lookup_index(index)?.ok_or_else(|| {
+                ArbosStateError::DecompressError("invalid index in compressed address".to_string())
+            })?;
+            Ok((addr, consumed))
         }
     }
 }
