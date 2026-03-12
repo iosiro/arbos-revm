@@ -1,6 +1,6 @@
 use alloy_sol_types::{SolCall, sol};
 use revm::{
-    context::JournalTr,
+    context::{Block, JournalTr},
     interpreter::{Gas, InterpreterResult},
     precompile::PrecompileId,
     primitives::{Address, Bytes, Log, U256, address, alloy_primitives::IntoLogData},
@@ -459,6 +459,16 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 ArbOwner::removeChainOwnerCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::removeChainOwnerCall, input);
 
+                    let is_member = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .is_chain_owner(call.ownerToRemove)
+                    );
+                    if !is_member {
+                        interpreter_revert!(gas, Bytes::from("tried to remove non-owner"));
+                    }
+
                     try_state!(
                         gas,
                         context
@@ -475,6 +485,19 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 ArbOwner::removeNativeTokenOwnerCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::removeNativeTokenOwnerCall, input);
 
+                    let is_member = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .is_native_token_owner(call.ownerToRemove)
+                    );
+                    if !is_member {
+                        interpreter_revert!(
+                            gas,
+                            Bytes::from("tried to remove non native token owner")
+                        );
+                    }
+
                     try_state!(
                         gas,
                         context
@@ -490,6 +513,18 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 }
                 ArbOwner::removeWasmCacheManagerCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::removeWasmCacheManagerCall, input);
+
+                    let is_member = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .programs()
+                            .cache_managers()
+                            .contains(call.manager)
+                    );
+                    if !is_member {
+                        interpreter_revert!(gas, Bytes::from("tried to remove non-manager"));
+                    }
 
                     try_state!(
                         gas,
@@ -553,12 +588,51 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 ArbOwner::setNativeTokenManagementFromCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::setNativeTokenManagementFromCall, input);
 
+                    let now = context.block().timestamp().saturating_to::<u64>();
+                    let timestamp = call.timestamp;
+
+                    if timestamp != 0 {
+                        const FEATURE_ENABLE_DELAY: u64 = 7 * 24 * 60 * 60; // one week
+                        let stored = try_state!(
+                            gas,
+                            context
+                                .arb_state(Some(&mut gas), is_static)
+                                .native_token_enabled_time()
+                                .get()
+                        );
+
+                        // If disabled or scheduled >7 days out: new must be >= now + 7 days
+                        if (stored == 0 || stored > now + FEATURE_ENABLE_DELAY)
+                            && timestamp < now + FEATURE_ENABLE_DELAY
+                        {
+                            interpreter_revert!(
+                                gas,
+                                Bytes::from(
+                                    "feature must be enabled at least 7 days in the future"
+                                )
+                            );
+                        }
+
+                        // If scheduled within 0-7 days: new must not be earlier than stored
+                        if stored > now
+                            && stored <= now + FEATURE_ENABLE_DELAY
+                            && timestamp < stored
+                        {
+                            interpreter_revert!(
+                                gas,
+                                Bytes::from(
+                                    "feature cannot be updated to a time earlier than the current scheduled enable time"
+                                )
+                            );
+                        }
+                    }
+
                     try_state!(
                         gas,
                         context
                             .arb_state(Some(&mut gas), is_static)
                             .native_token_enabled_time()
-                            .set(call.timestamp)
+                            .set(timestamp)
                     );
 
                     interpreter_return!(gas, Bytes::new());

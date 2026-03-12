@@ -3,6 +3,7 @@ use crate::{
     config::ArbitrumConfigTr,
     constants::ARBOS_L1_PRICER_FUNDS_ADDRESS,
     generate_state_mut_table,
+    local_context::ArbitrumLocalContextTr,
     macros::{interpreter_return, interpreter_revert},
     precompile_impl,
     precompiles::{ArbPrecompileLogic, ExtendedPrecompile, StateMutability},
@@ -130,6 +131,12 @@ interface ArbGasInfo {
     /// @notice Returns the L1 pricing surplus as of the last update (may be negative).
     /// Available in ArbOS version 20
     function getLastL1PricingSurplus() external view returns (int256);
+
+    /// @notice Get the max tx gas limit
+    function getMaxTxGasLimit() external view returns (uint64);
+
+    /// @notice Get the max block gas limit
+    function getMaxBlockGasLimit() external view returns (uint64);
 }
 
 }
@@ -171,6 +178,8 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
             getL1PricingFundsDueForRewardsCall(View),
             getL1PricingUnitsSinceUpdateCall(View),
             getLastL1PricingSurplusCall(View),
+            getMaxTxGasLimitCall(View),
+            getMaxBlockGasLimitCall(View),
         }
     };
 
@@ -573,7 +582,8 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
                 interpreter_return!(gas, Bytes::from(output));
             }
             ArbGasInfo::getCurrentTxL1GasFeesCall::SELECTOR => {
-                let output = ArbGasInfo::getCurrentTxL1GasFeesCall::abi_encode_returns(&U256::ZERO);
+                let poster_fee = context.local().tx_l1_cost().unwrap_or(U256::ZERO);
+                let output = ArbGasInfo::getCurrentTxL1GasFeesCall::abi_encode_returns(&poster_fee);
 
                 interpreter_return!(gas, Bytes::from(output));
             }
@@ -629,6 +639,28 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
                 let output = ArbGasInfo::getL1GasPriceEstimateCall::abi_encode_returns(
                     &l1_gas_price_estimate,
                 );
+
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbGasInfo::getMaxTxGasLimitCall::SELECTOR => {
+                let max_tx_gas_limit = {
+                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
+                    try_state!(gas, arb_state.l2_pricing().per_tx_gas_limit().get())
+                };
+
+                let output =
+                    ArbGasInfo::getMaxTxGasLimitCall::abi_encode_returns(&max_tx_gas_limit);
+
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbGasInfo::getMaxBlockGasLimitCall::SELECTOR => {
+                let max_block_gas_limit = {
+                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
+                    try_state!(gas, arb_state.l2_pricing().per_block_gas_limit().get())
+                };
+
+                let output =
+                    ArbGasInfo::getMaxBlockGasLimitCall::abi_encode_returns(&max_block_gas_limit);
 
                 interpreter_return!(gas, Bytes::from(output));
             }

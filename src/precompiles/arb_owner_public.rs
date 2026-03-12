@@ -71,6 +71,13 @@ interface ArbOwnerPublic {
     ///
     function isCalldataPriceIncreaseEnabled() external view returns (bool);
 
+    /// @notice Get how much L1 charges per non-zero byte of calldata
+    function getParentGasFloorPerToken() external view returns (uint64);
+
+    /// @notice Returns the time in epoch seconds when native token management becomes enabled
+    /// Available in ArbOS version 41
+    function getNativeTokenManagementFrom() external view returns (uint64);
+
     event ChainOwnerRectified(address rectifiedOwner);
 }
 
@@ -99,6 +106,8 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPublicPrecompil
             getBrotliCompressionLevelCall(View),
             getScheduledUpgradeCall(View),
             isCalldataPriceIncreaseEnabledCall(View),
+            getParentGasFloorPerTokenCall(View),
+            getNativeTokenManagementFromCall(View),
         }
     };
 
@@ -256,6 +265,30 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPublicPrecompil
                     &enabled,
                 );
 
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbOwnerPublic::getParentGasFloorPerTokenCall::SELECTOR => {
+                let _ = decode_call!(gas, ArbOwnerPublic::getParentGasFloorPerTokenCall, input);
+                let gas_floor = {
+                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
+                    try_state!(gas, arb_state.l1_pricing().gas_floor_per_token().get())
+                };
+                let output =
+                    ArbOwnerPublic::getParentGasFloorPerTokenCall::abi_encode_returns(&gas_floor);
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbOwnerPublic::getNativeTokenManagementFromCall::SELECTOR => {
+                let _ = decode_call!(gas, ArbOwnerPublic::getNativeTokenManagementFromCall, input);
+                let enabled_time = try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .native_token_enabled_time()
+                        .get()
+                );
+                let output = ArbOwnerPublic::getNativeTokenManagementFromCall::abi_encode_returns(
+                    &enabled_time,
+                );
                 interpreter_return!(gas, Bytes::from(output));
             }
             ArbOwnerPublic::rectifyChainOwnerCall::SELECTOR => {

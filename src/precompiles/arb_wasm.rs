@@ -464,11 +464,11 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
 
                 // refund excess
                 let refund = call_value.saturating_sub(U256::from(data_fee));
-                if let Some(error) = context
-                    .journal_mut()
-                    .transfer(*target_address, caller_address, refund)
-                    .unwrap()
-                    && !refund.is_zero()
+                if !refund.is_zero()
+                    && let Some(error) = context
+                        .journal_mut()
+                        .transfer(*target_address, caller_address, refund)
+                        .unwrap()
                 {
                     return Some(InterpreterResult {
                         result: error.into(),
