@@ -186,13 +186,13 @@ fn test_e2e_account_codehash_eoa() {
                 32,
                 "codehash output should be 32 bytes"
             );
-            // EOA should have empty code hash (keccak256 of empty = c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470)
+            // Stylus account_codehash wraps StateDB.GetCodeHash (not the EXTCODEHASH opcode),
+            // so funded EOAs should return KECCAK_EMPTY — the raw code_hash field.
             let expected_empty_hash: B256 = keccak256([]);
             let code_hash = B256::from_slice(output.data().as_ref());
-            // Note: Empty accounts may return zero hash, funded EOAs return empty code hash
-            assert!(
-                code_hash == expected_empty_hash || code_hash == B256::ZERO,
-                "EOA code hash should be empty hash or zero, got {:?}",
+            assert_eq!(
+                code_hash, expected_empty_hash,
+                "EOA code hash should be KECCAK_EMPTY, got {:?}",
                 code_hash
             );
         }
@@ -286,11 +286,15 @@ fn test_e2e_account_codehash_nonexistent() {
                 "codehash output should be 32 bytes"
             );
             let code_hash = B256::from_slice(output.data().as_ref());
-            // Non-existent account should return zero hash per EIP-1052
+            // Stylus account_codehash wraps StateDB.GetCodeHash (not the EXTCODEHASH opcode).
+            // Non-existent accounts have code_hash = KECCAK_EMPTY in their default AccountInfo,
+            // so the Stylus host should return KECCAK_EMPTY, NOT B256::ZERO.
+            // (EIP-1052 EXTCODEHASH returns zero for non-existent accounts, but that's the
+            // opcode semantics — the Stylus host bypasses that and returns the raw field.)
+            let expected_empty_hash: B256 = keccak256([]);
             assert_eq!(
-                code_hash,
-                B256::ZERO,
-                "non-existent account code hash should be zero"
+                code_hash, expected_empty_hash,
+                "non-existent account code hash should be KECCAK_EMPTY (not B256::ZERO)"
             );
         }
         ExecutionResult::Revert { output, .. } => {
