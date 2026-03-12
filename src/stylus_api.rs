@@ -699,15 +699,31 @@ where
 
             EvmApiMethod::AccountCode => {
                 let address = buffer::take_address(&mut data);
+                let gas_left = buffer::take_u64(&mut data);
+
+                // Load account info (without code) to determine warm/cold and compute gas
+                let account = context.load_account_code_hash(address).unwrap();
+                let gas = wasm_account_touch(&mut *context, account.is_cold, true);
+
+                // If not enough gas, return empty code (matching nitro behavior)
+                if gas_left < gas {
+                    return (vec![], VecReader::new(vec![]), ArbGas(gas));
+                }
+
                 let code = context.load_account_code(address).unwrap();
-                let gas = wasm_account_touch(context, code.is_cold, true);
                 (vec![], VecReader::new(code.to_vec()), ArbGas(gas))
             }
 
             EvmApiMethod::AccountCodeHash => {
                 let address = buffer::take_address(&mut data);
-                let code_hash = context.load_account_code_hash(address).unwrap();
-                let gas = wasm_account_touch(context, code_hash.is_cold, false);
+                // Use load_account to get the raw code_hash (KECCAK_EMPTY for no-code
+                // accounts) instead of Host::load_account_code_hash which applies
+                // EIP-1052 EXTCODEHASH semantics (B256::ZERO for empty accounts).
+                // The Stylus host wraps StateDB.GetCodeHash, not the EXTCODEHASH opcode.
+                let account = context.journal_mut().load_account(address).unwrap();
+                let is_cold = account.is_cold;
+                let code_hash = account.data.info.code_hash;
+                let gas = wasm_account_touch(&mut *context, is_cold, false);
                 (code_hash.to_vec(), VecReader::new(vec![]), ArbGas(gas))
             }
 
