@@ -23,6 +23,7 @@ use tracing::{debug, trace, warn};
 
 use crate::{
     ArbitrumContextTr, ArbitrumEvm, Utf8OrHex, buffer,
+    config::ArbitrumConfigTr,
     local_context::ArbitrumLocalContextTr,
     state::{ArbState, ArbStateGetter},
     stylus_executor::stylus_call_cost,
@@ -133,33 +134,30 @@ where
             );
         }
 
-        let gas_limit = if self
-            .ctx()
-            .cfg()
-            .spec()
-            .into()
-            //.into_eth_spec()
-            .is_enabled_in(SpecId::TANGERINE)
-        {
-            min(gas_left - gas_left / 64, gas_limit)
-        } else {
-            gas_limit
-        };
-
-        let mut gas = Gas::new(gas_limit);
-        if !gas.record_cost(warm_cold_cost(
+        // Compute base cost (warm/cold account touch) first, then apply 63/64 rule.
+        // Nitro: startGas = SaturatingUSub(gasLeft, baseCost) * 63 / 64
+        let base_cost = warm_cold_cost(
             self.ctx()
                 .journal_mut()
                 .load_account(bytecode_address)
                 .unwrap()
                 .is_cold,
-        )) {
-            return (
-                Status::OutOfGas.into(),
-                VecReader::new(vec![]),
-                ArbGas(gas.spent()),
-            );
-        }
+        );
+
+        let gas_limit = if self
+            .ctx()
+            .cfg()
+            .spec()
+            .into()
+            .is_enabled_in(SpecId::TANGERINE)
+        {
+            let after_base = gas_left.saturating_sub(base_cost);
+            min(after_base - after_base / 64, gas_limit)
+        } else {
+            gas_limit
+        };
+
+        let mut gas = Gas::new(gas_limit);
 
         let first_frame_input = FrameInput::Call(Box::new(CallInputs {
             input: CallInput::Bytes(calldata),
@@ -297,16 +295,6 @@ where
             ArbGas(gas_remaining),
         );
 
-        if is_create_2 && !spec.is_enabled_in(SpecId::PETERSBURG) {
-            debug!(
-                target: "arbos-revm::stylus-api",
-                target_address = %input.target_address,
-                "CREATE2 not enabled for current spec"
-            );
-            return error_response;
-        }
-
-        let mut gas_cost = 0;
         let len = init_code.len();
 
         if len != 0 && spec.is_enabled_in(SpecId::SHANGHAI) {
@@ -321,22 +309,24 @@ where
                 );
                 return error_response;
             }
-            gas_cost = initcode_cost(len);
+        }
+
+        // Nitro: baseCost = params.CreateGas, plus keccak cost for CREATE2
+        // Both CREATE and CREATE2 pay CreateGas; CREATE2 additionally pays keccak word cost
+        let mut gas_cost = revm::interpreter::gas::CREATE;
+        if is_create_2 {
+            let keccak_words = (len as u64).div_ceil(32);
+            gas_cost = gas_cost.saturating_add(keccak_words.saturating_mul(6)); // Keccak256WordGas = 6
+        }
+        if len != 0 && spec.is_enabled_in(SpecId::SHANGHAI) {
+            gas_cost = gas_cost.saturating_add(initcode_cost(len));
         }
 
         let scheme = if is_create_2 {
-            if let Some(check_cost) = revm::interpreter::gas::create2_cost(len)
-                .and_then(|cost| gas_cost.checked_add(cost))
-            {
-                gas_cost = check_cost;
-            } else {
-                return error_response;
-            };
             CreateScheme::Create2 {
                 salt: salt.unwrap(),
             }
         } else {
-            gas_cost += revm::interpreter::gas::CREATE;
             CreateScheme::Create
         };
 
@@ -348,10 +338,11 @@ where
                 gas_remaining,
                 "Insufficient gas for Stylus create"
             );
+            // Nitro returns remaining gas on error, not 0
             return (
                 [vec![0x00], "out of gas".as_bytes().to_vec()].concat(),
                 VecReader::new(vec![]),
-                ArbGas(0),
+                ArbGas(gas_remaining),
             );
         }
 
@@ -584,11 +575,13 @@ where
                                     total_cost,
                                     "SetTrieSlots ran out of gas"
                                 );
-                                return (
-                                    Status::OutOfGas.into(),
-                                    VecReader::new(vec![]),
-                                    ArbGas(gas_left),
-                                );
+                                // Nitro: ArbOS < 50 returns Failure, >= 50 returns OutOfGas
+                                let status = if self.ctx().cfg().arbos_version() < 50 {
+                                    Status::Failure
+                                } else {
+                                    Status::OutOfGas
+                                };
+                                return (status.into(), VecReader::new(vec![]), ArbGas(gas_left));
                             }
                         }
                         _ => {
