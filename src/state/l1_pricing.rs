@@ -1,7 +1,8 @@
-use revm::primitives::{Address, B256, U256};
+use revm::primitives::{Address, B256, I256, U256};
 
 use crate::{
     ArbitrumContextTr,
+    math::big_mul_by_bips,
     state::types::{
         ArbosStateError, StorageBackedAddress, StorageBackedAddressSet, StorageBackedI256,
         StorageBackedTr, StorageBackedU64, StorageBackedU256, map_address, substorage,
@@ -153,6 +154,174 @@ impl<'a, CTX: ArbitrumContextTr> L1Pricing<'a, CTX> {
             per_batch_gas_cost: self.per_batch_gas_cost().get()?,
             amortized_cost_cap_bips: self.amortized_cost_cap_bips().get()?,
         })
+    }
+
+    /// Processes a batch poster spending report, updating L1 pricing state.
+    ///
+    /// This implements the core L1 fee accounting: allocates calldata units,
+    /// records poster debt, accrues rewards, settles payments from the fee
+    /// pool, and adjusts the per-unit price using a signed-derivative
+    /// convergence algorithm.
+    ///
+    /// Matches nitro `l1pricing.go:320-516`. Actual ETH transfers are omitted
+    /// (state accounting only) since arbos-revm is a testing tool.
+    pub fn update_for_batch_poster_spending(
+        &mut self,
+        update_time: u64,
+        current_time: u64,
+        batch_poster: Address,
+        mut wei_spent: U256,
+        l1_basefee: U256,
+    ) -> Result<(), ArbosStateError> {
+        // --- Step 1: Time allocation fraction ---
+        let mut last_update_time = self.last_update_time().get()?;
+
+        // First-update guard when lastUpdateTime==0
+        // Matches nitro l1pricing.go:356-357
+        if last_update_time == 0 && update_time > 0 {
+            last_update_time = update_time - 1;
+        }
+
+        // Time bounds validation
+        // Matches nitro l1pricing.go:359
+        if update_time > current_time || update_time < last_update_time {
+            return Err(ArbosStateError::InvalidTime);
+        }
+
+        let (alloc_num, alloc_denom) = {
+            let denom = current_time.saturating_sub(last_update_time);
+            let num = update_time.saturating_sub(last_update_time);
+            if denom == 0 {
+                (1u64, 1u64)
+            } else {
+                (num, denom)
+            }
+        };
+
+        let units_since = self.units_since_update().get()?;
+        let units_allocated = units_since
+            .saturating_mul(alloc_num)
+            .checked_div(alloc_denom)
+            .unwrap_or(0);
+        self.units_since_update()
+            .set(units_since.saturating_sub(units_allocated))?;
+
+        // --- Step 2: Amortized cost cap ---
+        let cost_cap_bips = self.amortized_cost_cap_bips().get()?;
+        if cost_cap_bips != 0 && units_allocated > 0 {
+            let baseline = l1_basefee.saturating_mul(U256::from(units_allocated));
+            let cap = big_mul_by_bips(baseline, cost_cap_bips as i64);
+            if cap < wei_spent {
+                wei_spent = cap;
+            }
+        }
+
+        // --- Step 3: Record batch poster debt ---
+        {
+            let mut table = self.batch_poster_table();
+            let due = table.get(batch_poster).funds_due().get()?;
+            table
+                .get(batch_poster)
+                .funds_due()
+                .set(due.saturating_add(wei_spent))?;
+        }
+
+        // --- Step 4: Accumulate rewards ---
+        let per_unit_reward = self.per_unit_reward().get()?;
+        let reward_increment =
+            I256::try_from(U256::from(per_unit_reward).saturating_mul(U256::from(units_allocated)))
+                .unwrap_or(I256::MAX);
+        let funds_due_for_rewards = self.funds_due_for_rewards().get()?;
+        self.funds_due_for_rewards()
+            .set(funds_due_for_rewards.saturating_add(reward_increment))?;
+
+        // --- Step 5: Settle rewards (accounting only, no transfer) ---
+        // Only pay current period's reward, not all accumulated debt.
+        // Matches nitro l1pricing.go:417-421
+        let mut l1_fees_available = self.l1_fees_available().get()?;
+        let funds_due_for_rewards = self.funds_due_for_rewards().get()?;
+        {
+            let payment_for_rewards =
+                U256::from(per_unit_reward).saturating_mul(U256::from(units_allocated));
+            let payment_for_rewards = payment_for_rewards.min(l1_fees_available);
+            let payment_i256 = I256::try_from(payment_for_rewards).unwrap_or(I256::MAX);
+            let new_funds_due = funds_due_for_rewards.saturating_sub(payment_i256);
+            self.funds_due_for_rewards().set(new_funds_due)?;
+            l1_fees_available = l1_fees_available.saturating_sub(payment_for_rewards);
+            self.l1_fees_available().set(l1_fees_available)?;
+        }
+
+        // --- Step 6: Settle poster refund (accounting only, no transfer) ---
+        {
+            let poster_due = self
+                .batch_poster_table()
+                .get(batch_poster)
+                .funds_due()
+                .get()?;
+            if !poster_due.is_zero() {
+                let payment = poster_due.min(l1_fees_available);
+                self.batch_poster_table()
+                    .get(batch_poster)
+                    .funds_due()
+                    .set(poster_due.saturating_sub(payment))?;
+                l1_fees_available = l1_fees_available.saturating_sub(payment);
+                self.l1_fees_available().set(l1_fees_available)?;
+            }
+        }
+
+        // --- Step 7: Update last update time ---
+        self.last_update_time().set(update_time)?;
+
+        // --- Step 8: Price adjustment (only if units were allocated) ---
+        if units_allocated > 0 {
+            // Compute surplus = l1_fees_available - (total_funds_due + funds_due_for_rewards)
+            let total_funds_due_i256 = self.batch_poster_table().total_funds_due().get()?;
+            let funds_due_for_rewards = self.funds_due_for_rewards().get()?;
+            let l1_fees_i256 = I256::try_from(l1_fees_available).unwrap_or(I256::MAX);
+            let obligations = total_funds_due_i256.saturating_add(funds_due_for_rewards);
+            let surplus = l1_fees_i256.saturating_sub(obligations);
+
+            let equilibration_units = self.equilibration_units().get()?;
+            let inertia = self.inertia().get()?;
+            let last_surplus = self.last_surplus().get()?;
+            let current_price = I256::try_from(self.price_per_unit().get()?).unwrap_or(I256::MAX);
+
+            if !equilibration_units.is_zero() {
+                let eq_i256 = I256::try_from(equilibration_units).unwrap_or(I256::MAX);
+                let units_i256 = I256::try_from(U256::from(units_allocated)).unwrap_or(I256::MAX);
+                let inertia_units =
+                    eq_i256 / I256::try_from(U256::from(inertia)).unwrap_or(I256::ONE);
+
+                // desired_derivative = -surplus / equilibration_units
+                let desired_derivative = surplus.checked_neg().unwrap_or(I256::ZERO) / eq_i256;
+
+                // actual_derivative = (surplus - last_surplus) / units_allocated
+                let actual_derivative = surplus.saturating_sub(last_surplus) / units_i256;
+
+                // change_derivative_by = desired - actual
+                let change_derivative_by = desired_derivative.saturating_sub(actual_derivative);
+
+                // price_change = change_derivative_by * units_allocated / (units_allocated + inertia_units)
+                let alloc_plus_inert = units_i256.saturating_add(inertia_units);
+                let price_change = if alloc_plus_inert.is_zero() {
+                    I256::ZERO
+                } else {
+                    change_derivative_by.saturating_mul(units_i256) / alloc_plus_inert
+                };
+
+                let new_price = current_price.saturating_add(price_change);
+                let new_price_u256 = if new_price.is_negative() {
+                    U256::ZERO
+                } else {
+                    U256::from(new_price.into_raw())
+                };
+                self.price_per_unit().set(new_price_u256)?;
+            }
+
+            self.last_surplus().set(surplus)?;
+        }
+
+        Ok(())
     }
 }
 

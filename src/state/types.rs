@@ -34,6 +34,7 @@ pub enum ArbosStateError {
     ProgramExpired(u32),
     RectifyMappingNotOwner,
     RectifyMappingNoChange,
+    InvalidTime,
     Context(String),
 }
 
@@ -67,6 +68,9 @@ impl Display for ArbosStateError {
             }
             Self::RectifyMappingNoChange => {
                 write!(f, "RectifyMapping: Owner address is correctly mapped")
+            }
+            Self::InvalidTime => {
+                write!(f, "invalid timestamp")
             }
             Self::Context(err) => {
                 write!(f, "Context error: {err}")

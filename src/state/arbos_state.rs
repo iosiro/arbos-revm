@@ -212,6 +212,23 @@ where
     }
 }
 
+impl<'a, CTX> ArbStateWrapper<'a, CTX>
+where
+    CTX: ArbitrumContextTr,
+{
+    /// Stub: checks whether an ArbOS version upgrade is due and applies it.
+    ///
+    /// In the full nitro implementation this walks through migration cases
+    /// up to v51. Since arbos-revm is a testing tool, the version is set
+    /// via `ArbitrumConfig` directly and no migrations are needed.
+    pub fn upgrade_arbos_version_if_necessary(
+        &mut self,
+        _current_timestamp: u64,
+    ) -> Result<(), ArbosStateError> {
+        Ok(())
+    }
+}
+
 impl<'a, CTX> ArbStateGetter<CTX> for ArbStateWrapper<'a, CTX>
 where
     CTX: ArbitrumContextTr,

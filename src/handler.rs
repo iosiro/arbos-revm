@@ -1,7 +1,10 @@
 use std::ops::Deref;
 
+use alloy_sol_types::{SolCall, sol};
+
 use crate::{
     ArbitrumContextTr,
+    config::ArbitrumConfigTr,
     constants::{
         ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE,
         ARBOS_ADDRESS, ARBOS_L1_PRICER_FUNDS_ADDRESS,
@@ -9,7 +12,7 @@ use crate::{
     l1_fee,
     local_context::ArbitrumLocalContextTr,
     state::{ArbState, ArbStateGetter, types::StorageBackedTr},
-    transaction::ArbitrumTxTr,
+    transaction::{ArbitrumInternalTx, ArbitrumTxTr},
 };
 use revm::{
     Inspector,
@@ -24,9 +27,15 @@ use revm::{
     },
     inspector::{InspectorEvmTr, InspectorHandler},
     interpreter::interpreter::EthInterpreter,
-    primitives::{Bytes, TxKind, U256},
+    primitives::{Address, Bytes, TxKind, U256},
     state::EvmState,
 };
+
+sol! {
+    function startBlock(uint256 l1BaseFee, uint64 l1BlockNumber, uint64 l2BlockNumber, uint64 timePassed);
+    function batchPostingReport(uint256 batchTimestamp, address batchPosterAddress, uint64 batchNumber, uint64 batchDataGas, uint256 l1BaseFeeWei);
+    function batchPostingReportV2(uint256 batchTimestamp, address batchPosterAddress, uint64 batchNumber, uint64 batchCalldataLength, uint64 batchCalldataNonZeros, uint64 batchExtraGas, uint256 l1BaseFeeWei);
+}
 
 pub struct ArbitrumHandler<EVM, ERROR, FRAME> {
     /// Mainnet handler allows us to use functions from the mainnet handler inside Arbitrum
@@ -111,13 +120,11 @@ where
 
     /// Executes an Arbitrum internal transaction.
     ///
-    /// Internal transactions are sent by ArbOS to update system state:
-    /// - Update L1 pricing
-    /// - Update block info (timestamps, etc.)
-    /// - Reap expired retryables
+    /// Internal transactions are sent by ArbOS to update system state.
+    /// Dispatches to `startBlock` or `batchPostingReport` based on the
+    /// 4-byte selector in `tx.input()`.
     ///
-    /// For now, we just validate and succeed without executing state updates,
-    /// since full ArbOS state management would require additional implementation.
+    /// Matches nitro `internal_tx.go:68-141`.
     fn execute_internal_tx(&mut self, evm: &mut EVM) -> Result<ExecutionResult<HaltReason>, ERROR> {
         let ctx = evm.ctx();
         let caller = ctx.tx().caller();
@@ -129,11 +136,36 @@ where
             ));
         }
 
-        // For now, just succeed without applying state updates
-        // Full implementation would parse tx.input() and apply updates to ArbOS state
-        // similar to ApplyInternalTxUpdate in nitro
+        let input = ctx.tx().input().clone();
+        let arbos_version = ctx.cfg().arbos_version() as u64;
+        let current_time = ctx.block().timestamp().saturating_to::<u64>();
+
+        if input.len() >= 4 {
+            let selector: [u8; 4] = input[..4].try_into().unwrap_or_default();
+
+            match selector {
+                <startBlockCall as SolCall>::SELECTOR => {
+                    self.handle_start_block(evm, &input[4..], arbos_version, current_time);
+                }
+                <batchPostingReportCall as SolCall>::SELECTOR => {
+                    self.handle_batch_posting_report(evm, &input[4..], current_time);
+                }
+                s if s == ArbitrumInternalTx::BATCH_POSTING_REPORT_V2_METHOD => {
+                    self.handle_batch_posting_report_v2(
+                        evm,
+                        &input[4..],
+                        arbos_version,
+                        current_time,
+                    );
+                }
+                _ => {
+                    // Unknown internal TX type — ignore silently
+                }
+            }
+        }
 
         // Commit the transaction
+        let ctx = evm.ctx();
         ctx.journal_mut().commit_tx();
         ctx.local_mut().clear();
         evm.frame_stack().clear();
@@ -146,6 +178,231 @@ where
             output: revm::context::result::Output::Call(Bytes::new()),
             logs: Vec::new(),
         })
+    }
+
+    /// Handles the `startBlock` internal transaction.
+    ///
+    /// 1. Processes parent block hash (EIP-2935, ArbOS >= 40)
+    /// 2. Records new L1 block hash (only when l1_block_number > old)
+    /// 3. Reaps up to 2 expired retryables
+    /// 4. Updates L2 pricing model
+    /// 5. Checks for ArbOS version upgrades
+    ///
+    /// Matches nitro `internal_tx.go:68-109`.
+    fn handle_start_block(
+        &self,
+        evm: &mut EVM,
+        data: &[u8],
+        arbos_version: u64,
+        current_time: u64,
+    ) {
+        let Ok(decoded) = startBlockCall::abi_decode(data) else {
+            return;
+        };
+
+        let mut l1_block_number = decoded.l1BlockNumber;
+        let time_passed = decoded.timePassed;
+
+        // Version corrections (nitro internal_tx.go:89-92)
+        if arbos_version < 8 {
+            l1_block_number = l1_block_number.saturating_add(1);
+        }
+
+        let ctx = evm.ctx();
+
+        // For ArbOS >= 40, call EIP-2935 ProcessParentBlockHash.
+        // TODO: revm does not expose ProcessParentBlockHash directly;
+        // implement when revm gains EIP-2935 system-call support.
+
+        // Use B256::ZERO as the previous block hash placeholder.
+        // In production nitro this is evm.Context.GetHash(blockNumber - 1),
+        // but we don't have access to the block hash oracle here.
+        // TODO: Pass the actual previous block hash when the execution context
+        // provides access to block hash history.
+        let prev_hash = revm::primitives::B256::ZERO;
+
+        // Only call record_new_l1_block when l1_block_number > old_l1_block_number
+        // (nitro internal_tx.go:97-99)
+        let old_l1_block_number = ctx
+            .arb_state(None, false)
+            .blockhashes()
+            .l1_block_number()
+            .get()
+            .unwrap_or(0);
+
+        if l1_block_number > old_l1_block_number {
+            // Pass l1_block_number - 1 to record_new_l1_block (nitro internal_tx.go:98)
+            let _ = ctx
+                .arb_state(None, false)
+                .blockhashes()
+                .record_new_l1_block(l1_block_number - 1, prev_hash, arbos_version);
+        }
+
+        // Reap up to 2 expired retryable tickets
+        let _ = ctx
+            .arb_state(None, false)
+            .retryable_state()
+            .try_to_reap_one_retryable(current_time);
+        let _ = ctx
+            .arb_state(None, false)
+            .retryable_state()
+            .try_to_reap_one_retryable(current_time);
+
+        // Update L2 pricing model
+        let _ = ctx
+            .arb_state(None, false)
+            .l2_pricing()
+            .update_pricing_model(time_passed);
+
+        // Check for ArbOS version upgrade (stub)
+        let _ = ctx
+            .arb_state(None, false)
+            .upgrade_arbos_version_if_necessary(current_time);
+    }
+
+    /// Handles the `batchPostingReport` internal transaction.
+    ///
+    /// Computes L1 spending and forwards to L1 pricing settlement.
+    fn handle_batch_posting_report(&self, evm: &mut EVM, data: &[u8], current_time: u64) {
+        let Ok(decoded) = batchPostingReportCall::abi_decode(data) else {
+            return;
+        };
+
+        let batch_timestamp = decoded.batchTimestamp.saturating_to::<u64>();
+        let batch_poster = decoded.batchPosterAddress;
+        let batch_data_gas = decoded.batchDataGas;
+        let l1_base_fee_wei = decoded.l1BaseFeeWei;
+
+        let ctx = evm.ctx();
+
+        // Compute gas spent: per_batch_gas_cost + batch_data_gas
+        let per_batch_gas_cost = ctx
+            .arb_state(None, false)
+            .l1_pricing()
+            .per_batch_gas_cost()
+            .get()
+            .unwrap_or(0);
+        let gas_spent = U256::from(per_batch_gas_cost).saturating_add(U256::from(batch_data_gas));
+        let wei_spent = l1_base_fee_wei.saturating_mul(gas_spent);
+
+        // Ensure batch poster is registered
+        let _ = ctx
+            .arb_state(None, false)
+            .l1_pricing()
+            .batch_poster_table()
+            .add_if_missing(batch_poster, batch_poster);
+
+        let _ = ctx
+            .arb_state(None, false)
+            .l1_pricing()
+            .update_for_batch_poster_spending(
+                batch_timestamp,
+                current_time,
+                batch_poster,
+                wei_spent,
+                l1_base_fee_wei,
+            );
+    }
+
+    /// Handles the `batchPostingReportV2` internal transaction.
+    ///
+    /// V2 adds `batchExtraGas` field and uses calldata stats (length + non-zeros)
+    /// instead of a single `batchDataGas` value. Computes gas spent using the
+    /// legacy cost formula plus extra gas and per-batch gas cost.
+    ///
+    /// Matches nitro `internal_tx.go:142-195`.
+    fn handle_batch_posting_report_v2(
+        &self,
+        evm: &mut EVM,
+        data: &[u8],
+        arbos_version: u64,
+        current_time: u64,
+    ) {
+        let Ok(decoded) = batchPostingReportV2Call::abi_decode(data) else {
+            return;
+        };
+
+        let batch_timestamp = decoded.batchTimestamp.saturating_to::<u64>();
+        let batch_poster = decoded.batchPosterAddress;
+        let batch_calldata_length = decoded.batchCalldataLength;
+        let batch_calldata_non_zeros = decoded.batchCalldataNonZeros;
+        let batch_extra_gas = decoded.batchExtraGas;
+        let l1_base_fee_wei = decoded.l1BaseFeeWei;
+
+        let ctx = evm.ctx();
+
+        // Compute legacy cost for stats (nitro arbostypes/incomingmessage.go:169-176)
+        // gas = TxDataZeroGas*(length-nonZeros) + TxDataNonZeroGasEIP2028*nonZeros
+        //     + Keccak256Gas + WordsForBytes(length)*Keccak256WordGas
+        //     + 2*SstoreSetGasEIP2200
+        let tx_data_zero_gas: u64 = 4;
+        let tx_data_non_zero_gas_eip2028: u64 = 16;
+        let keccak256_gas: u64 = 30;
+        let keccak256_word_gas: u64 = 6;
+        let sstore_set_gas_eip2200: u64 = 20000;
+        let words_for_bytes = batch_calldata_length.saturating_add(31) / 32;
+
+        let mut gas_spent: u64 = tx_data_zero_gas
+            .saturating_mul(batch_calldata_length.saturating_sub(batch_calldata_non_zeros))
+            .saturating_add(tx_data_non_zero_gas_eip2028.saturating_mul(batch_calldata_non_zeros))
+            .saturating_add(keccak256_gas)
+            .saturating_add(words_for_bytes.saturating_mul(keccak256_word_gas))
+            .saturating_add(2u64.saturating_mul(sstore_set_gas_eip2200));
+
+        // Add batchExtraGas
+        gas_spent = gas_spent.saturating_add(batch_extra_gas);
+
+        // Add per-batch gas cost
+        let per_batch_gas_cost = ctx
+            .arb_state(None, false)
+            .l1_pricing()
+            .per_batch_gas_cost()
+            .get()
+            .unwrap_or(0);
+        gas_spent = gas_spent.saturating_add(per_batch_gas_cost);
+
+        // For ArbOS >= 50, apply gas floor per token (nitro internal_tx.go:169-178)
+        if arbos_version >= 50 {
+            let gas_floor_per_token = ctx
+                .arb_state(None, false)
+                .l1_pricing()
+                .gas_floor_per_token()
+                .get()
+                .unwrap_or(0);
+            // FloorGasAdditionalTokens = 172 (nitro internal_tx.go:60)
+            let floor_gas_additional_tokens: u64 = 172;
+            let tx_gas: u64 = 21000; // params.TxGas
+            let floor_gas_spent = gas_floor_per_token
+                .saturating_mul(
+                    batch_calldata_length
+                        .saturating_add(batch_calldata_non_zeros.saturating_mul(3))
+                        .saturating_add(floor_gas_additional_tokens),
+                )
+                .saturating_add(tx_gas);
+            if floor_gas_spent > gas_spent {
+                gas_spent = floor_gas_spent;
+            }
+        }
+
+        let wei_spent = l1_base_fee_wei.saturating_mul(U256::from(gas_spent));
+
+        // Ensure batch poster is registered
+        let _ = ctx
+            .arb_state(None, false)
+            .l1_pricing()
+            .batch_poster_table()
+            .add_if_missing(batch_poster, batch_poster);
+
+        let _ = ctx
+            .arb_state(None, false)
+            .l1_pricing()
+            .update_for_batch_poster_spending(
+                batch_timestamp,
+                current_time,
+                batch_poster,
+                wei_spent,
+                l1_base_fee_wei,
+            );
     }
 
     /// Executes an Arbitrum submit retryable transaction.
@@ -302,27 +559,98 @@ where
         Ok(())
     }
 
-    /// Distributes transaction fees to beneficiaries.
+    /// Distributes transaction fees using the Arbitrum fee model.
     ///
-    /// This method:
-    /// 1. Calls the mainnet reward_beneficiary for standard L2 fee distribution
-    /// 2. Sends the cached L1 cost to the L1 pricer funds pool address
+    /// Instead of the mainnet behaviour (tip to coinbase, basefee burned), Arbitrum
+    /// splits fees between:
+    /// - **Infra fee account**: `min(min_base_fee, basefee) * compute_gas`
+    /// - **Network fee account**: remaining compute cost
+    /// - **L1 pricer pool**: the cached L1 data cost
+    ///
+    /// Also drains the L2 gas pool by the compute gas consumed.
+    ///
+    /// Note: `reimburse_caller` (gas refund to the tx sender) is handled
+    /// separately by the default `post_execution` flow before this method
+    /// is called, so the gas refund is not affected.
     fn reward_beneficiary(
         &self,
         evm: &mut Self::Evm,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
-        // First, do the standard mainnet beneficiary reward (L2 fees)
-        self.mainnet.reward_beneficiary(evm, frame_result)?;
+        let gas_used = frame_result.gas().used();
 
         let ctx = evm.ctx();
+        let basefee = U256::from(ctx.block().basefee() as u128);
         let l1_cost = ctx.local().tx_l1_cost().unwrap_or(U256::ZERO);
+        let poster_gas = ctx.local().poster_gas().unwrap_or(0);
 
-        // Send L1 fees to the L1 pricer funds pool
+        // compute_cost = total_cost - poster_fee (nitro tx_processor.go:645-646)
+        // total_cost = basefee * gas_used
+        // poster_fee = the L1 cost already charged (cached as l1_cost)
+        let total_cost = basefee.saturating_mul(U256::from(gas_used));
+        let mut compute_cost = total_cost.saturating_sub(l1_cost);
+
+        // compute_gas = gas_used - poster_gas (nitro tx_processor.go:663)
+        // Used for infra fee calculation and gas pool deduction
+        let compute_gas = gas_used.saturating_sub(poster_gas);
+
+        // Infra fee split (nitro tx_processor.go:656-668)
+        let infra_fee_account = ctx
+            .arb_state(None, false)
+            .infra_fee_account()
+            .get()
+            .unwrap_or(Address::ZERO);
+        if infra_fee_account != Address::ZERO && !compute_cost.is_zero() {
+            let min_base_fee = ctx
+                .arb_state(None, false)
+                .l2_pricing()
+                .min_base_fee_wei()
+                .get()
+                .unwrap_or(U256::ZERO);
+            let infra_fee = basefee.min(min_base_fee);
+            // Use compute_gas (not gas_used) for infra fee calculation
+            let infra_compute_cost = infra_fee.saturating_mul(U256::from(compute_gas));
+            ctx.journal_mut()
+                .balance_incr(infra_fee_account, infra_compute_cost)?;
+            compute_cost = compute_cost.saturating_sub(infra_compute_cost);
+        }
+
+        // Network fee account gets remaining compute cost
+        let network_fee_account = ctx
+            .arb_state(None, false)
+            .network_fee_account()
+            .get()
+            .unwrap_or(Address::ZERO);
+        if network_fee_account != Address::ZERO && !compute_cost.is_zero() {
+            ctx.journal_mut()
+                .balance_incr(network_fee_account, compute_cost)?;
+        }
+
+        // L1 cost goes to L1 pricer funds pool (nitro tx_processor.go:672-676)
         if !l1_cost.is_zero() {
             ctx.journal_mut()
                 .balance_incr(ARBOS_L1_PRICER_FUNDS_ADDRESS, l1_cost)?;
+
+            // Update l1FeesAvailable after minting poster fee (nitro tx_processor.go:677-681)
+            let current_l1_fees = ctx
+                .arb_state(None, false)
+                .l1_pricing()
+                .l1_fees_available()
+                .get()
+                .unwrap_or(U256::ZERO);
+            let _ = ctx
+                .arb_state(None, false)
+                .l1_pricing()
+                .l1_fees_available()
+                .set(current_l1_fees.saturating_add(l1_cost));
         }
+
+        // Update L2 gas pool using compute_gas (not total gas_used)
+        // (nitro tx_processor.go:688-698)
+        let _ = ctx
+            .arb_state(None, false)
+            .l2_pricing()
+            .add_to_gas_pool(-(compute_gas as i64));
 
         Ok(())
     }
