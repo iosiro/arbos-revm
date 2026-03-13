@@ -22,6 +22,7 @@ use crate::{
         INITIAL_RECENT_CACHE_SIZE, INITIAL_STYLUS_VERSION,
     },
     local_context::ArbitrumLocalContextTr,
+    math::{ONE_IN_BIPS, approx_exp_basis_points},
     state::types::{
         ArbosStateError, StorageBackedAddressSet, StorageBackedB256, StorageBackedTr,
         StorageBackedU32, StorageBackedU64, map_address, substorage,
@@ -595,31 +596,4 @@ pub fn activate_program<CTX: ArbitrumContextTr>(
         data_fee,
         module_hash,
     })
-}
-
-/// Basis points constant: 1.0 = 10000 bips
-const ONE_IN_BIPS: i64 = 10000;
-
-/// Approximates b * e^(x/b) using the Maclaurin series with Horner's method,
-/// where x is in basis points and b = ONE_IN_BIPS (10000).
-/// Matches nitro's `arbmath.ApproxExpBasisPoints`.
-fn approx_exp_basis_points(value: i64, accuracy: u64) -> i64 {
-    let negative = value < 0;
-    let x = if negative { -value } else { value } as u64;
-    let b = ONE_IN_BIPS as u64;
-
-    // Horner's method: res = b + x/accuracy, then iterate
-    let mut res = b + x / accuracy;
-    let mut i = accuracy - 1;
-    while i > 0 {
-        res = b + res.saturating_mul(x) / (i * b);
-        i -= 1;
-    }
-
-    if negative {
-        // e^(-x) = b^2 / res (in bips representation)
-        (b.saturating_mul(b) / res) as i64
-    } else {
-        res as i64
-    }
 }
