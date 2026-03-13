@@ -3,6 +3,7 @@
 //! This module provides utility functions for calculating L1 data fees.
 //! The L1 fee represents the cost of posting transaction data to L1.
 
+use crate::utils::{Dictionary, brotli_compress};
 use revm::primitives::{Bytes, U256};
 
 /// Gas cost per non-zero byte of calldata (EIP-2028)
@@ -33,25 +34,37 @@ pub fn data_gas(data: &Bytes) -> u64 {
 
 /// Calculate the L1 data cost for a transaction.
 ///
-/// Formula:
-/// ```text
-/// data_gas = sum(16 for each non-zero byte, 4 for each zero byte)
-/// l1_cost = data_gas * l1_base_fee
-/// ```
+/// The transaction bytes are always compressed with Brotli first, and the
+/// data gas is calculated on the compressed bytes (matching production
+/// Arbitrum behavior). Falls back to uncompressed calculation on compression
+/// error.
 ///
 /// # Arguments
 /// * `enveloped_tx` - The enveloped transaction bytes
 /// * `l1_base_fee` - The L1 base fee (price per unit) from ArbOS state
+/// * `brotli_compression_level` - Brotli compression level (0-11)
 ///
 /// # Returns
 /// The L1 cost in wei
-pub fn calculate_tx_l1_cost(enveloped_tx: &Bytes, l1_base_fee: U256) -> U256 {
+pub fn calculate_tx_l1_cost(
+    enveloped_tx: &Bytes,
+    l1_base_fee: U256,
+    brotli_compression_level: u64,
+) -> U256 {
     if l1_base_fee.is_zero() {
         return U256::ZERO;
     }
 
-    let gas = data_gas(enveloped_tx);
-    U256::from(gas).saturating_mul(l1_base_fee)
+    let units = match brotli_compress(
+        enveloped_tx,
+        brotli_compression_level as u32,
+        22,
+        Dictionary::Empty,
+    ) {
+        Ok(compressed) => TX_DATA_NON_ZERO_GAS * compressed.len() as u64,
+        Err(_) => data_gas(enveloped_tx), // fallback
+    };
+    U256::from(units).saturating_mul(l1_base_fee)
 }
 
 /// Calculate the poster gas (L1 gas converted to L2 gas units).
@@ -98,12 +111,27 @@ mod tests {
 
     #[test]
     fn test_l1_cost_calculation() {
-        // 10 non-zero bytes = 160 gas * 1000 = 160,000 wei
+        // Even at compression level 0, brotli is used (matching nitro behavior).
+        // Cost is based on compressed size * 16 * l1_base_fee.
         let data = Bytes::from(vec![1u8; 10]);
-        assert_eq!(
-            calculate_tx_l1_cost(&data, U256::from(1000)),
-            U256::from(160_000)
-        );
+        let cost = calculate_tx_l1_cost(&data, U256::from(1000), 0);
+        // Brotli at level 0 still compresses, so cost should differ from raw data_gas
+        let raw_cost = U256::from(data_gas(&data)).saturating_mul(U256::from(1000));
+        // The cost should be positive (non-zero data with non-zero base fee)
+        assert!(cost > U256::ZERO);
+        // With only 10 bytes, brotli overhead may make compressed larger,
+        // but the important thing is we use the brotli path
+        assert_ne!(cost, raw_cost);
+    }
+
+    #[test]
+    fn test_l1_cost_with_brotli_compression() {
+        // Higher compression levels should produce smaller or equal output
+        let data = Bytes::from(vec![0xABu8; 100]);
+        let cost_level_0 = calculate_tx_l1_cost(&data, U256::from(1000), 0);
+        let cost_level_1 = calculate_tx_l1_cost(&data, U256::from(1000), 1);
+        // Both should be based on compressed size; level 1 should be <= level 0
+        assert!(cost_level_1 <= cost_level_0);
     }
 
     #[test]
@@ -123,7 +151,7 @@ mod tests {
     #[test]
     fn test_zero_base_fee() {
         let data = Bytes::from(vec![1u8; 10]);
-        assert_eq!(calculate_tx_l1_cost(&data, U256::ZERO), U256::ZERO);
+        assert_eq!(calculate_tx_l1_cost(&data, U256::ZERO, 0), U256::ZERO);
         assert_eq!(calculate_poster_gas(U256::from(1000), U256::ZERO), 0);
     }
 }

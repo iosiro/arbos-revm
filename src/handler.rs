@@ -239,8 +239,17 @@ where
                     .get()
                     .unwrap_or(U256::ZERO);
 
-                // Calculate L1 cost
-                let cost = l1_fee::calculate_tx_l1_cost(enveloped_tx, l1_base_fee);
+                // Calculate L1 cost (with Brotli compression)
+                let brotli_compression_level = ctx
+                    .arb_state(None, false)
+                    .brotli_compression_level()
+                    .get()
+                    .unwrap_or(0);
+                let cost = l1_fee::calculate_tx_l1_cost(
+                    enveloped_tx,
+                    l1_base_fee,
+                    brotli_compression_level,
+                );
 
                 // Calculate and cache poster gas
                 let basefee = ctx.block().basefee() as u128;
