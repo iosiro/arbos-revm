@@ -94,5 +94,8 @@ pub const INITIAL_L2_PRICING_INERTIA: u64 = 102;
 pub const INITIAL_L2_BACKLOG_TOLERANCE: u64 = 10;
 pub const INITIAL_L2_PER_TX_GAS_LIMIT: u64 = 32_000_000;
 
+/// Retryable ticket lifetime in seconds (7 days).
+pub const RETRYABLE_LIFETIME_SECONDS: u64 = 604_800;
+
 /// The ArbOS address used as the sender for internal transactions
 pub const ARBOS_ADDRESS: Address = address!("0x00000000000000000000000000000000000A4B05");
