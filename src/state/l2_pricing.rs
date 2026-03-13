@@ -7,6 +7,7 @@ use crate::{
         INITIAL_L2_PER_BLOCK_GAS_LIMIT, INITIAL_L2_PER_TX_GAS_LIMIT, INITIAL_L2_PRICING_INERTIA,
         INITIAL_L2_SPEED_LIMIT,
     },
+    math::{apply_gas_delta, approx_exp_basis_points, big_mul_by_bips, natural_to_bips},
     state::types::{
         ArbosStateError, StorageBackedTr, StorageBackedU64, StorageBackedU256, map_address,
     },
@@ -133,5 +134,46 @@ impl<'a, CTX: ArbitrumContextTr> L2Pricing<'a, CTX> {
             backlog_tolerance: self.backlog_tolerance().get()?,
             per_tx_gas_limit: self.per_tx_gas_limit().get()?,
         })
+    }
+
+    /// Adjusts the gas backlog by the given signed delta.
+    /// Positive values drain the backlog (time-based or consumed gas);
+    /// negative values increase it (gas used by transactions).
+    ///
+    /// Matches nitro `model.go:39-57` (legacy single-constraint path).
+    pub fn add_to_gas_pool(&mut self, gas: i64) -> Result<(), ArbosStateError> {
+        let backlog = self.gas_backlog().get()?;
+        self.gas_backlog().set(apply_gas_delta(backlog, gas))
+    }
+
+    /// Updates the L2 pricing model for a new block.
+    ///
+    /// 1. Drains the gas backlog by `time_passed * speed_limit`.
+    /// 2. Recomputes the base fee using an exponential function of excess
+    ///    backlog over the tolerance threshold.
+    ///
+    /// Matches nitro `model.go:119-133`.
+    pub fn update_pricing_model(&mut self, time_passed: u64) -> Result<(), ArbosStateError> {
+        let speed_limit = self.speed_limit_per_second().get()?;
+        let drain = i64::try_from(time_passed.saturating_mul(speed_limit)).unwrap_or(i64::MAX);
+        self.add_to_gas_pool(drain)?;
+
+        let inertia = self.pricing_inertia().get()?;
+        let tolerance = self.backlog_tolerance().get()?;
+        let backlog = self.gas_backlog().get()?;
+        let min_base_fee = self.min_base_fee_wei().get()?;
+
+        let threshold = tolerance.saturating_mul(speed_limit);
+        let base_fee = if backlog > threshold {
+            let excess = i64::try_from(backlog - threshold).unwrap_or(i64::MAX);
+            let denom = i64::try_from(inertia.saturating_mul(speed_limit))
+                .unwrap_or(i64::MAX)
+                .max(1);
+            let exponent_bips = natural_to_bips(excess) / denom;
+            big_mul_by_bips(min_base_fee, approx_exp_basis_points(exponent_bips, 4))
+        } else {
+            min_base_fee
+        };
+        self.base_fee_wei().set(base_fee)
     }
 }
