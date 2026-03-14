@@ -127,24 +127,32 @@ where
                 call_value = %value,
                 "Rejecting Stylus call with value in static context"
             );
-            return (
-                Status::WriteProtection.into(),
-                VecReader::new(vec![]),
-                ArbGas(gas_left),
-            );
+            // Nitro: returns status byte 2 (Failure) and cost = 0 for write protection
+            return (Status::Failure.into(), VecReader::new(vec![]), ArbGas(0));
         }
 
-        // Compute base cost (warm/cold account touch) first, then apply 63/64 rule.
-        // Nitro: startGas = SaturatingUSub(gasLeft, baseCost) * 63 / 64
-        let base_cost = warm_cold_cost(
-            self.ctx()
-                .journal_mut()
-                .load_account(bytecode_address)
-                .unwrap()
-                .is_cold,
-        );
+        // Compute base cost: warm/cold access + value transfer + new account costs
+        // Matches nitro WasmCallCost (operations_acl_arbitrum.go)
+        let account_load = self
+            .ctx()
+            .journal_mut()
+            .load_account(bytecode_address)
+            .unwrap();
+        let is_cold = account_load.is_cold;
+        let is_empty = account_load.data.is_empty();
+        let mut base_cost = warm_cold_cost(is_cold);
+        let transfers_value = !value.is_zero();
+        if transfers_value {
+            // CallValueTransferGas = 9000
+            base_cost += 9000;
+            if is_empty {
+                // CallNewAccountGas = 25000
+                base_cost += 25000;
+            }
+        }
 
-        let gas_limit = if self
+        // Apply the 63/64ths rule: startGas = SaturatingUSub(gasLeft, baseCost) * 63 / 64
+        let mut gas_limit = if self
             .ctx()
             .cfg()
             .spec()
@@ -157,7 +165,28 @@ where
             gas_limit
         };
 
+        // EVM rule: calls that pay get a stipend (params.CallStipend = 2300)
+        if transfers_value {
+            gas_limit = gas_limit.saturating_add(2300);
+        }
+
         let mut gas = Gas::new(gas_limit);
+
+        // Determine call scheme and value based on call type
+        let (scheme, call_value) = match req_type {
+            EvmApiMethod::DelegateCall => (
+                revm::interpreter::CallScheme::DelegateCall,
+                revm::interpreter::CallValue::Apparent(value),
+            ),
+            EvmApiMethod::StaticCall => (
+                revm::interpreter::CallScheme::StaticCall,
+                revm::interpreter::CallValue::Transfer(value),
+            ),
+            _ => (
+                revm::interpreter::CallScheme::Call,
+                revm::interpreter::CallValue::Transfer(value),
+            ),
+        };
 
         let first_frame_input = FrameInput::Call(Box::new(CallInputs {
             input: CallInput::Bytes(calldata),
@@ -166,8 +195,8 @@ where
             bytecode_address,
             target_address,
             caller,
-            value: revm::interpreter::CallValue::Transfer(value),
-            scheme: revm::interpreter::CallScheme::Call,
+            value: call_value,
+            scheme,
             is_static,
             known_bytecode: None,
         }));
@@ -196,7 +225,8 @@ where
                 .free_child_context();
 
             if let Ok(FrameResult::Call(call_outcome)) = result {
-                gas.erase_cost(call_outcome.gas().remaining());
+                let return_gas = call_outcome.gas().remaining();
+                gas.erase_cost(return_gas);
 
                 let instruction_result = *call_outcome.instruction_result();
                 let status = if instruction_result.is_ok() {
@@ -208,6 +238,9 @@ where
                 let status_label = status.as_str();
                 let output = call_outcome.output().to_vec();
 
+                // Nitro: cost = baseCost + (gas - returnGas)
+                let total_cost = base_cost.saturating_add(gas.spent());
+
                 debug!(
                     target: "arbos-revm::stylus-api",
                     target_address = %target_address,
@@ -216,26 +249,28 @@ where
                     status = status_label,
                     output_len = output.len(),
                     output = %String::from_utf8_or_hex(output.clone()),
-                    gas_spent = gas.spent(),
-                    gas_remaining = call_outcome.gas().remaining(),
+                    gas_spent = total_cost,
+                    gas_remaining = return_gas,
                     "Stylus host call finished"
                 );
 
-                return (status.into(), VecReader::new(output), ArbGas(gas.spent()));
+                return (status.into(), VecReader::new(output), ArbGas(total_cost));
             }
         }
 
+        // Nitro: cost = baseCost + (gas - returnGas), where returnGas = 0 on failure
+        let total_cost = base_cost.saturating_add(gas.spent());
         warn!(
             target: "arbos-revm::stylus-api",
             target_address = %target_address,
             bytecode_address = %bytecode_address,
-            gas_spent = gas.spent(),
+            gas_spent = total_cost,
             "Stylus host call returning failure response without call outcome"
         );
         (
             Status::Failure.into(),
             VecReader::new(vec![]),
-            ArbGas(gas.spent()),
+            ArbGas(total_cost),
         )
     }
 
@@ -282,10 +317,12 @@ where
                 target_address = %input.target_address,
                 "Rejecting create in static context"
             );
+            // Nitro: returns (zeroAddr, nil, 0, vm.ErrWriteProtection)
+            // which becomes cost = startGas - returnGas - one64th = gas - 0 - 0 = gas
             return (
                 [vec![0x00], "write protection".as_bytes().to_vec()].concat(),
                 VecReader::new(vec![]),
-                ArbGas(0),
+                ArbGas(gas_remaining),
             );
         }
 
@@ -338,7 +375,7 @@ where
                 gas_remaining,
                 "Insufficient gas for Stylus create"
             );
-            // Nitro returns remaining gas on error, not 0
+            // Nitro: returns (zeroAddr, nil, gas, ErrOutOfGas) -> cost = gas
             return (
                 [vec![0x00], "out of gas".as_bytes().to_vec()].concat(),
                 VecReader::new(vec![]),
@@ -389,42 +426,44 @@ where
                 .free_child_context();
 
             if let Ok(FrameResult::Create(create_outcome)) = result {
+                let return_gas = create_outcome.gas().remaining();
+                // Nitro: cost = startGas - returnGas - one64th
+                let cost = gas_remaining.saturating_sub(return_gas.saturating_add(gas_stipend));
+
                 if InstructionResult::Revert == *create_outcome.instruction_result() {
-                    let output = create_outcome.output().to_vec();
+                    let revert_data = create_outcome.output().to_vec();
                     debug!(
                         target: "arbos-revm::stylus-api",
                         target_address = %input.target_address,
-                        output_len = output.len(),
-                        output = %String::from_utf8_or_hex(output.clone()),
-                        gas_spent = gas.spent(),
-                        gas_remaining = create_outcome.gas().remaining(),
+                        output_len = revert_data.len(),
+                        output = %String::from_utf8_or_hex(revert_data.clone()),
+                        gas_cost = cost,
+                        gas_remaining = return_gas,
                         "Stylus create reverted"
                     );
-                    return (
-                        [vec![0x00], output].concat(),
-                        VecReader::new(vec![]),
-                        ArbGas(gas.spent()),
-                    );
+                    // Nitro: on revert, addr = zeroAddr, retVal = revert data
+                    // Returns [0x01, zeroAddr] with revert data as retVal
+                    let response = [vec![0x01], Address::ZERO.to_vec()].concat();
+                    return (response, VecReader::new(revert_data), ArbGas(cost));
                 }
 
-                if let Some(address) = create_outcome.address {
-                    gas.erase_cost(create_outcome.gas().remaining() + gas_stipend);
+                // Success or other non-revert outcome
+                let address = create_outcome.address.unwrap_or(Address::ZERO);
 
-                    debug!(
-                        target: "arbos-revm::stylus-api",
-                        target_address = %input.target_address,
-                        new_address = %address,
-                        gas_spent = gas.spent(),
-                        gas_remaining = create_outcome.gas().remaining(),
-                        "Stylus create succeeded"
-                    );
+                debug!(
+                    target: "arbos-revm::stylus-api",
+                    target_address = %input.target_address,
+                    new_address = %address,
+                    gas_cost = cost,
+                    gas_remaining = return_gas,
+                    "Stylus create succeeded"
+                );
 
-                    return (
-                        [vec![0x01], address.to_vec()].concat(),
-                        VecReader::new(vec![]),
-                        ArbGas(gas.spent()),
-                    );
-                }
+                return (
+                    [vec![0x01], address.to_vec()].concat(),
+                    VecReader::new(vec![]),
+                    ArbGas(cost),
+                );
             }
         }
 
@@ -555,34 +594,51 @@ where
                     );
                 }
 
-                let mut total_cost = 0;
+                let mut remaining_gas = gas_left;
+                let mut is_out_of_gas = false;
                 while !data.is_empty() {
                     let (key, value) = (buffer::take_u256(&mut data), buffer::take_u256(&mut data));
 
+                    // Compute cost BEFORE writing by loading the slot to determine
+                    // cold/warm status, then constructing the expected SStoreResult.
+                    // This matches nitro's pattern: check cost first, break if
+                    // insufficient, then write.
+                    let load_result = context.sload(input.target_address, key);
+                    let Some(load_result) = load_result else {
+                        warn!(
+                            target: "arbos-revm::stylus-api",
+                            target_address = %input.target_address,
+                            "SetTrieSlots failed during storage load"
+                        );
+                        return (
+                            Status::Failure.into(),
+                            VecReader::new(vec![]),
+                            ArbGas(gas_left),
+                        );
+                    };
+
+                    // sload warms the slot; compute the cost we'd expect from sstore.
+                    // Since sload warms the slot, the subsequent sstore will see
+                    // is_cold=false but we need to account for the original cold cost.
+                    let slot_is_cold = load_result.is_cold;
+
+                    // Now do the actual sstore (slot is warm after sload)
                     match context.sstore(input.target_address, key, value) {
                         Some(result) => {
-                            total_cost += revm::interpreter::gas::sstore_cost(
+                            // Use the original cold status from sload, not from sstore
+                            // (which always sees warm after our sload above)
+                            let cost = revm::interpreter::gas::sstore_cost(
                                 spec.clone().into(),
                                 &result.data,
-                                result.is_cold,
+                                slot_is_cold,
                             );
 
-                            if gas_left < total_cost {
-                                debug!(
-                                    target: "arbos-revm::stylus-api",
-                                    target_address = %input.target_address,
-                                    gas_left,
-                                    total_cost,
-                                    "SetTrieSlots ran out of gas"
-                                );
-                                // Nitro: ArbOS < 50 returns Failure, >= 50 returns OutOfGas
-                                let status = if self.ctx().cfg().arbos_version() < 50 {
-                                    Status::Failure
-                                } else {
-                                    Status::OutOfGas
-                                };
-                                return (status.into(), VecReader::new(vec![]), ArbGas(gas_left));
+                            if cost > remaining_gas {
+                                remaining_gas = 0;
+                                is_out_of_gas = true;
+                                break;
                             }
+                            remaining_gas -= cost;
                         }
                         _ => {
                             warn!(
@@ -599,10 +655,26 @@ where
                     }
                 }
 
+                if is_out_of_gas || remaining_gas == 0 {
+                    debug!(
+                        target: "arbos-revm::stylus-api",
+                        target_address = %input.target_address,
+                        gas_left,
+                        "SetTrieSlots ran out of gas"
+                    );
+                    // Nitro: ArbOS < 50 returns Failure, >= 50 returns OutOfGas
+                    let status = if self.ctx().cfg().arbos_version() < 50 {
+                        Status::Failure
+                    } else {
+                        Status::OutOfGas
+                    };
+                    return (status.into(), VecReader::new(vec![]), ArbGas(gas_left));
+                }
+
                 (
                     Status::Success.into(),
                     VecReader::new(vec![]),
-                    ArbGas(total_cost),
+                    ArbGas(gas_left - remaining_gas),
                 )
             }
 
