@@ -27,28 +27,28 @@ sol! {
 interface ArbGasInfo {
     /// @notice Get gas prices for a provided aggregator
     /// @return return gas prices in wei
-    ///        (
-    ///            per L2 tx,
-    ///            per L1 calldata byte
-    ///            per storage allocation,
-    ///            per ArbGas base,
-    ///            per ArbGas congestion,
-    ///            per ArbGas total
-    ///        )
+    /// (
+    /// per L2 tx,
+    /// per L1 calldata byte
+    /// per storage allocation,
+    /// per ArbGas base,
+    /// per ArbGas congestion,
+    /// per ArbGas total
+    /// )
     function getPricesInWeiWithAggregator(
         address aggregator
     ) external view returns (uint256, uint256, uint256, uint256, uint256, uint256);
 
     /// @notice Get gas prices. Uses the caller's preferred aggregator, or the default if the caller doesn't have a preferred one.
     /// @return return gas prices in wei
-    ///        (
-    ///            per L2 tx,
-    ///            per L1 calldata byte
-    ///            per storage allocation,
-    ///            per ArbGas base,
-    ///            per ArbGas congestion,
-    ///            per ArbGas total
-    ///        )
+    /// (
+    /// per L2 tx,
+    /// per L1 calldata byte
+    /// per storage allocation,
+    /// per ArbGas base,
+    /// per ArbGas congestion,
+    /// per ArbGas total
+    /// )
     function getPricesInWei()
         external
         view
@@ -650,6 +650,19 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
 
                 let output =
                     ArbGasInfo::getMaxTxGasLimitCall::abi_encode_returns(&max_tx_gas_limit);
+
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            // Add missing match arm for getL1PricingUnitsSinceUpdate
+            ArbGasInfo::getL1PricingUnitsSinceUpdateCall::SELECTOR => {
+                let units_since_update = {
+                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
+                    try_state!(gas, arb_state.l1_pricing().units_since_update().get())
+                };
+
+                let output = ArbGasInfo::getL1PricingUnitsSinceUpdateCall::abi_encode_returns(
+                    &units_since_update,
+                );
 
                 interpreter_return!(gas, Bytes::from(output));
             }

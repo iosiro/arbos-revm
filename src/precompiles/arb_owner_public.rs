@@ -7,7 +7,9 @@ use revm::{
 };
 
 use crate::{
-    ArbitrumContextTr, generate_state_mut_table,
+    ArbitrumContextTr,
+    config::ArbitrumConfigTr,
+    generate_state_mut_table,
     macros::{emit_event, interpreter_return, interpreter_revert},
     precompile_impl,
     precompiles::{
@@ -242,10 +244,20 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPublicPrecompil
                         .upgrade_timestamp()
                         .get()
                 );
+
+                // If current ArbOS version >= upgrade_version, return (0, 0)
+                // (matches nitro ArbOwnerPublic.go:80-81)
+                let (version, timestamp) =
+                    if u64::from(context.cfg().arbos_version()) >= upgrade_version {
+                        (0u64, 0u64)
+                    } else {
+                        (upgrade_version, upgrade_timestamp)
+                    };
+
                 let output = ArbOwnerPublic::getScheduledUpgradeCall::abi_encode_returns(
                     &ArbOwnerPublic::getScheduledUpgradeReturn {
-                        arbosVersion: upgrade_version,
-                        scheduledForTimestamp: upgrade_timestamp,
+                        arbosVersion: version,
+                        scheduledForTimestamp: timestamp,
                     },
                 );
                 interpreter_return!(gas, Bytes::from(output));
@@ -256,10 +268,13 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPublicPrecompil
                     ArbOwnerPublic::isCalldataPriceIncreaseEnabledCall,
                     input
                 );
+                // Read from features bitmask, not l1_pricing.gas_floor_per_token
+                // (matches nitro ArbOwnerPublic.go:89 / features.go:31-33)
                 let enabled = {
                     let mut arb_state = context.arb_state(Some(&mut gas), is_static);
-                    let value = try_state!(gas, arb_state.l1_pricing().gas_floor_per_token().get());
-                    value != 0
+                    let features_value = try_state!(gas, arb_state.features().get());
+                    // Check bit 0 (increasedCalldata feature flag)
+                    features_value.bit(0)
                 };
                 let output = ArbOwnerPublic::isCalldataPriceIncreaseEnabledCall::abi_encode_returns(
                     &enabled,

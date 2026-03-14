@@ -1,12 +1,15 @@
 use alloy_sol_types::{SolCall, SolError, sol};
 use revm::{
     context::{Block, JournalTr},
-    interpreter::{Gas, InterpreterResult, gas::ISTANBUL_SLOAD_GAS},
+    interpreter::{Gas, InterpreterResult},
     precompile::PrecompileId,
     primitives::{
         Address, B256, Bytes, Log, U256, address, alloy_primitives::IntoLogData, keccak256,
     },
 };
+
+/// Pre-Istanbul SLOAD gas cost (50), matching nitro's params.SloadGas.
+const SLOAD_GAS: u64 = 50;
 
 use crate::{
     ArbitrumContextTr,
@@ -407,7 +410,8 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
                 // Charge for accessing retryable storage slots.
                 let byte_count = retryable_size_bytes(calldata_len);
                 let write_words = byte_count.div_ceil(32);
-                try_record_cost!(gas, ISTANBUL_SLOAD_GAS.saturating_mul(write_words));
+                // Use SLOAD_GAS (50) matching nitro's params.SloadGas, not ISTANBUL_SLOAD_GAS (800)
+                try_record_cost!(gas, SLOAD_GAS.saturating_mul(write_words));
 
                 let nonce = {
                     let mut arb_state = context.arb_state(Some(&mut gas), is_static);

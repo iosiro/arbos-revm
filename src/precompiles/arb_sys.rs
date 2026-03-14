@@ -195,7 +195,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
         context: &mut CTX,
         input: &[u8],
         _target_address: &Address,
-        _caller_address: Address,
+        caller_address: Address,
         _call_value: U256,
         _is_static: bool,
         gas_limit: u64,
@@ -241,7 +241,8 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
                         );
                     }
 
-                    interpreter_return!(gas, Bytes::from("invalid block number for ArbBlockHAsh"));
+                    // Pre-v11 error should revert, not return success
+                    interpreter_revert!(gas, Bytes::from("invalid block number for ArbBlockHAsh"));
                 }
 
                 let hash = context.block_hash(requested_block).unwrap_or_default();
@@ -295,6 +296,14 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
                 interpreter_return!(gas, Bytes::from(output));
             }
             ArbSys::sendMerkleTreeStateCall::SELECTOR => {
+                // Only callable by address zero (matches nitro ArbSys.go:217-219)
+                if caller_address != Address::ZERO {
+                    interpreter_revert!(
+                        gas,
+                        Bytes::from("method can only be called by address zero")
+                    );
+                }
+
                 let output = ArbSys::sendMerkleTreeStateCall::abi_encode_returns(
                     &ArbSys::sendMerkleTreeStateReturn {
                         size: U256::ZERO,

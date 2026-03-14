@@ -31,9 +31,8 @@ mod arb_wasm_cache;
 
 use crate::{
     ArbitrumContextTr,
-    macros::{interpreter_return, interpreter_revert},
+    macros::interpreter_revert,
     precompiles::{arb_wasm::arb_wasm_precompile, arb_wasm_cache::arb_wasm_cache_precompile},
-    state::{ArbState, ArbStateGetter, try_state, types::StorageBackedTr},
     try_record_cost,
 };
 
@@ -475,22 +474,29 @@ pub(crate) trait ArbPrecompileLogic<CTX: ArbitrumContextTr> {
             .find(|(sel, _)| *sel == selector)
         {
             Some((_, p)) => *p,
-            None => interpreter_return!(gas),
+            // Unknown selectors revert consuming all gas (matches nitro precompile.go:716-718)
+            None => {
+                gas.spend_all();
+                interpreter_revert!(gas, Bytes::new());
+            }
         };
 
         if purity != StateMutability::Pure {
             try_record_cost!(gas, ISTANBUL_SLOAD_GAS);
         }
 
+        // Write methods called in static context consume all gas and revert
+        // (matches nitro precompile.go:726-728)
         if purity >= StateMutability::NonPayable && is_static {
-            let _ = try_state!(
-                gas,
-                context
-                    .arb_state(Some(&mut gas), is_static)
-                    .l2_pricing()
-                    .per_tx_gas_limit()
-                    .get()
-            );
+            gas.spend_all();
+            interpreter_revert!(gas, Bytes::new());
+        }
+
+        // Non-payable methods reject value transfers
+        // (matches nitro precompile.go:731-733)
+        if call_value > U256::ZERO && purity < StateMutability::Payable {
+            gas.spend_all();
+            interpreter_revert!(gas, Bytes::new());
         }
 
         // call the inner logic

@@ -523,8 +523,9 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                         .get_active_program(&params, &call.codehash)
                 );
 
+                // Return bytes, not KB (matches nitro programs.go:520-522)
                 let output = IArbWasm::codehashAsmSizeCall::abi_encode_returns(
-                    &program_info.asm_estimated_kb,
+                    &(program_info.asm_estimated_kb.saturating_mul(1024)),
                 );
 
                 interpreter_return!(gas, Bytes::from(output));
@@ -588,16 +589,23 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                         .get_active_program(&params, &code_hash)
                 );
 
-                let cached_gas = crate::stylus_executor::init_gas_cost(
+                // cachedGas uses MIN_CACHED_GAS_UNITS and cached_cost_scalar
+                // (matches nitro programs.go:530-533)
+                let cached_gas = crate::stylus_executor::cached_gas_cost(
                     program_info.cached_cost,
                     params.min_cached_init_gas,
-                    params.init_cost_scalar,
+                    params.cached_cost_scalar,
                 );
-                let init_gas = crate::stylus_executor::init_gas_cost(
+                let mut init_gas = crate::stylus_executor::init_gas_cost(
                     program_info.init_cost,
                     params.min_init_gas,
                     params.init_cost_scalar,
                 );
+                // When version > 1, init_gas includes cached_gas
+                // (matches nitro programs.go:501-503)
+                if params.version > 1 {
+                    init_gas = init_gas.saturating_add(cached_gas);
+                }
 
                 let output = IArbWasm::programInitGasCall::abi_encode_returns(
                     &IArbWasm::programInitGasReturn {
