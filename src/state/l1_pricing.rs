@@ -2,6 +2,10 @@ use revm::primitives::{Address, B256, I256, U256};
 
 use crate::{
     ArbitrumContextTr,
+    constants::{
+        ARBOS_BATCH_POSTER_ADDRESS, INITIAL_L1_EQUILIBRATION_UNITS, INITIAL_L1_INERTIA,
+        INITIAL_L1_PER_UNIT_REWARD,
+    },
     math::big_mul_by_bips,
     state::types::{
         ArbosStateError, StorageBackedAddress, StorageBackedAddressSet, StorageBackedI256,
@@ -22,9 +26,9 @@ pub struct L1PricingParams {
 impl Default for L1PricingParams {
     fn default() -> Self {
         Self {
-            equilibration_units: U256::ZERO,
-            inertia: 0,
-            per_unit_reward: 0,
+            equilibration_units: U256::from(INITIAL_L1_EQUILIBRATION_UNITS),
+            inertia: INITIAL_L1_INERTIA,
+            per_unit_reward: INITIAL_L1_PER_UNIT_REWARD,
             price_per_unit: U256::ZERO,
             per_batch_gas_cost: 0,
             amortized_cost_cap_bips: 0,
@@ -142,7 +146,20 @@ impl<'a, CTX: ArbitrumContextTr> L1Pricing<'a, CTX> {
         self.per_batch_gas_cost().set(params.per_batch_gas_cost)?;
         self.amortized_cost_cap_bips()
             .set(params.amortized_cost_cap_bips)?;
+
+        // Register the default batch poster (nitro l1pricing.go:92-94)
+        self.batch_poster_table()
+            .add_if_missing(ARBOS_BATCH_POSTER_ADDRESS, ARBOS_BATCH_POSTER_ADDRESS)?;
+
         Ok(())
+    }
+
+    /// Add calldata units to the units_since_update counter.
+    /// Matches nitro `l1pricing.go:230-236` (AddToUnitsSinceUpdate).
+    pub fn add_to_units_since_update(&mut self, units: u64) -> Result<(), ArbosStateError> {
+        let old_units = self.units_since_update().get()?;
+        self.units_since_update()
+            .set(old_units.saturating_add(units))
     }
 
     pub fn get(&mut self) -> Result<L1PricingParams, ArbosStateError> {
@@ -416,6 +433,26 @@ impl<'a, CTX: ArbitrumContextTr> BatchPosterTable<'a, CTX> {
         self.get(batch_poster)
             .pay_recipient()
             .set(new_fee_collector)
+    }
+
+    /// Set funds due for a batch poster, atomically updating both the
+    /// individual poster's `fundsDue` and the aggregate `totalFundsDue`.
+    /// Matches nitro `batchPoster.go:119-134` (SetFundsDue).
+    pub fn set_funds_due(
+        &mut self,
+        batch_poster: Address,
+        new_val: U256,
+    ) -> Result<(), ArbosStateError> {
+        let old_val = self.get(batch_poster).funds_due().get()?;
+        self.get(batch_poster).funds_due().set(new_val)?;
+
+        let total = self.total_funds_due().get()?;
+        let total_u256 = U256::from(total.into_raw());
+        let new_total_u256 = total_u256.saturating_add(new_val).saturating_sub(old_val);
+        let new_total = I256::try_from(new_total_u256).unwrap_or(I256::MAX);
+        self.total_funds_due().set(new_total)?;
+
+        Ok(())
     }
 }
 

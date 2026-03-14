@@ -94,6 +94,11 @@ pub const INITIAL_L2_PRICING_INERTIA: u64 = 102;
 pub const INITIAL_L2_BACKLOG_TOLERANCE: u64 = 10;
 pub const INITIAL_L2_PER_TX_GAS_LIMIT: u64 = 32_000_000;
 
+// L1 pricing defaults — matching nitro `l1pricing.go:77-84`
+pub const INITIAL_L1_EQUILIBRATION_UNITS: u64 = 60 * 16 * 100_000;
+pub const INITIAL_L1_INERTIA: u64 = 10;
+pub const INITIAL_L1_PER_UNIT_REWARD: u64 = 10;
+
 /// Retryable ticket lifetime in seconds (7 days).
 pub const RETRYABLE_LIFETIME_SECONDS: u64 = 604_800;
 

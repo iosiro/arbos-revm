@@ -67,10 +67,33 @@ pub fn calculate_tx_l1_cost(
     U256::from(units).saturating_mul(l1_base_fee)
 }
 
+/// Calculate the L1 data cost and calldata units for a transaction.
+///
+/// Returns both the cost and the calldata units so that
+/// `units_since_update` can be tracked in L1 pricing state.
+///
+/// # Arguments
+/// * `enveloped_tx` - The enveloped transaction bytes
+/// * `l1_base_fee` - The L1 base fee (price per unit) from ArbOS state
+///
+/// # Returns
+/// Tuple of (l1_cost_in_wei, calldata_units)
+pub fn calculate_tx_l1_cost_and_units(enveloped_tx: &Bytes, l1_base_fee: U256) -> (U256, u64) {
+    if l1_base_fee.is_zero() {
+        return (U256::ZERO, 0);
+    }
+
+    let units = data_gas(enveloped_tx);
+    let cost = U256::from(units).saturating_mul(l1_base_fee);
+    (cost, units)
+}
+
 /// Calculate the poster gas (L1 gas converted to L2 gas units).
 ///
 /// This is the amount of L2 gas that will be charged to cover the L1 data cost.
-/// The formula is: poster_gas = l1_cost / l2_base_fee (rounded up)
+/// The formula is: poster_gas = l1_cost / l2_base_fee (truncating/floor division).
+///
+/// Matches nitro `tx_processor.go:432`: `BigDiv(posterCost, baseFee)` which truncates.
 ///
 /// # Arguments
 /// * `l1_cost` - The L1 cost in wei
@@ -83,8 +106,8 @@ pub fn calculate_poster_gas(l1_cost: U256, l2_base_fee: U256) -> u64 {
         return 0;
     }
 
-    // poster_gas = l1_cost / l2_base_fee (rounded up)
-    let poster_gas = l1_cost.saturating_add(l2_base_fee - U256::from(1)) / l2_base_fee;
+    // poster_gas = l1_cost / l2_base_fee (floor division, matching nitro BigDiv)
+    let poster_gas = l1_cost / l2_base_fee;
 
     // Saturate to u64::MAX if the result is too large
     poster_gas.try_into().unwrap_or(u64::MAX)
@@ -141,11 +164,11 @@ mod tests {
         let poster_gas = calculate_poster_gas(U256::from(160_000), U256::from(1000));
         assert_eq!(poster_gas, 160);
 
-        // Test rounding up
+        // Test truncation (floor division, matching nitro BigDiv)
         // L1 cost = 160,001 wei, L2 base fee = 1000 wei
-        // poster_gas = ceil(160,001 / 1000) = ceil(160.001) = 161
+        // poster_gas = floor(160,001 / 1000) = floor(160.001) = 160
         let poster_gas = calculate_poster_gas(U256::from(160_001), U256::from(1000));
-        assert_eq!(poster_gas, 161);
+        assert_eq!(poster_gas, 160);
     }
 
     #[test]

@@ -20,6 +20,14 @@ pub trait ArbitrumLocalContextTr: LocalContextTr {
     fn poster_gas(&self) -> Option<u64>;
     /// Set the poster gas
     fn set_poster_gas(&mut self, gas: Option<u64>);
+    /// Get the compute hold gas (gas held back to enforce per-TX gas cap)
+    fn compute_hold_gas(&self) -> u64;
+    /// Set the compute hold gas
+    fn set_compute_hold_gas(&mut self, gas: u64);
+    /// Get the calldata units for this transaction
+    fn calldata_units(&self) -> u64;
+    /// Set the calldata units
+    fn set_calldata_units(&mut self, units: u64);
 }
 
 /// Local context that is filled by execution.
@@ -39,6 +47,10 @@ pub struct ArbitrumLocalContext {
     pub tx_l1_cost: Option<U256>,
     /// Cached poster gas (L1 cost converted to L2 gas units)
     pub poster_gas: Option<u64>,
+    /// Gas held back to enforce per-TX gas cap. Must be refunded after execution.
+    pub compute_hold_gas: u64,
+    /// Calldata units tracked for L1 pricing unitsSinceUpdate.
+    pub calldata_units: u64,
 }
 
 impl Default for ArbitrumLocalContext {
@@ -51,6 +63,8 @@ impl Default for ArbitrumLocalContext {
             recent_wasms: VecDeque::new(),
             tx_l1_cost: None,
             poster_gas: None,
+            compute_hold_gas: 0,
+            calldata_units: 0,
         }
     }
 }
@@ -63,6 +77,8 @@ impl LocalContextTr for ArbitrumLocalContext {
         // Clear L1 fee related fields
         self.tx_l1_cost = None;
         self.poster_gas = None;
+        self.compute_hold_gas = 0;
+        self.calldata_units = 0;
     }
 
     fn shared_memory_buffer(&self) -> &Rc<RefCell<Vec<u8>>> {
@@ -140,6 +156,22 @@ impl ArbitrumLocalContextTr for ArbitrumLocalContext {
 
     fn set_poster_gas(&mut self, gas: Option<u64>) {
         self.poster_gas = gas;
+    }
+
+    fn compute_hold_gas(&self) -> u64 {
+        self.compute_hold_gas
+    }
+
+    fn set_compute_hold_gas(&mut self, gas: u64) {
+        self.compute_hold_gas = gas;
+    }
+
+    fn calldata_units(&self) -> u64 {
+        self.calldata_units
+    }
+
+    fn set_calldata_units(&mut self, units: u64) {
+        self.calldata_units = units;
     }
 }
 

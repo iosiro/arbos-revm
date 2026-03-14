@@ -1,4 +1,7 @@
-use revm::primitives::{Address, B256, Bytes, U256};
+use revm::{
+    interpreter::Gas,
+    primitives::{Address, B256, Bytes, U256},
+};
 
 use crate::{
     ArbitrumContextTr,
@@ -8,6 +11,76 @@ use crate::{
         StorageBackedTr, StorageBackedU64, StorageBackedU256, map_address, substorage,
     },
 };
+
+/// Sentinel value for nil/contract-creation address in retryable `to` field.
+/// Matches nitro's `AddressOrNil` which uses `2^255` (0x8000...0000) as sentinel.
+const ADDRESS_OR_NIL_SENTINEL: U256 = U256::from_limbs([0, 0, 0, 1u64 << 63]);
+
+/// Storage-backed address that supports nil-address encoding for contract creation.
+///
+/// Uses `2^255` (0x8000...0000) as sentinel for nil/contract-creation.
+/// - `get()`: If stored value == sentinel, returns `None`. Otherwise returns `Some(address)`.
+/// - `set(addr)`: If `None`, stores sentinel. Otherwise stores address.
+pub struct StorageBackedAddressOrNil<'a, CTX>
+where
+    CTX: ArbitrumContextTr,
+{
+    context: &'a mut CTX,
+    gas: Option<&'a mut Gas>,
+    is_static: bool,
+    slot: B256,
+}
+
+impl<'a, CTX: ArbitrumContextTr> StorageBackedAddressOrNil<'a, CTX> {
+    pub fn new(
+        context: &'a mut CTX,
+        gas: Option<&'a mut Gas>,
+        is_static: bool,
+        slot: B256,
+    ) -> Self {
+        Self {
+            context,
+            gas,
+            is_static,
+            slot,
+        }
+    }
+
+    pub fn get(&mut self) -> Result<Option<Address>, ArbosStateError> {
+        let word = StorageBackedU256::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            self.slot,
+        )
+        .get()?;
+
+        if word == ADDRESS_OR_NIL_SENTINEL {
+            Ok(None) // nil / contract creation
+        } else {
+            // Decode as address (last 20 bytes of the 32-byte word)
+            let addr = Address::from_word(B256::from(word.to_be_bytes()));
+            Ok(Some(addr))
+        }
+    }
+
+    pub fn set(&mut self, addr: Option<Address>) -> Result<(), ArbosStateError> {
+        let word = match addr {
+            None => ADDRESS_OR_NIL_SENTINEL,
+            Some(a) => {
+                let b256 = B256::from(U256::from_be_slice(a.as_slice()));
+                U256::from_be_slice(b256.as_slice())
+            }
+        };
+        StorageBackedU256::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            self.slot,
+        )
+        .set(word)
+    }
+}
 
 const ARBOS_STATE_RETRYABLE_TIMEOUT_QUEUE_KEY: &[u8] = &[0];
 const ARBOS_STATE_RETRYABLE_CALLDATA_KEY: &[u8] = &[1];
@@ -150,9 +223,11 @@ impl<'a, CTX: ArbitrumContextTr> Retryable<'a, CTX> {
         StorageBackedAddress::new(self.context, self.gas.as_deref_mut(), self.is_static, slot)
     }
 
-    pub fn to(&mut self) -> StorageBackedAddress<'_, CTX> {
+    /// Returns a StorageBackedAddressOrNil for the retryable `to` field.
+    /// This supports nil-address encoding (2^255 sentinel) for contract-creation retryables.
+    pub fn to(&mut self) -> StorageBackedAddressOrNil<'_, CTX> {
         let slot = self.slot(2);
-        StorageBackedAddress::new(self.context, self.gas.as_deref_mut(), self.is_static, slot)
+        StorageBackedAddressOrNil::new(self.context, self.gas.as_deref_mut(), self.is_static, slot)
     }
 
     pub fn callvalue(&mut self) -> StorageBackedU256<'_, CTX> {
@@ -184,7 +259,7 @@ impl<'a, CTX: ArbitrumContextTr> Retryable<'a, CTX> {
         self.num_tries().set(0)?;
         self.timeout().set(0)?;
         self.callvalue().set(U256::ZERO)?;
-        self.to().set(Address::ZERO)?;
+        self.to().set(Some(Address::ZERO))?;
         self.from().set(Address::ZERO)?;
         self.calldata().set(&Bytes::new())?;
         self.beneficiary().set(Address::ZERO)?;

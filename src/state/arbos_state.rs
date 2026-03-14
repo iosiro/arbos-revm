@@ -26,6 +26,7 @@ use crate::{
     },
 };
 
+const ARBOS_STATE_VERSION_OFFSET: u8 = 0;
 const ARBOS_STATE_UPGRADE_VERSION_OFFSET: u8 = 1;
 const ARBOS_STATE_UPGRADE_TIMESTAMP_OFFSET: u8 = 2;
 const ARBOS_STATE_NETWORK_FEE_ACCOUNT_OFFSET: u8 = 3;
@@ -50,6 +51,9 @@ pub trait ArbStateGetter<CTX: ArbitrumContextTr> {
     fn is_chain_owner(&mut self, address: Address) -> Result<bool, ArbosStateError>;
     fn is_native_token_owner(&mut self, address: Address) -> Result<bool, ArbosStateError>;
     fn code_hash(&mut self, address: Address) -> Result<B256, ArbosStateError>;
+    /// ArbOS version at slot 0 of the root state (versionOffset).
+    /// This is the current ArbOS version, distinct from upgrade_version (slot 1).
+    fn version(&mut self) -> StorageBackedU64<'_, CTX>;
     fn upgrade_timestamp(&mut self) -> StorageBackedU64<'_, CTX>;
     fn upgrade_version(&mut self) -> StorageBackedU64<'_, CTX>;
     fn network_fee_account(&mut self) -> StorageBackedAddress<'_, CTX>;
@@ -239,6 +243,15 @@ where
             self.gas.as_deref_mut(),
             self.is_static,
             state_subkey(ARBOS_STATE_PROGRAMS_KEY),
+        )
+    }
+
+    fn version(&mut self) -> StorageBackedU64<'_, CTX> {
+        StorageBackedU64::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            state_slot(ARBOS_STATE_VERSION_OFFSET),
         )
     }
 
