@@ -3,6 +3,7 @@
 
 //! EVM data access tests for Stylus programs.
 
+use arbos_revm::state::{ArbState, ArbStateGetter, types::StorageBackedTr};
 use revm::{
     context::result::ExecutionResult,
     primitives::{Address, U256},
@@ -19,6 +20,14 @@ fn test_e2e_evm_block_number() {
     let mut context = setup_context_with_arbos_state();
 
     context.block.number = U256::from(42);
+
+    // On Arbitrum, block.number in Stylus returns the L1 block number from ArbOS state
+    context
+        .arb_state(None, false)
+        .blockhashes()
+        .l1_block_number()
+        .set(42)
+        .expect("failed to set L1 block number");
 
     let wat = include_bytes!("../test-data/evm-data.wat");
     let program_address = deploy_wat_program(&mut context, wat);

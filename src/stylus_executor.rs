@@ -26,7 +26,7 @@ use revm::{
         InterpreterResult, gas::memory_gas, interpreter::EthInterpreter,
         interpreter_types::InputsTr,
     },
-    primitives::{Address, B256, Bytes, FixedBytes, Log, U256, alloy_primitives::U64, keccak256},
+    primitives::{Address, B256, Bytes, FixedBytes, Log, U256, alloy_primitives::U64},
 };
 use stylus::{
     brotli::{self, Dictionary},
@@ -53,7 +53,11 @@ use crate::{
     },
     context::ArbitrumContextTr,
     local_context::ArbitrumLocalContextTr,
-    state::{ArbState, ArbStateGetter, program::ProgramInfo, types::ArbosStateError},
+    state::{
+        ArbState, ArbStateGetter,
+        program::ProgramInfo,
+        types::{ArbosStateError, StorageBackedTr},
+    },
     stylus_api::StylusHandler,
 };
 
@@ -66,7 +70,12 @@ lazy_static::lazy_static! {
 type EvmApiHandler<'a> =
     Arc<Box<dyn Fn(EvmApiMethod, Vec<u8>) -> (Vec<u8>, VecReader, arbutil::evm::api::Gas) + 'a>>;
 
-pub fn build_evm_data<CTX>(context: &CTX, input: InputsImpl) -> EvmData
+pub fn build_evm_data<CTX>(
+    context: &CTX,
+    input: InputsImpl,
+    module_hash: Bytes32,
+    l1_block_number: u64,
+) -> EvmData
 where
     CTX: ArbitrumContextTr,
 {
@@ -84,17 +93,17 @@ where
         chainid: config_env.chain_id(),
         block_coinbase: Bytes20::try_from(block_env.beneficiary().as_slice()).unwrap(),
         block_gas_limit: U64::wrapping_from(block_env.gas_limit()).to::<u64>(),
-        block_number: U64::wrapping_from(block_env.number()).to::<u64>(),
+        block_number: l1_block_number,
         block_timestamp: U64::wrapping_from(block_env.timestamp()).to::<u64>(),
         contract_address: Bytes20::try_from(input.target_address.as_slice()).unwrap(),
-        module_hash: Bytes32::try_from(keccak256(input.target_address.as_slice()).as_slice())
-            .unwrap(),
+        module_hash,
         msg_sender: Bytes20::try_from(input.caller_address.as_slice()).unwrap(),
         msg_value: Bytes32::try_from(input.call_value.to_be_bytes_vec()).unwrap(),
         tx_gas_price: Bytes32::from(
             U256::from(tx_env.effective_gas_price(base_fee as u128)).to_be_bytes(),
         ),
         tx_origin: Bytes20::try_from(tx_env.caller().as_slice()).unwrap(),
+        // TODO: derive reentrant flag from call depth when depth tracking is available
         reentrant: 0,
         return_data_len: 0,
         cached: true,
@@ -401,6 +410,24 @@ where
             let compile_config =
                 CompileConfig::version(stylus_params.version, context.cfg().debug_mode());
 
+            // Read the actual module hash from program state (nitro: moduleHash, _ := p.moduleHashes.Get(codeHash))
+            let module_hash = context
+                .arb_state(None, true)
+                .programs()
+                .module_hash(&code_hash)
+                .get()
+                .map(|h| Bytes32::from(h.0))
+                .unwrap_or_default();
+
+            // Read L1 block number from ArbOS state (nitro: l1BlockNumber, err := evm.ProcessingHook.L1BlockNumber(evm.Context))
+            let l1_block_number_result = context
+                .arb_state(None, true)
+                .blockhashes()
+                .l1_block_number()
+                .get();
+            let l1_block_number =
+                l1_block_number_result.unwrap_or(context.block().number().to::<u64>());
+
             let evm_data = build_evm_data(
                 self.ctx(),
                 InputsImpl {
@@ -410,6 +437,8 @@ where
                     call_value: stylus_ctx.call_value,
                     bytecode_address: Some(stylus_ctx.target_address),
                 },
+                module_hash,
+                l1_block_number,
             );
 
             (stylus_config, compile_config, evm_data)
@@ -602,14 +631,29 @@ where
             "Stylus program finished"
         );
 
-        let result = match kind {
-            UserOutcomeKind::Success => revm::interpreter::InstructionResult::Return,
-            UserOutcomeKind::Revert => revm::interpreter::InstructionResult::Revert,
-            UserOutcomeKind::Failure => revm::interpreter::InstructionResult::Revert,
-            UserOutcomeKind::OutOfInk => revm::interpreter::InstructionResult::OutOfGas,
+        let (result, output) = match kind {
+            UserOutcomeKind::Success => (
+                revm::interpreter::InstructionResult::Return,
+                Bytes::from(data),
+            ),
+            UserOutcomeKind::Revert => (
+                revm::interpreter::InstructionResult::Revert,
+                Bytes::from(data),
+            ),
+            UserOutcomeKind::Failure => {
+                // Nitro returns nil data on failure, not the error string
+                (revm::interpreter::InstructionResult::Revert, Bytes::new())
+            }
+            UserOutcomeKind::OutOfInk => (
+                revm::interpreter::InstructionResult::OutOfGas,
+                Bytes::from(data),
+            ),
             UserOutcomeKind::OutOfStack => {
                 gas_left = 0;
-                revm::interpreter::InstructionResult::StackOverflow
+                (
+                    revm::interpreter::InstructionResult::StackOverflow,
+                    Bytes::from(data),
+                )
             }
         };
 
@@ -619,15 +663,15 @@ where
             .local_mut()
             .set_stylus_pages_open(stylus_open_pages);
 
-        if !data.is_empty() && self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_FIXES {
-            let evm_cost = memory_gas(data.len());
+        if !output.is_empty() && self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_FIXES {
+            let evm_cost = memory_gas(output.len().div_ceil(32));
 
             if gas.limit() < evm_cost {
                 debug!(
                     target: "arbos-revm::stylus",
                     bytecode_address = %stylus_ctx.bytecode_address,
                     target_address = %stylus_ctx.target_address,
-                    output_len = data.len(),
+                    output_len = output.len(),
                     evm_cost,
                     gas_limit = gas.limit(),
                     "Not enough gas to return Stylus output"
@@ -649,7 +693,7 @@ where
         }
         Some(InterpreterAction::Return(InterpreterResult {
             result,
-            output: data.into(),
+            output,
             gas,
         }))
     }
