@@ -1,3 +1,7 @@
+// TODO — Override the GASPRICE opcode to return `basefee` instead of the
+// transaction's gas price for ArbOS >= 3. revm does not currently expose
+// per-opcode overrides, so the standard EVM GASPRICE behaviour is used.
+
 use std::ops::Deref;
 
 use alloy_sol_types::{SolCall, sol};
@@ -6,8 +10,9 @@ use crate::{
     ArbitrumContextTr,
     config::ArbitrumConfigTr,
     constants::{
-        ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE,
-        ARBOS_ADDRESS, ARBOS_L1_PRICER_FUNDS_ADDRESS,
+        ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_RETRY_TX_TYPE,
+        ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBITRUM_UNSIGNED_TX_TYPE, ARBOS_ADDRESS,
+        ARBOS_L1_PRICER_FUNDS_ADDRESS,
     },
     l1_fee,
     local_context::ArbitrumLocalContextTr,
@@ -35,6 +40,19 @@ sol! {
     function startBlock(uint256 l1BaseFee, uint64 l1BlockNumber, uint64 l2BlockNumber, uint64 timePassed);
     function batchPostingReport(uint256 batchTimestamp, address batchPosterAddress, uint64 batchNumber, uint64 batchDataGas, uint256 l1BaseFeeWei);
     function batchPostingReportV2(uint256 batchTimestamp, address batchPosterAddress, uint64 batchNumber, uint64 batchCalldataLength, uint64 batchCalldataNonZeros, uint64 batchExtraGas, uint256 l1BaseFeeWei);
+}
+
+/// Returns true for Arbitrum-specific tx types that should have their
+/// tip dropped (gas price capped at basefee). Matches nitro DropTip().
+fn should_drop_tip(tx_type: u8) -> bool {
+    matches!(
+        tx_type,
+        ARBITRUM_DEPOSIT_TX_TYPE
+            | ARBITRUM_UNSIGNED_TX_TYPE
+            | ARBITRUM_RETRY_TX_TYPE
+            | ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE
+            | ARBITRUM_INTERNAL_TX_TYPE
+    )
 }
 
 pub struct ArbitrumHandler<EVM, ERROR, FRAME> {
@@ -333,8 +351,8 @@ where
 
         // Compute legacy cost for stats (nitro arbostypes/incomingmessage.go:169-176)
         // gas = TxDataZeroGas*(length-nonZeros) + TxDataNonZeroGasEIP2028*nonZeros
-        //     + Keccak256Gas + WordsForBytes(length)*Keccak256WordGas
-        //     + 2*SstoreSetGasEIP2200
+        // + Keccak256Gas + WordsForBytes(length)*Keccak256WordGas
+        // + 2*SstoreSetGasEIP2200
         let tx_data_zero_gas: u64 = 4;
         let tx_data_non_zero_gas_eip2028: u64 = 16;
         let keccak256_gas: u64 = 30;
@@ -507,6 +525,18 @@ where
                     l1_base_fee,
                     brotli_compression_level,
                 );
+                // Also get calldata units for tracking
+                let (_, calldata_units) =
+                    l1_fee::calculate_tx_l1_cost_and_units(enveloped_tx, l1_base_fee);
+
+                // Update units_since_update in L1 pricing state
+                if calldata_units > 0 {
+                    let _ = ctx
+                        .arb_state(None, false)
+                        .l1_pricing()
+                        .add_to_units_since_update(calldata_units);
+                }
+                ctx.local_mut().set_calldata_units(calldata_units);
 
                 // Calculate and cache poster gas
                 let basefee = ctx.block().basefee() as u128;
@@ -567,11 +597,46 @@ where
     /// - **Network fee account**: remaining compute cost
     /// - **L1 pricer pool**: the cached L1 data cost
     ///
+    /// Override reimburse_caller to enforce NonrefundableGas and DropTip.
+    /// - Poster gas is non-refundable (nitro NonrefundableGas = posterGas)
+    /// - Arbitrum-specific tx types use basefee, not effective_gas_price (DropTip)
+    fn reimburse_caller(
+        &self,
+        evm: &mut Self::Evm,
+        frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
+    ) -> Result<(), Self::Error> {
+        let gas = frame_result.gas();
+        let remaining = gas.remaining();
+        let refunded = gas.refunded() as u64;
+
+        let ctx = evm.ctx();
+        let poster_gas = ctx.local().poster_gas().unwrap_or(0);
+        let tx_type = ctx.tx().tx_type();
+        // DropTip — use basefee for Arbitrum-specific tx types
+        let basefee_u128 = ctx.block().basefee() as u128;
+        let effective_gas_price = if should_drop_tip(tx_type) {
+            U256::from(basefee_u128)
+        } else {
+            U256::from(ctx.tx().effective_gas_price(basefee_u128))
+        };
+
+        // Poster gas is non-refundable. Cap refund so we don't refund more
+        // than gas_used - poster_gas.
+        let gas_used = gas.used();
+        let refundable_used = gas_used.saturating_sub(poster_gas);
+        let max_refund = remaining.min(refundable_used);
+        let total_refund = max_refund.saturating_add(refunded.min(max_refund / 5));
+
+        let caller = ctx.tx().caller();
+        let refund_amount = effective_gas_price.saturating_mul(U256::from(total_refund));
+
+        // Use the mainnet handler's balance_incr pattern
+        let _ = evm.ctx().journal_mut().balance_incr(caller, refund_amount);
+
+        Ok(())
+    }
+
     /// Also drains the L2 gas pool by the compute gas consumed.
-    ///
-    /// Note: `reimburse_caller` (gas refund to the tx sender) is handled
-    /// separately by the default `post_execution` flow before this method
-    /// is called, so the gas refund is not affected.
     fn reward_beneficiary(
         &self,
         evm: &mut Self::Evm,
