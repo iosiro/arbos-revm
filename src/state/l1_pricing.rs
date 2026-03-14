@@ -8,6 +8,29 @@ use crate::{
     },
 };
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct L1PricingParams {
+    pub equilibration_units: U256,
+    pub inertia: u64,
+    pub per_unit_reward: u64,
+    pub price_per_unit: U256,
+    pub per_batch_gas_cost: u64,
+    pub amortized_cost_cap_bips: u64,
+}
+
+impl Default for L1PricingParams {
+    fn default() -> Self {
+        Self {
+            equilibration_units: U256::ZERO,
+            inertia: 0,
+            per_unit_reward: 0,
+            price_per_unit: U256::ZERO,
+            per_batch_gas_cost: 0,
+            amortized_cost_cap_bips: 0,
+        }
+    }
+}
+
 const ARBOS_L1_PRICING_BATCH_POSTER_TABLE_KEY: &[u8] = &[0];
 const ARBOS_L1_PRICING_PAY_RECIPIENT_OFFSET: u64 = 0;
 const ARBOS_L1_PRICING_EQUILIBRATION_UNITS_OFFSET: u64 = 1;
@@ -108,6 +131,28 @@ impl<'a, CTX: ArbitrumContextTr> L1Pricing<'a, CTX> {
     pub fn gas_floor_per_token(&mut self) -> StorageBackedU64<'_, CTX> {
         let slot = self.slot(ARBOS_L1_PRICING_GAS_FLOOR_PER_TOKEN_OFFSET);
         StorageBackedU64::new(self.context, self.gas.as_deref_mut(), self.is_static, slot)
+    }
+
+    pub fn initialize(&mut self, params: &L1PricingParams) -> Result<(), ArbosStateError> {
+        self.equilibration_units().set(params.equilibration_units)?;
+        self.inertia().set(params.inertia)?;
+        self.per_unit_reward().set(params.per_unit_reward)?;
+        self.price_per_unit().set(params.price_per_unit)?;
+        self.per_batch_gas_cost().set(params.per_batch_gas_cost)?;
+        self.amortized_cost_cap_bips()
+            .set(params.amortized_cost_cap_bips)?;
+        Ok(())
+    }
+
+    pub fn get(&mut self) -> Result<L1PricingParams, ArbosStateError> {
+        Ok(L1PricingParams {
+            equilibration_units: self.equilibration_units().get()?,
+            inertia: self.inertia().get()?,
+            per_unit_reward: self.per_unit_reward().get()?,
+            price_per_unit: self.price_per_unit().get()?,
+            per_batch_gas_cost: self.per_batch_gas_cost().get()?,
+            amortized_cost_cap_bips: self.amortized_cost_cap_bips().get()?,
+        })
     }
 }
 

@@ -7,6 +7,8 @@ pub mod program;
 pub mod retryable;
 pub mod types;
 pub use arbos_state::{ArbState, ArbStateGetter, ArbStateWrapper, ArbosStateParams};
+pub use l1_pricing::L1PricingParams;
+pub use l2_pricing::L2PricingParams;
 pub use types::ArbosStateError;
 
 macro_rules! try_state {

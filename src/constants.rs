@@ -85,5 +85,14 @@ pub const ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE: u8 = 0x69;
 pub const ARBITRUM_INTERNAL_TX_TYPE: u8 = 0x6A;
 pub const ARBITRUM_LEGACY_TX_TYPE: u8 = 0x78;
 
+// L2 pricing defaults — nitro v6+ values
+pub const INITIAL_L2_SPEED_LIMIT: u64 = 7_000_000;
+pub const INITIAL_L2_PER_BLOCK_GAS_LIMIT: u64 = 32_000_000;
+pub const INITIAL_L2_MIN_BASE_FEE_WEI: u64 = 100_000_000; // 0.1 gwei
+pub const INITIAL_L2_BASE_FEE_WEI: u64 = 100_000_000;
+pub const INITIAL_L2_PRICING_INERTIA: u64 = 102;
+pub const INITIAL_L2_BACKLOG_TOLERANCE: u64 = 10;
+pub const INITIAL_L2_PER_TX_GAS_LIMIT: u64 = 32_000_000;
+
 /// The ArbOS address used as the sender for internal transactions
 pub const ARBOS_ADDRESS: Address = address!("0x00000000000000000000000000000000000A4B05");

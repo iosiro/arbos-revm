@@ -15,8 +15,8 @@ use crate::{
     state::{
         address_table::AddressTable,
         block_hashes::BlockHashes,
-        l1_pricing::L1Pricing,
-        l2_pricing::L2Pricing,
+        l1_pricing::{L1Pricing, L1PricingParams},
+        l2_pricing::{L2Pricing, L2PricingParams},
         program::{DataPricerParams, Programs, StylusParams},
         retryable::{Retryable, RetryableState},
         types::{
@@ -107,6 +107,8 @@ pub struct ArbosStateParams {
     pub native_token_enabled_time: u64,
     pub stylus_params: StylusParams,
     pub data_pricer_params: DataPricerParams,
+    pub l1_pricing_params: L1PricingParams,
+    pub l2_pricing_params: L2PricingParams,
 }
 
 impl Default for ArbosStateParams {
@@ -122,6 +124,8 @@ impl Default for ArbosStateParams {
             native_token_enabled_time: 0,
             stylus_params: StylusParams::default(),
             data_pricer_params: DataPricerParams::default(),
+            l1_pricing_params: L1PricingParams::default(),
+            l2_pricing_params: L2PricingParams::default(),
         }
     }
 }
@@ -167,6 +171,9 @@ where
         self.programs()
             .initialize(&params.stylus_params, &params.data_pricer_params)?;
 
+        self.l1_pricing().initialize(&params.l1_pricing_params)?;
+        self.l2_pricing().initialize(&params.l2_pricing_params)?;
+
         Ok(())
     }
 
@@ -183,6 +190,8 @@ where
             native_token_enabled_time: self.native_token_enabled_time().get()?,
             stylus_params: self.programs().stylus_params().get()?,
             data_pricer_params: self.programs().data_pricer().get()?,
+            l1_pricing_params: self.l1_pricing().get()?,
+            l2_pricing_params: self.l2_pricing().get()?,
         };
 
         // If values are default/zero, populate from context without writing to storage.
