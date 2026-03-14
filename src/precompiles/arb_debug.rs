@@ -1,5 +1,7 @@
 use crate::{
-    ArbitrumContextTr, generate_state_mut_table,
+    ArbitrumContextTr,
+    config::ArbitrumConfigTr,
+    generate_state_mut_table,
     macros::{emit_event, interpreter_return, interpreter_revert},
     precompile_impl,
     precompiles::{
@@ -81,11 +83,22 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbDebugPrecompile {
         input: &[u8],
         _target_address: &Address,
         caller_address: Address,
-        _call_value: U256,
+        call_value: U256,
         is_static: bool,
         gas_limit: u64,
     ) -> Option<InterpreterResult> {
         let mut gas = Gas::new(gas_limit);
+
+        // Check if debug mode is enabled. If not, consume all gas and revert.
+        if !context.cfg().debug_mode() {
+            gas.spend_all();
+            return Some(InterpreterResult {
+                result: InstructionResult::Revert,
+                gas,
+                output: Bytes::from("debug precompiles are disabled"),
+            });
+        }
+
         let selector = selector_or_revert!(gas, input);
 
         match selector {
@@ -114,11 +127,12 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbDebugPrecompile {
                     B256::from(call.value),
                 );
 
+                // Return (caller, msg.value) matching nitro ArbDebug.go:44
                 interpreter_return!(
                     gas,
                     ArbDebug::eventsCall::abi_encode_returns(&ArbDebug::eventsReturn::from((
-                        address!("0x00000000000000000000000000000000000000ff"),
-                        U256::from(gas_limit),
+                        caller_address,
+                        call_value,
                     )))
                 );
             }

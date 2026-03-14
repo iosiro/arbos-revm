@@ -1,8 +1,6 @@
-use core::panic;
-
 use crate::{
     ArbitrumContextTr, generate_state_mut_table,
-    macros::{interpreter_return, interpreter_revert},
+    macros::{emit_event, interpreter_return, interpreter_revert},
     precompile_impl,
     precompiles::{
         ArbPrecompileLogic, ExtendedPrecompile, StateMutability, decode_call, selector_or_revert,
@@ -16,7 +14,7 @@ use revm::{
     context::JournalTr,
     interpreter::{Gas, InterpreterResult},
     precompile::PrecompileId,
-    primitives::{Address, Bytes, U256, address},
+    primitives::{Address, Bytes, Log, U256, address, alloy_primitives::IntoLogData},
 };
 
 sol! {
@@ -103,6 +101,20 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbNativeTokenManagerPr
                     .balance_incr(caller_address, call.amount)
                     .expect("Failed to mint native token");
 
+                // Emit NativeTokenMinted event after mint
+                emit_event!(
+                    context,
+                    Log {
+                        address: *target_address,
+                        data: ArbNativeTokenManager::NativeTokenMinted {
+                            to: caller_address,
+                            amount: call.amount,
+                        }
+                        .into_log_data()
+                    },
+                    gas
+                );
+
                 let output = ArbNativeTokenManager::mintNativeTokenCall::abi_encode_returns(
                     &ArbNativeTokenManager::mintNativeTokenReturn {},
                 );
@@ -123,11 +135,27 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbNativeTokenManagerPr
                     interpreter_revert!(gas, Bytes::from("burn amount exceeds balance"));
                 };
 
+                // Burn tokens by transferring to Address::ZERO (destroys them)
+                // rather than transferring to the precompile address.
                 match context
                     .journal_mut()
-                    .transfer(caller_address, *target_address, call.amount)
+                    .transfer(caller_address, Address::ZERO, call.amount)
                 {
                     Ok(None) => {
+                        // Emit NativeTokenBurned event after burn
+                        emit_event!(
+                            context,
+                            Log {
+                                address: *target_address,
+                                data: ArbNativeTokenManager::NativeTokenBurned {
+                                    from: caller_address,
+                                    amount: call.amount,
+                                }
+                                .into_log_data()
+                            },
+                            gas
+                        );
+
                         let output = ArbNativeTokenManager::burnNativeTokenCall::abi_encode_returns(
                             &ArbNativeTokenManager::burnNativeTokenReturn {},
                         );

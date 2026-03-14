@@ -227,6 +227,19 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
                 let mut retryable = arb_state.retryable(call.ticketId);
                 try_state!(gas, retryable.clear());
 
+                // Emit Canceled event after successfully deleting the retryable
+                emit_event!(
+                    context,
+                    Log {
+                        address: *target_address,
+                        data: ArbRetryableTx::Canceled {
+                            ticketId: call.ticketId,
+                        }
+                        .into_log_data()
+                    },
+                    gas
+                );
+
                 let output = ArbRetryableTx::cancelCall::abi_encode_returns(
                     &ArbRetryableTx::cancelReturn {},
                 );

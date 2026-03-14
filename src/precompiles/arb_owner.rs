@@ -1,7 +1,7 @@
 use alloy_sol_types::{SolCall, sol};
 use revm::{
     context::{Block, JournalTr},
-    interpreter::{Gas, InterpreterResult},
+    interpreter::{Gas, InstructionResult, InterpreterResult},
     precompile::PrecompileId,
     primitives::{Address, Bytes, Log, U256, address, alloy_primitives::IntoLogData},
 };
@@ -9,7 +9,10 @@ use revm::{
 use crate::{
     ArbitrumContextTr,
     config::ArbitrumConfigTr,
-    constants::{ARBOS_L1_PRICER_FUNDS_ADDRESS, COST_SCALAR_PERCENT},
+    constants::{
+        ARBOS_L1_PRICER_FUNDS_ADDRESS, COST_SCALAR_PERCENT, MIN_CACHED_GAS_UNITS,
+        MIN_INIT_GAS_UNITS,
+    },
     generate_state_mut_table,
     macros::{emit_event, interpreter_return, interpreter_revert},
     precompile_impl,
@@ -211,9 +214,9 @@ interface ArbOwner {
     ) external;
 
     /// @notice Sets the minimum costs to invoke a program
-    /// @param gas amount of gas paid in increments of 256 when not the program is not cached
-    /// @param cached amount of gas paid in increments of 64 when the program is cached
-    function setWasmMinInitGas(uint8 gas, uint16 cached) external;
+    /// @param gas the minimum gas required, divided by 128 before storing
+    /// @param cached the minimum cached gas required, divided by 32 before storing
+    function setWasmMinInitGas(uint64 gas, uint64 cached) external;
 
     /// @notice Sets the linear adjustment made to program init costs.
     /// @param percent the adjustment (100% = no adjustment).
@@ -257,6 +260,26 @@ interface ArbOwner {
     ///
     function setCalldataPriceIncrease(
         bool enable
+    ) external;
+
+    /// @notice Set how much L1 charges per non-zero byte of calldata
+    function setParentGasFloorPerToken(
+        uint64 gasFloorPerToken
+    ) external;
+
+    /// @notice Set the maximum size a block can be
+    function setMaxBlockGasLimit(
+        uint64 limit
+    ) external;
+
+    /// @notice Set the L2 gas backlog directly (used by single-constraint pricing model only)
+    function setGasBacklog(
+        uint64 backlog
+    ) external;
+
+    /// @notice Set the gas pricing constraints used by the multi-constraint pricing model
+    function setGasPricingConstraints(
+        uint64[3][] calldata constraints
     ) external;
 
     /// Emitted when a successful call is made to this precompile
@@ -350,6 +373,10 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
             removeWasmCacheManagerCall(NonPayable),
             setChainConfigCall(NonPayable),
             setCalldataPriceIncreaseCall(NonPayable),
+            setParentGasFloorPerTokenCall(NonPayable),
+            setMaxBlockGasLimitCall(NonPayable),
+            setGasBacklogCall(NonPayable),
+            setGasPricingConstraintsCall(NonPayable),
         }
     };
 
@@ -395,6 +422,21 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 }
                 ArbOwner::addNativeTokenOwnerCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::addNativeTokenOwnerCall, input);
+
+                    let enabled_time = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .native_token_enabled_time()
+                            .get()
+                    );
+                    let now = context.block().timestamp().saturating_to::<u64>();
+                    if enabled_time == 0 || enabled_time > now {
+                        interpreter_revert!(
+                            gas,
+                            Bytes::from("native token feature is not enabled yet")
+                        );
+                    }
 
                     try_state!(
                         gas,
@@ -575,12 +617,18 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                     let call = decode_call!(gas, ArbOwner::setCalldataPriceIncreaseCall, input);
 
                     let mut arb_state = context.arb_state(Some(&mut gas), is_static);
-                    let mut l1_pricing = arb_state.l1_pricing();
+                    let current = try_state!(gas, arb_state.features().get());
+                    let new_value = if call.enable {
+                        current | U256::from(1) // set bit 0
+                    } else {
+                        current & !U256::from(1) // clear bit 0
+                    };
                     try_state!(
                         gas,
-                        l1_pricing
-                            .gas_floor_per_token()
-                            .set(if call.enable { 1 } else { 0 })
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .features()
+                            .set(new_value)
                     );
 
                     interpreter_return!(gas, Bytes::new());
@@ -874,9 +922,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 ArbOwner::setPerBatchGasChargeCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::setPerBatchGasChargeCall, input);
 
-                    if call.cost < 0 {
-                        interpreter_revert!(gas, Bytes::from("negative cost not allowed"));
-                    }
+                    // Nitro accepts negative values (int64). Store as two's complement u64.
                     try_state!(
                         gas,
                         context
@@ -1081,9 +1127,14 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 ArbOwner::setWasmMinInitGasCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::setWasmMinInitGasCall, input);
 
-                    if call.cached > u16::from(u8::MAX) {
-                        interpreter_revert!(gas, Bytes::from("cached gas too large"));
-                    }
+                    // Nitro divides by MinInitGasUnits(128) and MinCachedGasUnits(32)
+                    // before storing as uint8 values, saturating to u8::MAX.
+                    let min_init = call.gas.div_ceil(MIN_INIT_GAS_UNITS).min(u8::MAX as u64) as u8;
+                    let min_cached = call
+                        .cached
+                        .div_ceil(MIN_CACHED_GAS_UNITS)
+                        .min(u8::MAX as u64) as u8;
+
                     let mut params = try_state!(
                         gas,
                         context
@@ -1092,8 +1143,8 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                             .stylus_params()
                             .get()
                     );
-                    params.min_init_gas = call.gas;
-                    params.min_cached_init_gas = call.cached as u8;
+                    params.min_init_gas = min_init;
+                    params.min_cached_init_gas = min_cached;
                     try_state!(
                         gas,
                         context
@@ -1215,25 +1266,85 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                     );
                     interpreter_return!(gas, Bytes::new());
                 }
+                ArbOwner::setParentGasFloorPerTokenCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::setParentGasFloorPerTokenCall, input);
+
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .l1_pricing()
+                            .gas_floor_per_token()
+                            .set(call.gasFloorPerToken)
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
+                ArbOwner::setMaxBlockGasLimitCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::setMaxBlockGasLimitCall, input);
+
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .l2_pricing()
+                            .per_block_gas_limit()
+                            .set(call.limit)
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
+                ArbOwner::setGasBacklogCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::setGasBacklogCall, input);
+
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .l2_pricing()
+                            .gas_backlog()
+                            .set(call.backlog)
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
+                ArbOwner::setGasPricingConstraintsCall::SELECTOR => {
+                    // TODO: Multi-constraint gas pricing is not yet supported.
+                    // This is a stub that accepts the call but does nothing.
+                    let _call = decode_call!(gas, ArbOwner::setGasPricingConstraintsCall, input);
+                    interpreter_return!(gas, Bytes::new());
+                }
                 _ => interpreter_revert!(gas, Bytes::from("Unknown selector")),
             }
         }
 
         let result = run_arbos_owner(context, selector, input, is_static, gas);
 
-        emit_event!(
-            context,
-            Log {
-                address: address!("0x0000000000000000000000000000000000000070"),
-                data: ArbOwner::OwnerActs {
-                    method: selector.into(),
-                    owner: caller_address,
-                    data: Bytes::from(input[4..].to_vec())
-                }
-                .to_log_data(),
-            },
-            gas
-        );
+        // Only emit OwnerActs on success (matching nitro wrapper.go:110-124)
+        // On success, refund all gas (owners don't pay gas in nitro)
+        if let Some(ref r) = result
+            && r.result == InstructionResult::Return
+        {
+            let mut emit_gas = Gas::new(gas_limit);
+
+            emit_event!(
+                context,
+                Log {
+                    address: address!("0x0000000000000000000000000000000000000070"),
+                    data: ArbOwner::OwnerActs {
+                        method: selector.into(),
+                        owner: caller_address,
+                        data: Bytes::from(input[4..].to_vec())
+                    }
+                    .to_log_data(),
+                },
+                emit_gas
+            );
+
+            // Refund all gas to the owner on success
+            return Some(InterpreterResult {
+                result: InstructionResult::Return,
+                gas: Gas::new(gas_limit),
+                output: r.output.clone(),
+            });
+        }
 
         result
     }
