@@ -10,17 +10,33 @@ pub const STYLUS_DISCRIMINANT: &[u8] = &[
     STYLUS_EOF_VERSION,
 ];
 
-pub const INITIAL_ARBOS_VERSION: u16 = 42;
-pub const ARBOS_VERSION_STYLUS_FIXES: u16 = 31;
+pub const ARBOS_VERSION_STYLUS_FIXES: u64 = 31;
+pub const ARBOS_VERSION_STYLUS_CHARGING_FIXES: u64 = 32;
+pub const ARBOS_VERSION_MAX_WASM_SIZE: u64 = 40;
+pub const ARBOS_VERSION_DIA: u64 = 50;
+pub const ARBOS_VERSION_STYLUS_V3: u64 = 59;
+pub const ARBOS_VERSION_STYLUS_ACTIVATION_GAS: u64 = 59;
+pub const ARBOS_VERSION_STYLUS_CONTRACT_LIMIT: u64 = 60;
+pub const ARBOS_VERSION_COLLECT_TIPS: u64 = 60;
+pub const ARBOS_VERSION_TRANSACTION_FILTERING: u64 = 60;
+pub const MAX_ARBOS_VERSION_SUPPORTED: u64 = 61;
+
+/// Default ArbOS execution version supported by this crate and its pinned native
+/// Stylus runtime. Historical layouts remain explicitly selectable.
+pub const INITIAL_ARBOS_VERSION: u64 = 61;
 pub const INITIAL_STYLUS_VERSION: u16 = 2;
 pub const INITIAL_MAX_WASM_SIZE: u32 = 128 * 1024; // max decompressed wasm size (programs are also bounded by compressed size)
+pub const ARBOS_60_MAX_WASM_SIZE: u32 = 256 * 1024;
 pub const INITIAL_MAX_STACK_DEPTH: u32 = 4 * 65536; // 4 page stack.
+pub const ARBOS_50_MAX_STACK_DEPTH: u32 = 22_000;
+pub const INITIAL_MAX_FRAGMENT_COUNT: u8 = 4;
 pub const INITIAL_FREE_PAGES: u16 = 2; // 2 pages come free
 pub const INITIAL_PAGE_GAS: u16 = 1000; // linear cost per allocation.
 pub const INITIAL_PAGE_RAMP: u64 = 620674314; // targets 8
 pub const INITIAL_PAGE_LIMIT: u16 = 128; // reject wasms with memories larger than 8MB.
 pub const INITIAL_INK_PRICE: u32 = 10000; // 1 evm
 pub const INITIAL_MIN_INIT_GAS: u8 = 72; // charge 72 * 128 = 9216 gas.
+pub const STYLUS_V2_MIN_INIT_GAS: u8 = 69;
 pub const INITIAL_MIN_CACHED_GAS: u8 = 11; // charge 11
 pub const INITIAL_INIT_COST_SCALAR: u8 = 50; // scale costs 1:1 (100%)
 pub const INITIAL_CACHED_COST_SCALAR: u8 = 50; // scale costs
@@ -30,7 +46,7 @@ pub const INITIAL_RECENT_CACHE_SIZE: u16 = 32; // cache the 32 most recent progr
 
 pub const INITIAL_DATA_PRICER_DEMAND: u32 = 0;
 pub const INITIAL_DATA_PRICER_BYTES_PER_SECOND: u32 = ((1_u64 << 40) / (365 * 24 * 60 * 60)) as u32; // 1 TB p/a
-pub const INITIAL_DATA_PRICER_LAST_UPDATE_TIME: u64 = ARBOS_GENESIS_TIMESTAMP as u64;
+pub const INITIAL_DATA_PRICER_LAST_UPDATE_TIME: u64 = ARBOS_GENESIS_TIMESTAMP;
 pub const INITIAL_DATA_PRICER_MIN_PRICE: u32 = 82928201;
 pub const INITIAL_DATA_PRICER_INERTIA: u32 = 21360419;
 
@@ -61,20 +77,27 @@ pub const ARBOS_CHAIN_CONFIG_KEY: &[u8] = &[7];
 pub const ARBOS_STATE_PROGRAMS_KEY: &[u8] = &[8];
 pub const ARBOS_STATE_FEATURES_KEY: &[u8] = &[9];
 pub const ARBOS_STATE_NATIVE_TOKEN_OWNER_KEY: &[u8] = &[10];
+pub const ARBOS_STATE_TRANSACTION_FILTERER_KEY: &[u8] = &[11];
 
 pub const ARBOS_PROGRAMS_STATE_PARAMS_KEY: &[u8] = &[0];
 pub const ARBOS_PROGRAMS_STATE_PROGRAM_DATA_KEY: &[u8] = &[1];
 pub const ARBOS_PROGRAMS_STATE_MODULE_HASHES_KEY: &[u8] = &[2];
 pub const ARBOS_PROGRAMS_STATE_DATA_PRICER_KEY: &[u8] = &[3];
 pub const ARBOS_PROGRAMS_STATE_CACHE_MANAGERS_KEY: &[u8] = &[4];
+pub const ARBOS_PROGRAMS_STATE_ACTIVATION_GAS_KEY: &[u8] = &[5];
 
 pub const ARBOS_STATE_ADDRESS: Address = address!("0xA4B05FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+pub const FILTERED_TRANSACTIONS_STATE_ADDRESS: Address =
+    address!("0xA4B0500000000000000000000000000000000001");
 pub const ARBOS_BATCH_POSTER_ADDRESS: Address =
     address!("0xA4B000000000000000000073657175656e636572");
 pub const ARBOS_L1_PRICER_FUNDS_ADDRESS: Address =
     address!("0xA4B00000000000000000000000000000000000f6");
+pub const HISTORY_STORAGE_ADDRESS: Address = address!("0x0000F90827F1C53a10cb7A02335B175320002935");
+pub const HISTORY_SERVE_WINDOW: u64 = 8_191;
 
-pub const ARBOS_GENESIS_TIMESTAMP: u32 = 1672531200; // January 1, 2023 00:00:00 GMT
+/// Nitro's `programs.ArbitrumStartTime`, used as the epoch for compact Stylus timestamps.
+pub const ARBOS_GENESIS_TIMESTAMP: u64 = 1_421_388_000;
 
 // Arbitrum Transaction Types (EIP-2718 style)
 pub const ARBITRUM_DEPOSIT_TX_TYPE: u8 = 0x64;

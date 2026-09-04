@@ -1,8 +1,8 @@
 use std::ops::{Deref, DerefMut};
 
 use crate::{
-    ArbitrumContextTr, constants::STYLUS_DISCRIMINANT, handler::ArbitrumHandler,
-    transaction::ArbitrumTransactionError,
+    ArbitrumContextTr, constants::STYLUS_DISCRIMINANT, context::ArbitrumContextMutTr,
+    handler::ArbitrumHandler, transaction::ArbitrumTransactionError,
 };
 use revm::{
     Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, Inspector,
@@ -177,7 +177,7 @@ where
 impl<CTX, INSP, INST, PRECOMPILES> ExecuteEvm
     for ArbitrumEvm<CTX, INSP, PRECOMPILES, INST, EthFrame<EthInterpreter>>
 where
-    CTX: ArbitrumContextTr<Journal: JournalTr<State = EvmState>> + ContextSetters,
+    CTX: ArbitrumContextMutTr<Journal: JournalTr<State = EvmState>> + ContextSetters,
     INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
@@ -215,7 +215,7 @@ where
 impl<CTX, INSP, INST, PRECOMPILES> ExecuteCommitEvm
     for ArbitrumEvm<CTX, INSP, PRECOMPILES, INST, EthFrame<EthInterpreter>>
 where
-    CTX: ArbitrumContextTr<Journal: JournalTr<State = EvmState>, Db: DatabaseCommit>
+    CTX: ArbitrumContextMutTr<Journal: JournalTr<State = EvmState>, Db: DatabaseCommit>
         + ContextSetters,
     INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,

@@ -8,9 +8,11 @@ use revm::{
 
 use crate::constants::INITIAL_ARBOS_VERSION;
 
-#[auto_impl(&, &mut, Box, Arc)]
+#[auto_impl(&mut, Box)]
 pub trait ArbitrumConfigTr: Cfg {
-    fn arbos_version(&self) -> u16;
+    fn arbos_version(&self) -> u64;
+    /// Refresh the live execution version after a persisted ArbOS upgrade.
+    fn set_arbos_version(&mut self, version: u64);
     fn debug_mode(&self) -> bool;
     fn disable_auto_cache(&self) -> bool;
     fn disable_auto_activate(&self) -> bool;
@@ -22,7 +24,7 @@ pub trait ArbitrumConfigTr: Cfg {
 pub struct ArbitrumConfig<SPEC = SpecId> {
     pub inner: CfgEnv<SPEC>,
 
-    pub arbos_version: u16,
+    pub arbos_version: u64,
     pub debug_mode: bool,
     pub disable_auto_cache: bool,
     pub disable_auto_activate: bool,
@@ -134,8 +136,12 @@ impl<SPEC> ArbitrumConfigTr for ArbitrumConfig<SPEC>
 where
     SPEC: Into<SpecId> + Copy + Copy,
 {
-    fn arbos_version(&self) -> u16 {
+    fn arbos_version(&self) -> u64 {
         self.arbos_version
+    }
+
+    fn set_arbos_version(&mut self, version: u64) {
+        self.arbos_version = version;
     }
 
     fn debug_mode(&self) -> bool {

@@ -1,19 +1,26 @@
 use alloy_sol_types::{SolCall, SolError, sol};
 use revm::{
+    context::{Block, JournalTr, Transaction},
     interpreter::{Gas, InterpreterResult},
     precompile::PrecompileId,
-    primitives::{Address, B256, Bytes, FixedBytes, U256, address, fixed_bytes},
+    primitives::{
+        Address, B256, Bytes, FixedBytes, Log, U256, address, alloy_primitives::IntoLogData,
+        fixed_bytes, keccak256,
+    },
 };
 
 use crate::{
     ArbitrumContextTr,
     config::ArbitrumConfigTr,
+    constants::{ARBITRUM_CONTRACT_TX_TYPE, ARBITRUM_RETRY_TX_TYPE, ARBITRUM_UNSIGNED_TX_TYPE},
     generate_state_mut_table,
-    macros::{interpreter_return, interpreter_revert},
+    macros::{emit_event, interpreter_return, interpreter_revert},
     precompile_impl,
     precompiles::{
         ArbPrecompileLogic, ExtendedPrecompile, StateMutability, decode_call, selector_or_revert,
     },
+    state::{ArbState, ArbStateGetter, try_state, types::StorageBackedTr},
+    try_record_cost,
 };
 
 sol! {
@@ -194,10 +201,10 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
     fn inner(
         context: &mut CTX,
         input: &[u8],
-        _target_address: &Address,
-        _caller_address: Address,
-        _call_value: U256,
-        _is_static: bool,
+        target_address: &Address,
+        caller_address: Address,
+        call_value: U256,
+        is_static: bool,
         gas_limit: u64,
     ) -> Option<InterpreterResult> {
         let mut gas = Gas::new(gas_limit);
@@ -230,7 +237,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
                 let requested_block: u64 = call.arbBlockNum.saturating_to();
 
                 if requested_block >= current_block || requested_block + 256 < current_block {
-                    if context.cfg().arbos_version() >= 33 {
+                    if context.cfg().arbos_version() >= 11 {
                         interpreter_revert!(
                             gas,
                             ArbSys::InvalidBlockNumber {
@@ -241,7 +248,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
                         );
                     }
 
-                    interpreter_return!(gas, Bytes::from("invalid block number for ArbBlockHAsh"));
+                    interpreter_revert!(gas, Bytes::from("invalid block number for ArbBlockHAsh"));
                 }
 
                 let hash = context.block_hash(requested_block).unwrap_or_default();
@@ -256,7 +263,9 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
                 interpreter_return!(gas, Bytes::from(output));
             }
             ArbSys::isTopLevelCallCall::SELECTOR => {
-                let output = ArbSys::isTopLevelCallCall::abi_encode_returns(&false);
+                let output = ArbSys::isTopLevelCallCall::abi_encode_returns(
+                    &(context.journal().depth() <= 2),
+                );
 
                 interpreter_return!(gas, Bytes::from(output));
             }
@@ -273,33 +282,94 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
                 interpreter_return!(gas, Bytes::from(output));
             }
             ArbSys::wasMyCallersAddressAliasedCall::SELECTOR => {
-                let output = ArbSys::wasMyCallersAddressAliasedCall::abi_encode_returns(&false);
+                let aliases = matches!(
+                    context.tx().tx_type(),
+                    ARBITRUM_UNSIGNED_TX_TYPE | ARBITRUM_CONTRACT_TX_TYPE | ARBITRUM_RETRY_TX_TYPE
+                );
+                let depth = context.journal().depth();
+                let top_level = if context.cfg().arbos_version() < 6 {
+                    depth == 2
+                } else {
+                    depth <= 2
+                };
+                let output = ArbSys::wasMyCallersAddressAliasedCall::abi_encode_returns(
+                    &(top_level && aliases),
+                );
 
                 interpreter_return!(gas, Bytes::from(output));
             }
             ArbSys::myCallersAddressWithoutAliasingCall::SELECTOR => {
-                let address = Address::ZERO;
+                let depth = context.journal().depth();
+                let top_level = if context.cfg().arbos_version() < 6 {
+                    depth == 2
+                } else {
+                    depth <= 2
+                };
+                let aliases = top_level
+                    && matches!(
+                        context.tx().tx_type(),
+                        ARBITRUM_UNSIGNED_TX_TYPE
+                            | ARBITRUM_CONTRACT_TX_TYPE
+                            | ARBITRUM_RETRY_TX_TYPE
+                    );
+                let mut address = if depth > 1 {
+                    context.tx().caller()
+                } else {
+                    Address::ZERO
+                };
+                if aliases {
+                    address = inverse_remap_l1_address(&address);
+                }
                 let output =
                     ArbSys::myCallersAddressWithoutAliasingCall::abi_encode_returns(&address);
 
                 interpreter_return!(gas, Bytes::from(output));
             }
             ArbSys::sendTxToL1Call::SELECTOR => {
-                let output = ArbSys::sendTxToL1Call::abi_encode_returns(&U256::ONE);
-
-                interpreter_return!(gas, Bytes::from(output));
+                let call = decode_call!(gas, ArbSys::sendTxToL1Call, input);
+                send_tx_to_l1(
+                    context,
+                    target_address,
+                    caller_address,
+                    call.destination,
+                    call.data,
+                    call_value,
+                    is_static,
+                    &mut gas,
+                )
             }
             ArbSys::withdrawEthCall::SELECTOR => {
-                let output = ArbSys::withdrawEthCall::abi_encode_returns(&U256::ONE);
-
-                interpreter_return!(gas, Bytes::from(output));
+                let call = decode_call!(gas, ArbSys::withdrawEthCall, input);
+                send_tx_to_l1(
+                    context,
+                    target_address,
+                    caller_address,
+                    call.destination,
+                    Bytes::new(),
+                    call_value,
+                    is_static,
+                    &mut gas,
+                )
             }
             ArbSys::sendMerkleTreeStateCall::SELECTOR => {
+                if caller_address != Address::ZERO {
+                    interpreter_revert!(
+                        gas,
+                        Bytes::from("method can only be called by address zero")
+                    );
+                }
+                let (size, root, partials) = try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .send_merkle()
+                        .state_for_export()
+                );
                 let output = ArbSys::sendMerkleTreeStateCall::abi_encode_returns(
                     &ArbSys::sendMerkleTreeStateReturn {
-                        size: U256::ZERO,
-                        root: B256::ZERO,
-                        partials: vec![],
+                        size: U256::from(size),
+                        root,
+                        partials,
                     },
                 );
 
@@ -308,6 +378,128 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
             _ => interpreter_revert!(gas, Bytes::from("Unknown function selector")),
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_tx_to_l1<CTX: ArbitrumContextTr>(
+    context: &mut CTX,
+    target_address: &Address,
+    caller: Address,
+    destination: Address,
+    data: Bytes,
+    value: U256,
+    is_static: bool,
+    mut gas: &mut Gas,
+) -> Option<InterpreterResult> {
+    let arbos_version = context.cfg().arbos_version();
+    let l1_block_number = try_state!(
+        gas,
+        context
+            .arb_state(None, is_static)
+            .blockhashes()
+            .l1_block_number()
+            .get()
+    );
+    if arbos_version >= 41 && !value.is_zero() {
+        let native_token_owner_count = try_state!(
+            gas,
+            context
+                .arb_state(Some(gas), is_static)
+                .native_token_owners()
+                .size()
+        );
+        if native_token_owner_count > 0 {
+            interpreter_revert!(
+                gas,
+                Bytes::from_static(b"not allowed to send value when native token owners exist")
+            );
+        }
+    }
+
+    let l2_block = context.block_number();
+    let timestamp = context.block().timestamp();
+    let hash_input_len = 20usize * 2 + 32usize * 4 + data.len();
+    try_record_cost!(
+        gas,
+        30u64.saturating_add(6u64.saturating_mul(hash_input_len.div_ceil(32) as u64))
+    );
+    let send_hash = keccak256(
+        [
+            caller.as_slice(),
+            destination.as_slice(),
+            &l2_block.to_be_bytes::<32>(),
+            &U256::from(l1_block_number).to_be_bytes::<32>(),
+            &timestamp.to_be_bytes::<32>(),
+            &value.to_be_bytes::<32>(),
+            data.as_ref(),
+        ]
+        .concat(),
+    );
+
+    let (events, size) = {
+        let mut state = context.arb_state(Some(gas), is_static);
+        let mut accumulator = state.send_merkle();
+        let events = try_state!(gas, accumulator.append(send_hash));
+        let size = try_state!(gas, accumulator.size());
+        (events, size)
+    };
+
+    if !value.is_zero() {
+        let mut account = context
+            .journal_mut()
+            .load_account_mut(*target_address)
+            .ok()?
+            .data;
+        let Some(balance) = account.balance().checked_sub(value) else {
+            interpreter_revert!(gas);
+        };
+        account.set_balance(balance);
+    }
+
+    for event in events {
+        let position = (U256::from(event.level) << 192) + U256::from(event.num_leaves);
+        emit_event!(
+            context,
+            Log {
+                address: *target_address,
+                data: ArbSys::SendMerkleUpdate {
+                    reserved: U256::ZERO,
+                    hash: event.hash,
+                    position,
+                }
+                .to_log_data(),
+            },
+            gas
+        );
+    }
+
+    let leaf = U256::from(size - 1);
+    emit_event!(
+        context,
+        Log {
+            address: *target_address,
+            data: ArbSys::L2ToL1Tx {
+                caller,
+                destination,
+                hash: U256::from_be_bytes(send_hash.0),
+                position: leaf,
+                arbBlockNum: l2_block,
+                ethBlockNum: U256::from(l1_block_number),
+                timestamp,
+                callvalue: value,
+                data: data.clone(),
+            }
+            .to_log_data(),
+        },
+        gas
+    );
+
+    let identifier = if arbos_version >= 4 {
+        leaf
+    } else {
+        U256::from_be_bytes(send_hash.0)
+    };
+    interpreter_return!(gas, ArbSys::sendTxToL1Call::abi_encode_returns(&identifier));
 }
 
 const ADDRESS_ALIAS_OFFSET: FixedBytes<32> =
@@ -319,4 +511,10 @@ fn remap_l1_address(l1_addr: &Address) -> Address {
     let sum_bytes: [u8; 32] = sum.to_be_bytes();
     let aliased_bytes = &sum_bytes[12..32];
     Address::from_slice(aliased_bytes)
+}
+
+fn inverse_remap_l1_address(l2_alias: &Address) -> Address {
+    let value = U256::from_be_bytes(B256::left_padding_from(l2_alias.as_slice()).0)
+        .wrapping_sub(U256::from_be_bytes(ADDRESS_ALIAS_OFFSET.0));
+    Address::from_slice(&value.to_be_bytes::<32>()[12..])
 }

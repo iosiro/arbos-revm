@@ -1,10 +1,12 @@
 use alloy_sol_types::{SolCall, sol};
 use revm::{
-    context::JournalTr,
+    context::{Block, JournalTr},
     interpreter::{Gas, InterpreterResult},
     precompile::PrecompileId,
     primitives::{Address, Bytes, Log, U256, address, alloy_primitives::IntoLogData},
 };
+
+const FEATURE_ENABLE_DELAY: u64 = 7 * 24 * 60 * 60;
 
 use crate::{
     ArbitrumContextTr,
@@ -77,6 +79,14 @@ interface ArbOwner {
     /// Available in ArbOS version 41
     function getAllNativeTokenOwners() external view returns (address[] memory);
 
+    function setTransactionFilteringFrom(uint64 timestamp) external;
+    function addTransactionFilterer(address filterer) external;
+    function removeTransactionFilterer(address filterer) external;
+    function isTransactionFilterer(address filterer) external view returns (bool);
+    function getAllTransactionFilterers() external view returns (address[] memory);
+    function setFilteredFundsRecipient(address newRecipient) external;
+    function getFilteredFundsRecipient() external view returns (address);
+
     /// @notice Set how slowly ArbOS updates its estimate of the L1 basefee
     function setL1BaseFeeEstimateInertia(
         uint64 inertia
@@ -97,8 +107,13 @@ interface ArbOwner {
         uint64 limit
     ) external;
 
-    /// @notice Set the maximum size a tx (and block) can be
+    /// @notice Set the maximum size a transaction can be
     function setMaxTxGasLimit(
+        uint64 limit
+    ) external;
+
+    /// @notice Set the maximum aggregate gas a block can consume
+    function setMaxBlockGasLimit(
         uint64 limit
     ) external;
 
@@ -155,6 +170,10 @@ interface ArbOwner {
     function setL1PricePerUnit(
         uint256 pricePerUnit
     ) external;
+
+    /// @notice Sets the parent-chain gas floor charged per calldata token.
+    /// Available in ArbOS version 50.
+    function setParentGasFloorPerToken(uint64 gasFloorPerToken) external;
 
     /// @notice Sets the base charge (in L1 gas) attributed to each data batch in the calldata pricer
     function setPerBatchGasCharge(
@@ -236,6 +255,23 @@ interface ArbOwner {
         uint16 count
     ) external;
 
+    /// @notice Sets the configurable gas charge applied before Stylus activation.
+    /// Available in ArbOS version 59.
+    function setWasmActivationGas(uint64 gas) external;
+
+    /// @notice Sets the maximum number of fragments in a Stylus contract.
+    /// Available in ArbOS version 60.
+    function setMaxStylusContractFragments(uint8 maxFragments) external;
+
+    /// @notice Enables or disables collection of transaction priority fees.
+    /// Available in ArbOS version 60.
+    function setCollectTips(bool collectTips) external;
+
+    /// @notice Sets the single-dimensional gas-pricing constraints.
+    /// Available in ArbOS version 50.
+    function setGasPricingConstraints(uint64[3][] calldata constraints) external;
+    function setGasBacklog(uint64 backlog) external;
+
     /// @notice Adds account as a wasm cache manager
     function addWasmCacheManager(
         address manager
@@ -261,7 +297,20 @@ interface ArbOwner {
 
     /// Emitted when a successful call is made to this precompile
     event OwnerActs(bytes4 indexed method, address indexed owner, bytes data);
+
+    /// Available in ArbOS version 60 and above.
+    event ChainOwnerAdded(address indexed owner);
+    /// Available in ArbOS version 60 and above.
+    event ChainOwnerRemoved(address indexed owner);
+    /// Available in ArbOS version 60 and above.
+    event NativeTokenOwnerAdded(address indexed owner);
+    /// Available in ArbOS version 60 and above.
+    event NativeTokenOwnerRemoved(address indexed owner);
+    event TransactionFiltererAdded(address indexed filterer);
+    event TransactionFiltererRemoved(address indexed filterer);
+    event FilteredFundsRecipientSet(address indexed newRecipient);
 }
+
 }
 
 macro_rules! require_chain_owner {
@@ -284,10 +333,10 @@ pub(crate) fn require_chain_owner<CTX: ArbitrumContextTr>(
         context.arb_state(Some(gas), true).is_chain_owner(caller)
     );
     if !is_owner {
-        const NOT_CHAIN_OWNER: &str = "unauthorized caller to access-controlled method";
+        gas.spend_all();
         return Some(crate::macros::interpreter_result_revert_with_output(
             gas,
-            NOT_CHAIN_OWNER.into(),
+            Bytes::new(),
         ));
     }
     None
@@ -303,6 +352,8 @@ pub fn arb_owner_precompile<CTX: ArbitrumContextTr>() -> ExtendedPrecompile<CTX>
 struct ArbOwnerPrecompile;
 
 impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
+    const REFUND_ALL_ON_SUCCESS: bool = true;
+
     const STATE_MUT_TABLE: &'static [([u8; 4], StateMutability)] = generate_state_mut_table! {
         ArbOwner => {
             addChainOwnerCall(NonPayable),
@@ -314,11 +365,19 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
             removeNativeTokenOwnerCall(NonPayable),
             isNativeTokenOwnerCall(View),
             getAllNativeTokenOwnersCall(View),
+            setTransactionFilteringFromCall(NonPayable),
+            addTransactionFiltererCall(NonPayable),
+            removeTransactionFiltererCall(NonPayable),
+            isTransactionFiltererCall(View),
+            getAllTransactionFilterersCall(View),
+            setFilteredFundsRecipientCall(NonPayable),
+            getFilteredFundsRecipientCall(View),
             setL1BaseFeeEstimateInertiaCall(NonPayable),
             setL2BaseFeeCall(NonPayable),
             setMinimumL2BaseFeeCall(NonPayable),
             setSpeedLimitCall(NonPayable),
             setMaxTxGasLimitCall(NonPayable),
+            setMaxBlockGasLimitCall(NonPayable),
             setL2GasPricingInertiaCall(NonPayable),
             setL2GasBacklogToleranceCall(NonPayable),
             getNetworkFeeAccountCall(View),
@@ -331,6 +390,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
             setL1PricingRewardRecipientCall(NonPayable),
             setL1PricingRewardRateCall(NonPayable),
             setL1PricePerUnitCall(NonPayable),
+            setParentGasFloorPerTokenCall(NonPayable),
             setPerBatchGasChargeCall(NonPayable),
             setBrotliCompressionLevelCall(NonPayable),
             setAmortizedCostCapBipsCall(NonPayable),
@@ -346,12 +406,62 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
             setWasmExpiryDaysCall(NonPayable),
             setWasmKeepaliveDaysCall(NonPayable),
             setWasmBlockCacheSizeCall(NonPayable),
+            setWasmActivationGasCall(NonPayable),
+            setMaxStylusContractFragmentsCall(NonPayable),
+            setCollectTipsCall(NonPayable),
+            setGasPricingConstraintsCall(NonPayable),
+            setGasBacklogCall(NonPayable),
             addWasmCacheManagerCall(NonPayable),
             removeWasmCacheManagerCall(NonPayable),
             setChainConfigCall(NonPayable),
             setCalldataPriceIncreaseCall(NonPayable),
         }
     };
+
+    fn method_version(selector: [u8; 4]) -> (u64, Option<u64>) {
+        let minimum = match selector {
+            ArbOwner::getInfraFeeAccountCall::SELECTOR
+            | ArbOwner::setInfraFeeAccountCall::SELECTOR => 5,
+            ArbOwner::releaseL1PricerSurplusFundsCall::SELECTOR => 10,
+            ArbOwner::setChainConfigCall::SELECTOR => 11,
+            ArbOwner::setBrotliCompressionLevelCall::SELECTOR => 20,
+            ArbOwner::setInkPriceCall::SELECTOR
+            | ArbOwner::setWasmMaxStackDepthCall::SELECTOR
+            | ArbOwner::setWasmFreePagesCall::SELECTOR
+            | ArbOwner::setWasmPageGasCall::SELECTOR
+            | ArbOwner::setWasmPageLimitCall::SELECTOR
+            | ArbOwner::setWasmMinInitGasCall::SELECTOR
+            | ArbOwner::setWasmInitCostScalarCall::SELECTOR
+            | ArbOwner::setWasmExpiryDaysCall::SELECTOR
+            | ArbOwner::setWasmKeepaliveDaysCall::SELECTOR
+            | ArbOwner::setWasmBlockCacheSizeCall::SELECTOR
+            | ArbOwner::addWasmCacheManagerCall::SELECTOR
+            | ArbOwner::removeWasmCacheManagerCall::SELECTOR => 30,
+            ArbOwner::setWasmMaxSizeCall::SELECTOR
+            | ArbOwner::setCalldataPriceIncreaseCall::SELECTOR => 40,
+            ArbOwner::setNativeTokenManagementFromCall::SELECTOR
+            | ArbOwner::addNativeTokenOwnerCall::SELECTOR
+            | ArbOwner::removeNativeTokenOwnerCall::SELECTOR
+            | ArbOwner::isNativeTokenOwnerCall::SELECTOR
+            | ArbOwner::getAllNativeTokenOwnersCall::SELECTOR => 41,
+            ArbOwner::setGasPricingConstraintsCall::SELECTOR
+            | ArbOwner::setGasBacklogCall::SELECTOR
+            | ArbOwner::setParentGasFloorPerTokenCall::SELECTOR
+            | ArbOwner::setMaxBlockGasLimitCall::SELECTOR => 50,
+            ArbOwner::setWasmActivationGasCall::SELECTOR => 59,
+            ArbOwner::setMaxStylusContractFragmentsCall::SELECTOR
+            | ArbOwner::setCollectTipsCall::SELECTOR
+            | ArbOwner::setTransactionFilteringFromCall::SELECTOR
+            | ArbOwner::addTransactionFiltererCall::SELECTOR
+            | ArbOwner::removeTransactionFiltererCall::SELECTOR
+            | ArbOwner::isTransactionFiltererCall::SELECTOR
+            | ArbOwner::getAllTransactionFilterersCall::SELECTOR
+            | ArbOwner::setFilteredFundsRecipientCall::SELECTOR
+            | ArbOwner::getFilteredFundsRecipientCall::SELECTOR => 60,
+            _ => 0,
+        };
+        (minimum, None)
+    }
 
     fn inner(
         context: &mut CTX,
@@ -387,6 +497,20 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                             .add(call.newOwner)
                     );
 
+                    if context.cfg().arbos_version() >= 60 {
+                        emit_event!(
+                            context,
+                            Log {
+                                address: address!("0x0000000000000000000000000000000000000070"),
+                                data: ArbOwner::ChainOwnerAdded {
+                                    owner: call.newOwner
+                                }
+                                .into_log_data(),
+                            },
+                            gas
+                        );
+                    }
+
                     let output = ArbOwner::addChainOwnerCall::abi_encode_returns(
                         &ArbOwner::addChainOwnerReturn {},
                     );
@@ -396,6 +520,20 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 ArbOwner::addNativeTokenOwnerCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::addNativeTokenOwnerCall, input);
 
+                    let enabled_from = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .native_token_enabled_time()
+                            .get()
+                    );
+                    if enabled_from == 0 || enabled_from > context.block().timestamp().to::<u64>() {
+                        interpreter_revert!(
+                            gas,
+                            Bytes::from("native token feature is not enabled yet")
+                        );
+                    }
+
                     try_state!(
                         gas,
                         context
@@ -404,11 +542,63 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                             .add(call.newOwner)
                     );
 
+                    if context.cfg().arbos_version() >= 60 {
+                        emit_event!(
+                            context,
+                            Log {
+                                address: address!("0x0000000000000000000000000000000000000070"),
+                                data: ArbOwner::NativeTokenOwnerAdded {
+                                    owner: call.newOwner
+                                }
+                                .into_log_data(),
+                            },
+                            gas
+                        );
+                    }
+
                     let output = ArbOwner::addNativeTokenOwnerCall::abi_encode_returns(
                         &ArbOwner::addNativeTokenOwnerReturn {},
                     );
 
                     interpreter_return!(gas, Bytes::from(output));
+                }
+                ArbOwner::addTransactionFiltererCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::addTransactionFiltererCall, input);
+                    if context.cfg().arbos_version() < 60 {
+                        interpreter_revert!(gas, Bytes::from("method requires ArbOS 60"));
+                    }
+                    let enabled_from = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .transaction_filtering_enabled_time()
+                            .get()
+                    );
+                    if enabled_from == 0 || enabled_from > context.block().timestamp().to::<u64>() {
+                        interpreter_revert!(
+                            gas,
+                            Bytes::from("transaction filtering feature is not enabled yet")
+                        );
+                    }
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .transaction_filterers()
+                            .add(call.filterer)
+                    );
+                    emit_event!(
+                        context,
+                        Log {
+                            address: address!("0x0000000000000000000000000000000000000070"),
+                            data: ArbOwner::TransactionFiltererAdded {
+                                filterer: call.filterer
+                            }
+                            .into_log_data(),
+                        },
+                        gas
+                    );
+                    interpreter_return!(gas, Bytes::new());
                 }
                 ArbOwner::addWasmCacheManagerCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::addWasmCacheManagerCall, input);
@@ -459,6 +649,16 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 ArbOwner::removeChainOwnerCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::removeChainOwnerCall, input);
 
+                    let member = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .is_chain_owner(call.ownerToRemove)
+                    );
+                    if !member {
+                        interpreter_revert!(gas, Bytes::from("tried to remove non-owner"));
+                    }
+
                     try_state!(
                         gas,
                         context
@@ -466,6 +666,20 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                             .chain_owners()
                             .remove(&call.ownerToRemove)
                     );
+
+                    if context.cfg().arbos_version() >= 60 {
+                        emit_event!(
+                            context,
+                            Log {
+                                address: address!("0x0000000000000000000000000000000000000070"),
+                                data: ArbOwner::ChainOwnerRemoved {
+                                    owner: call.ownerToRemove
+                                }
+                                .into_log_data(),
+                            },
+                            gas
+                        );
+                    }
 
                     let output = ArbOwner::removeChainOwnerCall::abi_encode_returns(
                         &ArbOwner::removeChainOwnerReturn {},
@@ -475,6 +689,19 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 ArbOwner::removeNativeTokenOwnerCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::removeNativeTokenOwnerCall, input);
 
+                    let member = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .is_native_token_owner(call.ownerToRemove)
+                    );
+                    if !member {
+                        interpreter_revert!(
+                            gas,
+                            Bytes::from("tried to remove non native token owner")
+                        );
+                    }
+
                     try_state!(
                         gas,
                         context
@@ -483,14 +710,77 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                             .remove(&call.ownerToRemove)
                     );
 
+                    if context.cfg().arbos_version() >= 60 {
+                        emit_event!(
+                            context,
+                            Log {
+                                address: address!("0x0000000000000000000000000000000000000070"),
+                                data: ArbOwner::NativeTokenOwnerRemoved {
+                                    owner: call.ownerToRemove
+                                }
+                                .into_log_data(),
+                            },
+                            gas
+                        );
+                    }
+
                     let output = ArbOwner::removeNativeTokenOwnerCall::abi_encode_returns(
                         &ArbOwner::removeNativeTokenOwnerReturn {},
                     );
                     interpreter_return!(gas, Bytes::from(output));
                 }
+                ArbOwner::removeTransactionFiltererCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::removeTransactionFiltererCall, input);
+                    if context.cfg().arbos_version() < 60 {
+                        interpreter_revert!(gas, Bytes::from("method requires ArbOS 60"));
+                    }
+                    let member = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .transaction_filterers()
+                            .contains(call.filterer)
+                    );
+                    if !member {
+                        interpreter_revert!(
+                            gas,
+                            Bytes::from("tried to remove non existing transaction filterer")
+                        );
+                    }
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .transaction_filterers()
+                            .remove(&call.filterer)
+                    );
+                    emit_event!(
+                        context,
+                        Log {
+                            address: address!("0x0000000000000000000000000000000000000070"),
+                            data: ArbOwner::TransactionFiltererRemoved {
+                                filterer: call.filterer
+                            }
+                            .into_log_data(),
+                        },
+                        gas
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
                 ArbOwner::removeWasmCacheManagerCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::removeWasmCacheManagerCall, input);
 
+                    let member = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .programs()
+                            .cache_managers()
+                            .contains(call.manager)
+                    );
+                    if !member {
+                        interpreter_revert!(gas, Bytes::from("tried to remove non-manager"));
+                    }
                     try_state!(
                         gas,
                         context
@@ -536,22 +826,86 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
 
                     interpreter_return!(gas, Bytes::from(output));
                 }
+                ArbOwner::isTransactionFiltererCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::isTransactionFiltererCall, input);
+                    if context.cfg().arbos_version() < 60 {
+                        interpreter_revert!(gas, Bytes::from("method requires ArbOS 60"));
+                    }
+                    let member = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .transaction_filterers()
+                            .contains(call.filterer)
+                    );
+                    let output = ArbOwner::isTransactionFiltererCall::abi_encode_returns(&member);
+                    interpreter_return!(gas, Bytes::from(output));
+                }
+                ArbOwner::getAllTransactionFilterersCall::SELECTOR => {
+                    let _ = decode_call!(gas, ArbOwner::getAllTransactionFilterersCall, input);
+                    if context.cfg().arbos_version() < 60 {
+                        interpreter_revert!(gas, Bytes::from("method requires ArbOS 60"));
+                    }
+                    let filterers = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .transaction_filterers()
+                            .all()
+                    );
+                    let output =
+                        ArbOwner::getAllTransactionFilterersCall::abi_encode_returns(&filterers);
+                    interpreter_return!(gas, Bytes::from(output));
+                }
                 ArbOwner::setCalldataPriceIncreaseCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::setCalldataPriceIncreaseCall, input);
 
                     let mut arb_state = context.arb_state(Some(&mut gas), is_static);
-                    let mut l1_pricing = arb_state.l1_pricing();
-                    try_state!(
-                        gas,
-                        l1_pricing
-                            .gas_floor_per_token()
-                            .set(if call.enable { 1 } else { 0 })
-                    );
+                    let mut features = arb_state.features();
+                    let current = try_state!(gas, features.get());
+                    let calldata_price_increase = U256::from(1);
+                    let updated = if call.enable {
+                        current | calldata_price_increase
+                    } else {
+                        current & !calldata_price_increase
+                    };
+                    try_state!(gas, features.set(updated));
 
                     interpreter_return!(gas, Bytes::new());
                 }
                 ArbOwner::setNativeTokenManagementFromCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::setNativeTokenManagementFromCall, input);
+
+                    let now = context.block().timestamp().to::<u64>();
+                    let minimum = now.saturating_add(FEATURE_ENABLE_DELAY);
+                    let stored = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .native_token_enabled_time()
+                            .get()
+                    );
+                    if (stored == 0 || stored > minimum)
+                        && call.timestamp != 0
+                        && call.timestamp < minimum
+                    {
+                        interpreter_revert!(
+                            gas,
+                            Bytes::from("feature must be enabled at least 7 days in the future")
+                        );
+                    }
+                    if call.timestamp != 0
+                        && stored > now
+                        && stored <= minimum
+                        && call.timestamp < stored
+                    {
+                        interpreter_revert!(
+                            gas,
+                            Bytes::from(
+                                "feature cannot be updated to a time earlier than the current scheduled enable time"
+                            )
+                        );
+                    }
 
                     try_state!(
                         gas,
@@ -562,6 +916,91 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                     );
 
                     interpreter_return!(gas, Bytes::new());
+                }
+                ArbOwner::setTransactionFilteringFromCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::setTransactionFilteringFromCall, input);
+                    if context.cfg().arbos_version() < 60 {
+                        interpreter_revert!(gas, Bytes::from("method requires ArbOS 60"));
+                    }
+                    let now = context.block().timestamp().to::<u64>();
+                    let minimum = now.saturating_add(FEATURE_ENABLE_DELAY);
+                    let stored = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .transaction_filtering_enabled_time()
+                            .get()
+                    );
+                    if (stored == 0 || stored > minimum)
+                        && call.timestamp != 0
+                        && call.timestamp < minimum
+                    {
+                        interpreter_revert!(
+                            gas,
+                            Bytes::from("feature must be enabled at least 7 days in the future")
+                        );
+                    }
+                    if call.timestamp != 0
+                        && stored > now
+                        && stored <= minimum
+                        && call.timestamp < stored
+                    {
+                        interpreter_revert!(
+                            gas,
+                            Bytes::from(
+                                "feature cannot be updated to a time earlier than the current scheduled enable time"
+                            )
+                        );
+                    }
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .transaction_filtering_enabled_time()
+                            .set(call.timestamp)
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
+                ArbOwner::setFilteredFundsRecipientCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::setFilteredFundsRecipientCall, input);
+                    if context.cfg().arbos_version() < 60 {
+                        interpreter_revert!(gas, Bytes::from("method requires ArbOS 60"));
+                    }
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .filtered_funds_recipient()
+                            .set(call.newRecipient)
+                    );
+                    emit_event!(
+                        context,
+                        Log {
+                            address: address!("0x0000000000000000000000000000000000000070"),
+                            data: ArbOwner::FilteredFundsRecipientSet {
+                                newRecipient: call.newRecipient
+                            }
+                            .into_log_data(),
+                        },
+                        gas
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
+                ArbOwner::getFilteredFundsRecipientCall::SELECTOR => {
+                    let _ = decode_call!(gas, ArbOwner::getFilteredFundsRecipientCall, input);
+                    if context.cfg().arbos_version() < 60 {
+                        interpreter_revert!(gas, Bytes::from("method requires ArbOS 60"));
+                    }
+                    let recipient = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .filtered_funds_recipient()
+                            .get()
+                    );
+                    let output =
+                        ArbOwner::getFilteredFundsRecipientCall::abi_encode_returns(&recipient);
+                    interpreter_return!(gas, Bytes::from(output));
                 }
                 ArbOwner::setL1BaseFeeEstimateInertiaCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::setL1BaseFeeEstimateInertiaCall, input);
@@ -641,6 +1080,18 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                         );
                     }
 
+                    interpreter_return!(gas, Bytes::new());
+                }
+                ArbOwner::setMaxBlockGasLimitCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::setMaxBlockGasLimitCall, input);
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .l2_pricing()
+                            .per_block_gas_limit()
+                            .set(call.limit)
+                    );
                     interpreter_return!(gas, Bytes::new());
                 }
                 ArbOwner::setL2GasPricingInertiaCall::SELECTOR => {
@@ -797,19 +1248,28 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                     );
                     interpreter_return!(gas, Bytes::new());
                 }
+                ArbOwner::setParentGasFloorPerTokenCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::setParentGasFloorPerTokenCall, input);
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .l1_pricing()
+                            .gas_floor_per_token()
+                            .set(call.gasFloorPerToken)
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
                 ArbOwner::setPerBatchGasChargeCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::setPerBatchGasChargeCall, input);
 
-                    if call.cost < 0 {
-                        interpreter_revert!(gas, Bytes::from("negative cost not allowed"));
-                    }
                     try_state!(
                         gas,
                         context
                             .arb_state(Some(&mut gas), is_static)
                             .l1_pricing()
                             .per_batch_gas_cost()
-                            .set(call.cost as u64)
+                            .set(call.cost)
                     );
                     interpreter_return!(gas, Bytes::new());
                 }
@@ -1007,9 +1467,6 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 ArbOwner::setWasmMinInitGasCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::setWasmMinInitGasCall, input);
 
-                    if call.cached > u16::from(u8::MAX) {
-                        interpreter_revert!(gas, Bytes::from("cached gas too large"));
-                    }
                     let mut params = try_state!(
                         gas,
                         context
@@ -1018,8 +1475,13 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                             .stylus_params()
                             .get()
                     );
-                    params.min_init_gas = call.gas;
-                    params.min_cached_init_gas = call.cached as u8;
+                    params.min_init_gas = u64::from(call.gas)
+                        .div_ceil(crate::constants::MIN_INIT_GAS_UNITS)
+                        .min(u64::from(u8::MAX)) as u8;
+                    params.min_cached_init_gas = u64::from(call.cached)
+                        .div_ceil(crate::constants::MIN_CACHED_GAS_UNITS)
+                        .min(u64::from(u8::MAX))
+                        as u8;
                     try_state!(
                         gas,
                         context
@@ -1033,9 +1495,6 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                 ArbOwner::setWasmInitCostScalarCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::setWasmInitCostScalarCall, input);
 
-                    if call.percent == 0 {
-                        interpreter_revert!(gas, Bytes::from("init cost scalar must be nonzero"));
-                    }
                     let mut params = try_state!(
                         gas,
                         context
@@ -1127,17 +1586,110 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
                     );
                     interpreter_return!(gas, Bytes::new());
                 }
+                ArbOwner::setWasmActivationGasCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::setWasmActivationGasCall, input);
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .programs()
+                            .set_activation_gas(call.gas)
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
+                ArbOwner::setMaxStylusContractFragmentsCall::SELECTOR => {
+                    let call =
+                        decode_call!(gas, ArbOwner::setMaxStylusContractFragmentsCall, input);
+                    let mut params = try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .programs()
+                            .stylus_params()
+                            .get()
+                    );
+                    params.max_fragment_count = call.maxFragments;
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .programs()
+                            .stylus_params()
+                            .set(&params)
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
+                ArbOwner::setCollectTipsCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::setCollectTipsCall, input);
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .set_collect_tips(call.collectTips)
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
+                ArbOwner::setGasPricingConstraintsCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::setGasPricingConstraintsCall, input);
+                    let arbos_version = context.cfg().arbos_version();
+                    if arbos_version < 50 {
+                        interpreter_revert!(gas, Bytes::from("method requires ArbOS 50"));
+                    }
+                    if (51..60).contains(&arbos_version)
+                        && call.constraints.len()
+                            > crate::state::l2_pricing::GAS_CONSTRAINTS_MAX_NUM as usize
+                    {
+                        interpreter_revert!(gas, Bytes::from("too many constraints. Max: 20"));
+                    }
+                    let mut constraints = Vec::with_capacity(call.constraints.len());
+                    for values in call.constraints {
+                        if values[0] == 0 || values[1] == 0 {
+                            interpreter_revert!(
+                                gas,
+                                Bytes::from(
+                                    "constraint target and adjustment window must be nonzero",
+                                )
+                            );
+                        }
+                        constraints.push(crate::state::l2_pricing::GasConstraint {
+                            target: values[0],
+                            adjustment_window: values[1],
+                            backlog: values[2],
+                        });
+                    }
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .l2_pricing()
+                            .replace_gas_constraints(&constraints)
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
+                ArbOwner::setGasBacklogCall::SELECTOR => {
+                    let call = decode_call!(gas, ArbOwner::setGasBacklogCall, input);
+                    if context.cfg().arbos_version() < 50 {
+                        interpreter_revert!(gas, Bytes::from("method requires ArbOS 50"));
+                    }
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .l2_pricing()
+                            .gas_backlog()
+                            .set(call.backlog)
+                    );
+                    interpreter_return!(gas, Bytes::new());
+                }
                 ArbOwner::setChainConfigCall::SELECTOR => {
                     let call = decode_call!(gas, ArbOwner::setChainConfigCall, input);
 
-                    let hash = revm::primitives::keccak256(&call.chainConfig);
-                    let value = U256::from_be_bytes(hash.0);
                     try_state!(
                         gas,
                         context
                             .arb_state(Some(&mut gas), is_static)
                             .chain_config()
-                            .set(value)
+                            .set(call.chainConfig.as_bytes())
                     );
                     interpreter_return!(gas, Bytes::new());
                 }
@@ -1147,20 +1699,212 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPrecompile {
 
         let result = run_arbos_owner(context, selector, input, is_static, gas);
 
-        emit_event!(
-            context,
-            Log {
-                address: address!("0x0000000000000000000000000000000000000070"),
-                data: ArbOwner::OwnerActs {
-                    method: selector.into(),
-                    owner: caller_address,
-                    data: Bytes::from(input[4..].to_vec())
-                }
-                .to_log_data(),
-            },
-            gas
-        );
+        // Nitro suppresses OwnerActs for read-only calls from ArbOS 11 onward,
+        // and includes the complete calldata (selector included) in the event.
+        if !is_static || context.cfg().arbos_version() < 11 {
+            emit_event!(
+                context,
+                Log {
+                    address: address!("0x0000000000000000000000000000000000000070"),
+                    data: ArbOwner::OwnerActs {
+                        method: selector.into(),
+                        owner: caller_address,
+                        data: Bytes::copy_from_slice(input)
+                    }
+                    .to_log_data(),
+                },
+                gas
+            );
+        }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+
+    use revm::{
+        Journal,
+        context::{BlockEnv, ContextTr, JournalTr},
+        database::EmptyDBTyped,
+        primitives::keccak256,
+    };
+
+    use crate::{
+        ArbitrumContext,
+        config::ArbitrumConfig,
+        local_context::ArbitrumLocalContext,
+        state::{ArbState, ArbStateGetter, arbos_state::ArbosStateParams},
+        transaction::ArbitrumTransaction,
+    };
+
+    use super::*;
+
+    fn setup(version: u64, owner: Address) -> ArbitrumContext<EmptyDBTyped<Infallible>> {
+        let mut context = ArbitrumContext {
+            journaled_state: Journal::new(EmptyDBTyped::default()),
+            block: BlockEnv::default(),
+            cfg: ArbitrumConfig::default(),
+            tx: ArbitrumTransaction::default(),
+            chain: (),
+            local: ArbitrumLocalContext::default(),
+            error: Ok(()),
+        };
+        context.cfg.arbos_version = version;
+        context
+            .arb_state(None, false)
+            .initialize(&ArbosStateParams::for_arbos_version(version))
+            .unwrap();
+        context
+            .arb_state(None, false)
+            .chain_owners()
+            .add(owner)
+            .unwrap();
+        context
+    }
+
+    #[test]
+    fn chain_owner_events_begin_at_arbos_60() {
+        let owner = address!("0x0000000000000000000000000000000000001234");
+        let added = address!("0x0000000000000000000000000000000000005678");
+        let target = address!("0x0000000000000000000000000000000000000070");
+        let input = ArbOwner::addChainOwnerCall::abi_encode(&ArbOwner::addChainOwnerCall {
+            newOwner: added,
+        });
+
+        let mut v59 = setup(59, owner);
+        let result = ArbOwnerPrecompile::run(
+            &mut v59,
+            &input,
+            &target,
+            owner,
+            U256::ZERO,
+            false,
+            1_000_000,
+        )
+        .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(v59.journal().logs().len(), 1, "only OwnerActs before v60");
+
+        let mut v60 = setup(60, owner);
+        let result = ArbOwnerPrecompile::run(
+            &mut v60,
+            &input,
+            &target,
+            owner,
+            U256::ZERO,
+            false,
+            1_000_000,
+        )
+        .unwrap();
+        assert!(result.is_ok());
+        let logs = v60.journal().logs();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(
+            logs[0].data.topics()[0],
+            keccak256("ChainOwnerAdded(address)")
+        );
+        assert_eq!(logs[0].address, target);
+    }
+
+    #[test]
+    fn removing_a_missing_chain_owner_reverts() {
+        let owner = address!("0x0000000000000000000000000000000000001234");
+        let missing = address!("0x0000000000000000000000000000000000005678");
+        let target = address!("0x0000000000000000000000000000000000000070");
+        let mut context = setup(60, owner);
+        let input = ArbOwner::removeChainOwnerCall::abi_encode(&ArbOwner::removeChainOwnerCall {
+            ownerToRemove: missing,
+        });
+        let result = ArbOwnerPrecompile::run(
+            &mut context,
+            &input,
+            &target,
+            owner,
+            U256::ZERO,
+            false,
+            1_000_000,
+        )
+        .unwrap();
+        assert!(result.is_revert());
+    }
+
+    #[test]
+    fn native_token_management_enforces_nitro_activation_delay() {
+        let owner = address!("0x0000000000000000000000000000000000001234");
+        let added = address!("0x0000000000000000000000000000000000005678");
+        let target = address!("0x0000000000000000000000000000000000000070");
+        let mut context = setup(60, owner);
+        context.block.timestamp = U256::from(1_000);
+
+        let too_soon = ArbOwner::setNativeTokenManagementFromCall::abi_encode(
+            &ArbOwner::setNativeTokenManagementFromCall { timestamp: 1_001 },
+        );
+        let result = ArbOwnerPrecompile::run(
+            &mut context,
+            &too_soon,
+            &target,
+            owner,
+            U256::ZERO,
+            false,
+            1_000_000,
+        )
+        .unwrap();
+        assert!(result.is_revert());
+
+        let activation = 1_000 + FEATURE_ENABLE_DELAY;
+        let schedule = ArbOwner::setNativeTokenManagementFromCall::abi_encode(
+            &ArbOwner::setNativeTokenManagementFromCall {
+                timestamp: activation,
+            },
+        );
+        let result = ArbOwnerPrecompile::run(
+            &mut context,
+            &schedule,
+            &target,
+            owner,
+            U256::ZERO,
+            false,
+            1_000_000,
+        )
+        .unwrap();
+        assert!(result.is_ok());
+
+        let add =
+            ArbOwner::addNativeTokenOwnerCall::abi_encode(&ArbOwner::addNativeTokenOwnerCall {
+                newOwner: added,
+            });
+        let result = ArbOwnerPrecompile::run(
+            &mut context,
+            &add,
+            &target,
+            owner,
+            U256::ZERO,
+            false,
+            1_000_000,
+        )
+        .unwrap();
+        assert!(result.is_revert());
+
+        context.block.timestamp = U256::from(activation);
+        let result = ArbOwnerPrecompile::run(
+            &mut context,
+            &add,
+            &target,
+            owner,
+            U256::ZERO,
+            false,
+            1_000_000,
+        )
+        .unwrap();
+        assert!(result.is_ok());
+        assert!(
+            context
+                .arb_state(None, true)
+                .is_native_token_owner(added)
+                .unwrap()
+        );
     }
 }

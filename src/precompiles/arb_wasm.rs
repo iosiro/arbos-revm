@@ -131,6 +131,10 @@ interface IArbWasm {
     /// @return count the number of same-block programs.
     function blockCacheSize() external view returns (uint16 count);
 
+    /// @notice Gets the configurable gas charge applied before activation.
+    /// Available in ArbOS version 59.
+    function activationGas() external view returns (uint64 gas);
+
     /// @notice Emitted when a program is activated
     event ProgramActivated(
         bytes32 indexed codehash,
@@ -171,6 +175,8 @@ pub fn arb_wasm_precompile<CTX: ArbitrumContextTr>() -> ExtendedPrecompile<CTX> 
 struct ArbWasmPrecompile;
 
 impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
+    const MIN_ARBOS_VERSION: u64 = 30;
+
     const STATE_MUT_TABLE: &'static [([u8; 4], StateMutability)] = generate_state_mut_table! {
         IArbWasm => {
             activateProgramCall(Payable),
@@ -193,8 +199,17 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
             expiryDaysCall(View),
             keepaliveDaysCall(View),
             blockCacheSizeCall(View),
+            activationGasCall(View),
         }
     };
+
+    fn method_version(selector: [u8; 4]) -> (u64, Option<u64>) {
+        if selector == IArbWasm::activationGasCall::SELECTOR {
+            (59, None)
+        } else {
+            (30, None)
+        }
+    }
 
     fn inner(
         context: &mut CTX,
@@ -212,6 +227,15 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
         match selector {
             IArbWasm::activateProgramCall::SELECTOR => {
                 let call = decode_call!(gas, IArbWasm::activateProgramCall, input);
+
+                let activation_gas = try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .programs()
+                        .activation_gas()
+                );
+                try_record_cost!(gas, activation_gas);
 
                 let params = try_state!(
                     gas,
@@ -236,7 +260,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                         .programs()
                         .program_info(&code_hash)
                 ) {
-                    let expired = program_info.age > params.expiry_days as u32 * 24 * 60 * 60;
+                    let expired = program_info.age > u64::from(params.expiry_days) * 24 * 60 * 60;
 
                     // program is already activated
                     if program_info.version == params.version && !expired {
@@ -255,7 +279,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                     .unwrap_or_default()
                     .data;
 
-                let bytecode = match stylus_code(&bytecode) {
+                let bytecode = match stylus_code(&bytecode, params.max_wasm_size) {
                     Ok(Some(code)) => code,
                     Ok(None) => {
                         interpreter_revert!(gas, IArbWasm::ProgramNotWasm {}.abi_encode());
@@ -397,11 +421,11 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                         .get_active_program(&params, &call.codehash)
                 );
 
-                if program_info.age < params.keepalive_days as u32 * 24 * 60 * 60 {
+                if program_info.age < u64::from(params.keepalive_days) * 24 * 60 * 60 {
                     interpreter_revert!(
                         gas,
                         IArbWasm::ProgramKeepaliveTooSoon {
-                            ageInSeconds: program_info.age as u64
+                            ageInSeconds: program_info.age
                         }
                         .abi_encode()
                     );
@@ -524,7 +548,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                 );
 
                 let output = IArbWasm::codehashAsmSizeCall::abi_encode_returns(
-                    &program_info.asm_estimated_kb,
+                    &(program_info.asm_estimated_kb.saturating_mul(1024)),
                 );
 
                 interpreter_return!(gas, Bytes::from(output));
@@ -588,16 +612,19 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                         .get_active_program(&params, &code_hash)
                 );
 
-                let cached_gas = crate::stylus_executor::init_gas_cost(
+                let cached_gas = crate::stylus_executor::cached_gas_cost(
                     program_info.cached_cost,
                     params.min_cached_init_gas,
-                    params.init_cost_scalar,
+                    params.cached_cost_scalar,
                 );
-                let init_gas = crate::stylus_executor::init_gas_cost(
+                let mut init_gas = crate::stylus_executor::init_gas_cost(
                     program_info.init_cost,
                     params.min_init_gas,
                     params.init_cost_scalar,
                 );
+                if params.version > 1 {
+                    init_gas = init_gas.saturating_add(cached_gas);
+                }
 
                 let output = IArbWasm::programInitGasCall::abi_encode_returns(
                     &IArbWasm::programInitGasReturn {
@@ -668,8 +695,9 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                         .get_active_program(&params, &code_hash)
                 );
 
-                let output =
-                    IArbWasm::programTimeLeftCall::abi_encode_returns(&(program_info.age as u64));
+                let expiry_seconds = (params.expiry_days as u64).saturating_mul(86_400);
+                let time_left = expiry_seconds.saturating_sub(program_info.age);
+                let output = IArbWasm::programTimeLeftCall::abi_encode_returns(&time_left);
 
                 interpreter_return!(gas, Bytes::from(output));
             }
@@ -768,7 +796,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                         .get()
                 );
 
-                if context.cfg().arbos_version() < ARBOS_VERSION_STYLUS_CHARGING_FIXES as u16 {
+                if context.cfg().arbos_version() < ARBOS_VERSION_STYLUS_CHARGING_FIXES {
                     interpreter_revert!(gas);
                 }
 
@@ -838,6 +866,17 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                 let output =
                     IArbWasm::blockCacheSizeCall::abi_encode_returns(&params.block_cache_size);
 
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            IArbWasm::activationGasCall::SELECTOR => {
+                let activation_gas = try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .programs()
+                        .activation_gas()
+                );
+                let output = IArbWasm::activationGasCall::abi_encode_returns(&activation_gas);
                 interpreter_return!(gas, Bytes::from(output));
             }
             _ => interpreter_revert!(gas, Bytes::from("Unknown function selector")),

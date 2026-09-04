@@ -3,6 +3,7 @@
 
 //! EVM data access tests for Stylus programs.
 
+use arbos_revm::state::{ArbState, ArbStateGetter, types::StorageBackedTr};
 use revm::{
     context::result::ExecutionResult,
     primitives::{Address, U256},
@@ -19,6 +20,12 @@ fn test_e2e_evm_block_number() {
     let mut context = setup_context_with_arbos_state();
 
     context.block.number = U256::from(42);
+    context
+        .arb_state(None, false)
+        .blockhashes()
+        .l1_block_number()
+        .set(314)
+        .unwrap();
 
     let wat = include_bytes!("../test-data/evm-data.wat");
     let program_address = deploy_wat_program(&mut context, wat);
@@ -42,7 +49,7 @@ fn test_e2e_evm_block_number() {
                 "block_number output should be 8 bytes (u64)"
             );
             let block_num = u64::from_le_bytes(output.data()[..8].try_into().unwrap());
-            assert!(block_num == 42, "block_number should be valid");
+            assert_eq!(block_num, 314, "Stylus block_number must be the L1 block");
         }
         ExecutionResult::Revert { output, .. } => {
             panic!("execution reverted: {:?}", output);

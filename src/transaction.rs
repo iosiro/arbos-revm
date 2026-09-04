@@ -1,6 +1,6 @@
 use std::ops::{Deref, DerefMut};
 
-use alloy_rlp::{Encodable, RlpDecodable, RlpEncodable};
+use alloy_rlp::{Encodable, Header, RlpDecodable, RlpEncodable};
 use revm::{
     context::{
         Transaction, TxEnv,
@@ -89,6 +89,98 @@ impl ArbitrumTransaction {
             poster: Some(poster),
         }
     }
+}
+
+/// Computes Nitro's EIP-2718 hash for a scheduled `ArbitrumRetryTx` (type
+/// `0x68`). The retry target is RLP empty when the attempt creates a contract.
+#[allow(clippy::too_many_arguments)]
+pub fn arbitrum_retry_tx_hash(
+    chain_id: U256,
+    nonce: u64,
+    from: Address,
+    gas_fee_cap: U256,
+    gas: u64,
+    to: Option<Address>,
+    value: U256,
+    data: &Bytes,
+    ticket_id: B256,
+    refund_to: Address,
+    max_refund: U256,
+    submission_fee_refund: U256,
+) -> B256 {
+    let mut payload = Vec::new();
+    chain_id.encode(&mut payload);
+    nonce.encode(&mut payload);
+    from.encode(&mut payload);
+    gas_fee_cap.encode(&mut payload);
+    gas.encode(&mut payload);
+    match to {
+        Some(address) => address.encode(&mut payload),
+        None => (&[] as &[u8]).encode(&mut payload),
+    }
+    value.encode(&mut payload);
+    data.as_ref().encode(&mut payload);
+    ticket_id.encode(&mut payload);
+    refund_to.encode(&mut payload);
+    max_refund.encode(&mut payload);
+    submission_fee_refund.encode(&mut payload);
+
+    let mut encoded = Vec::with_capacity(1 + payload.len() + 9);
+    encoded.push(0x68);
+    Header {
+        list: true,
+        payload_length: payload.len(),
+    }
+    .encode(&mut encoded);
+    encoded.extend_from_slice(&payload);
+    keccak256(encoded)
+}
+
+/// Computes the canonical EIP-2718 hash for an `ArbitrumSubmitRetryableTx`
+/// (type `0x69`). A zero retry target is encoded as RLP nil/contract creation.
+#[allow(clippy::too_many_arguments)]
+pub fn arbitrum_submit_retryable_tx_hash(
+    chain_id: U256,
+    request_id: B256,
+    from: Address,
+    l1_base_fee: U256,
+    deposit_value: U256,
+    gas_fee_cap: U256,
+    gas: u64,
+    retry_to: Option<Address>,
+    retry_value: U256,
+    beneficiary: Address,
+    max_submission_fee: U256,
+    fee_refund_address: Address,
+    retry_data: &Bytes,
+) -> B256 {
+    let mut payload = Vec::new();
+    chain_id.encode(&mut payload);
+    request_id.encode(&mut payload);
+    from.encode(&mut payload);
+    l1_base_fee.encode(&mut payload);
+    deposit_value.encode(&mut payload);
+    gas_fee_cap.encode(&mut payload);
+    gas.encode(&mut payload);
+    match retry_to {
+        Some(address) => address.encode(&mut payload),
+        None => (&[] as &[u8]).encode(&mut payload),
+    }
+    retry_value.encode(&mut payload);
+    beneficiary.encode(&mut payload);
+    max_submission_fee.encode(&mut payload);
+    fee_refund_address.encode(&mut payload);
+    retry_data.as_ref().encode(&mut payload);
+
+    let mut encoded = Vec::with_capacity(1 + payload.len() + 9);
+    encoded.push(0x69);
+    Header {
+        list: true,
+        payload_length: payload.len(),
+    }
+    .encode(&mut encoded);
+    encoded.extend_from_slice(&payload);
+    keccak256(encoded)
 }
 
 impl From<TxEnv> for ArbitrumTransaction {
@@ -200,6 +292,10 @@ pub trait ArbitrumTxTr: Transaction {
 
     /// Returns the poster address that submitted this transaction.
     fn poster(&self) -> Option<Address>;
+
+    /// Drops the transaction tip before validation and execution, matching
+    /// Nitro's mutation of the execution message when tips are not collected.
+    fn drop_tip(&mut self, base_fee: u128);
 }
 
 impl ArbitrumTxTr for ArbitrumTransaction {
@@ -209,6 +305,13 @@ impl ArbitrumTxTr for ArbitrumTransaction {
 
     fn poster(&self) -> Option<Address> {
         self.poster
+    }
+
+    fn drop_tip(&mut self, base_fee: u128) {
+        if self.base.effective_gas_price(base_fee) > base_fee {
+            self.base.gas_price = base_fee;
+            self.base.gas_priority_fee = Some(0);
+        }
     }
 }
 
@@ -234,6 +337,71 @@ impl ArbitrumTxTr for TxEnv {
 
     fn poster(&self) -> Option<Address> {
         None
+    }
+
+    fn drop_tip(&mut self, base_fee: u128) {
+        if self.effective_gas_price(base_fee) > base_fee {
+            self.gas_price = base_fee;
+            self.gas_priority_fee = Some(0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::primitives::{address, b256};
+
+    fn retry_hash(to: Option<Address>) -> B256 {
+        arbitrum_retry_tx_hash(
+            U256::from(42_161),
+            7,
+            address!("1111111111111111111111111111111111111111"),
+            U256::from(100_000_000),
+            54_321,
+            to,
+            U256::from(99),
+            &Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+            b256!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            address!("2222222222222222222222222222222222222222"),
+            U256::MAX,
+            U256::from(1234),
+        )
+    }
+
+    #[test]
+    fn retry_tx_hash_matches_nitro_for_call_and_create() {
+        // Independently generated by Nitro v3.11.0's types.NewTx(...).Hash().
+        assert_eq!(
+            retry_hash(Some(address!("3333333333333333333333333333333333333333"))),
+            b256!("ea536d40099896924c0d6fd6dcab82929bb442a8e6ed3c8f1bf7552f3dc3c998")
+        );
+        assert_eq!(
+            retry_hash(None),
+            b256!("211e14bec006a19e5bfccc7f1177cbc257b1114e5000c35807dd388c08945032")
+        );
+    }
+
+    #[test]
+    fn submit_retryable_hash_matches_nitro() {
+        assert_eq!(
+            arbitrum_submit_retryable_tx_hash(
+                U256::from(42_161),
+                b256!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                address!("1111111111111111111111111111111111111111"),
+                U256::from(100),
+                U256::from(1_000_000),
+                U256::from(200),
+                54_321,
+                Some(address!("3333333333333333333333333333333333333333")),
+                U256::from(99),
+                address!("4444444444444444444444444444444444444444"),
+                U256::from(12_345),
+                address!("2222222222222222222222222222222222222222"),
+                &Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+            ),
+            b256!("d9dd9c321f46fab07a28e73626ee09fc32d70bd5d831246c89c5cf03955d57c0")
+        );
     }
 }
 
@@ -312,11 +480,11 @@ impl ArbitrumInternalTx {
 
     // Method selectors for internal transactions
     /// StartBlock method selector
-    pub const START_BLOCK_METHOD: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+    pub const START_BLOCK_METHOD: [u8; 4] = [0x6b, 0xf6, 0xa4, 0x2d];
     /// BatchPostingReport method selector
-    pub const BATCH_POSTING_REPORT_METHOD: [u8; 4] = [0x00, 0x00, 0x00, 0x02];
+    pub const BATCH_POSTING_REPORT_METHOD: [u8; 4] = [0xb6, 0x69, 0x37, 0x71];
     /// BatchPostingReportV2 method selector (ArbOS 50+)
-    pub const BATCH_POSTING_REPORT_V2_METHOD: [u8; 4] = [0x00, 0x00, 0x00, 0x03];
+    pub const BATCH_POSTING_REPORT_V2_METHOD: [u8; 4] = [0x99, 0x98, 0x26, 0x9e];
 
     /// Create a new internal transaction
     pub fn new(chain_id: u64, data: Bytes) -> Self {
@@ -598,6 +766,12 @@ impl ArbitrumTxTr for ArbitrumTypedTransaction {
             Self::Standard(tx) => tx.poster(),
             // System transactions don't have a poster
             Self::Deposit(_) | Self::Internal(_) => None,
+        }
+    }
+
+    fn drop_tip(&mut self, base_fee: u128) {
+        if let Self::Standard(tx) = self {
+            tx.drop_tip(base_fee);
         }
     }
 }

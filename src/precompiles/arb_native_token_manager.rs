@@ -1,8 +1,6 @@
-use core::panic;
-
 use crate::{
     ArbitrumContextTr, generate_state_mut_table,
-    macros::{interpreter_return, interpreter_revert},
+    macros::{emit_event, interpreter_return, interpreter_revert},
     precompile_impl,
     precompiles::{
         ArbPrecompileLogic, ExtendedPrecompile, StateMutability, decode_call, selector_or_revert,
@@ -16,7 +14,7 @@ use revm::{
     context::JournalTr,
     interpreter::{Gas, InterpreterResult},
     precompile::PrecompileId,
-    primitives::{Address, Bytes, U256, address},
+    primitives::{Address, Bytes, Log, U256, address, alloy_primitives::IntoLogData},
 };
 
 sol! {
@@ -70,6 +68,8 @@ const MINT_BURN_GAS_COST: u64 =
 struct ArbNativeTokenManagerPrecompile;
 
 impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbNativeTokenManagerPrecompile {
+    const MIN_ARBOS_VERSION: u64 = 41;
+
     const STATE_MUT_TABLE: &'static [([u8; 4], StateMutability)] = generate_state_mut_table! {
         ArbNativeTokenManager => {
             mintNativeTokenCall(NonPayable),
@@ -92,6 +92,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbNativeTokenManagerPr
         match selector {
             ArbNativeTokenManager::mintNativeTokenCall::SELECTOR => {
                 if !try_state!(gas, has_access(context, &mut gas, caller_address)) {
+                    gas.spend_all();
                     interpreter_revert!(gas);
                 }
 
@@ -103,6 +104,19 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbNativeTokenManagerPr
                     .balance_incr(caller_address, call.amount)
                     .expect("Failed to mint native token");
 
+                emit_event!(
+                    context,
+                    Log {
+                        address: *target_address,
+                        data: ArbNativeTokenManager::NativeTokenMinted {
+                            to: caller_address,
+                            amount: call.amount,
+                        }
+                        .into_log_data()
+                    },
+                    gas
+                );
+
                 let output = ArbNativeTokenManager::mintNativeTokenCall::abi_encode_returns(
                     &ArbNativeTokenManager::mintNativeTokenReturn {},
                 );
@@ -111,6 +125,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbNativeTokenManagerPr
             }
             ArbNativeTokenManager::burnNativeTokenCall::SELECTOR => {
                 if !try_state!(gas, has_access(context, &mut gas, caller_address)) {
+                    gas.spend_all();
                     interpreter_revert!(gas);
                 }
 
@@ -123,23 +138,31 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbNativeTokenManagerPr
                     interpreter_revert!(gas, Bytes::from("burn amount exceeds balance"));
                 };
 
-                match context
+                let new_balance = balance.saturating_sub(call.amount);
+                context
                     .journal_mut()
-                    .transfer(caller_address, *target_address, call.amount)
-                {
-                    Ok(None) => {
-                        let output = ArbNativeTokenManager::burnNativeTokenCall::abi_encode_returns(
-                            &ArbNativeTokenManager::burnNativeTokenReturn {},
-                        );
-                        interpreter_return!(gas, Bytes::from(output));
-                    }
-                    Ok(Some(err)) => Some(InterpreterResult {
-                        result: err.into(),
-                        gas,
-                        output: Bytes::default(),
-                    }),
-                    Err(e) => panic!("Failed to burn native token: {}", e),
-                }
+                    .load_account_mut(caller_address)
+                    .expect("Failed to load native token holder")
+                    .data
+                    .set_balance(new_balance);
+
+                emit_event!(
+                    context,
+                    Log {
+                        address: *target_address,
+                        data: ArbNativeTokenManager::NativeTokenBurned {
+                            from: caller_address,
+                            amount: call.amount,
+                        }
+                        .into_log_data()
+                    },
+                    gas
+                );
+
+                let output = ArbNativeTokenManager::burnNativeTokenCall::abi_encode_returns(
+                    &ArbNativeTokenManager::burnNativeTokenReturn {},
+                );
+                interpreter_return!(gas, Bytes::from(output));
             }
             _ => interpreter_revert!(gas, Bytes::from("Unknown function selector")),
         }

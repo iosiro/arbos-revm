@@ -1,8 +1,10 @@
 pub mod address_table;
 pub mod arbos_state;
 pub mod block_hashes;
+pub mod filtered_transactions;
 pub mod l1_pricing;
 pub mod l2_pricing;
+pub mod merkle_accumulator;
 pub mod program;
 pub mod retryable;
 pub mod types;

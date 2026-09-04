@@ -20,7 +20,8 @@ use revm::{
 };
 
 use crate::{
-    ArbitrumContextTr, ArbitrumEvm, constants::STYLUS_DISCRIMINANT, handler::ArbitrumHandler,
+    ArbitrumContextTr, ArbitrumEvm, constants::STYLUS_DISCRIMINANT, context::ArbitrumContextMutTr,
+    handler::ArbitrumHandler,
 };
 
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I> {
@@ -204,7 +205,7 @@ where
 impl<CTX, INSP, INST, PRECOMPILES> InspectEvm
     for ArbitrumEvm<CTX, INSP, PRECOMPILES, INST, EthFrame<EthInterpreter>>
 where
-    CTX: ContextSetters + ArbitrumContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
+    CTX: ContextSetters + ArbitrumContextMutTr<Journal: JournalTr<State = EvmState> + JournalExt>,
     INSP: Inspector<CTX, EthInterpreter>,
     INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
@@ -225,7 +226,7 @@ impl<CTX, INSP, INST, PRECOMPILES> InspectCommitEvm
     for ArbitrumEvm<CTX, INSP, PRECOMPILES, INST, EthFrame<EthInterpreter>>
 where
     CTX: ContextSetters
-        + ArbitrumContextTr<Journal: JournalTr<State = EvmState> + JournalExt, Db: DatabaseCommit>,
+        + ArbitrumContextMutTr<Journal: JournalTr<State = EvmState> + JournalExt, Db: DatabaseCommit>,
     INSP: Inspector<CTX, EthInterpreter>,
     INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
