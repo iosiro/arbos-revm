@@ -1,6 +1,6 @@
 use alloy_sol_types::{SolCall, SolError, sol};
 use revm::{
-    context::{Block, JournalTr, Transaction},
+    context::{Block, JournalTr, Transaction, journaled_state::account::JournaledAccountTr},
     interpreter::{Gas, InterpreterResult},
     precompile::PrecompileId,
     primitives::{
@@ -14,6 +14,7 @@ use crate::{
     config::ArbitrumConfigTr,
     constants::{ARBITRUM_CONTRACT_TX_TYPE, ARBITRUM_RETRY_TX_TYPE, ARBITRUM_UNSIGNED_TX_TYPE},
     generate_state_mut_table,
+    local_context::ArbitrumLocalContextTr,
     macros::{emit_event, interpreter_return, interpreter_revert},
     precompile_impl,
     precompiles::{
@@ -313,7 +314,10 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
                             | ARBITRUM_RETRY_TX_TYPE
                     );
                 let mut address = if depth > 1 {
-                    context.tx().caller()
+                    context
+                        .local()
+                        .parent_frame_caller()
+                        .unwrap_or_else(|| context.tx().caller())
                 } else {
                     Address::ZERO
                 };

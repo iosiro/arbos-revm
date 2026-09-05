@@ -9,6 +9,7 @@ use test_utils::{create_evm, execute_tx, setup_context};
 
 use alloy_sol_types::{SolCall, sol};
 use arbos_revm::{
+    ArbitrumCommittedFailure, ArbitrumTransaction,
     constants::{ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBOS_ADDRESS},
     state::{ArbState, arbos_state::ArbosStateParams},
 };
@@ -148,7 +149,7 @@ fn submit_retryable_early_failures_retain_nitro_state_and_isolate_next_tx() {
     );
     assert!(matches!(
         result,
-        ExecutionResult::Revert { gas_used: 0, .. }
+        ExecutionResult::Revert { ref gas, .. } if gas.tx_gas_used() == 0
     ));
     assert_eq!(balance(&mut evm, caller), U256::from(100));
 
@@ -159,7 +160,7 @@ fn submit_retryable_early_failures_retain_nitro_state_and_isolate_next_tx() {
     );
     assert!(matches!(
         result,
-        ExecutionResult::Revert { gas_used: 0, .. }
+        ExecutionResult::Revert { ref gas, .. } if gas.tx_gas_used() == 0
     ));
     assert_eq!(balance(&mut evm, caller), U256::from(1_100));
 
@@ -200,7 +201,7 @@ fn submit_retryable_callvalue_failure_compensates_before_failed_receipt() {
     );
     assert!(matches!(
         result,
-        ExecutionResult::Revert { gas_used: 0, .. }
+        ExecutionResult::Revert { ref gas, .. } if gas.tx_gas_used() == 0
     ));
     assert_eq!(balance(&mut evm, network), U256::ZERO);
     assert_eq!(balance(&mut evm, caller), U256::from(150_000));
@@ -216,18 +217,22 @@ fn malformed_internal_failure_is_receipt_level_and_does_not_dirty_next_tx() {
         .unwrap();
     let mut evm = create_evm(context);
 
-    let result = execute_tx(
-        &mut evm,
-        TxEnv {
+    let outcome = evm
+        .transact_one_arbitrum(ArbitrumTransaction::from(TxEnv {
             tx_type: ARBITRUM_INTERNAL_TX_TYPE,
             caller: ARBOS_ADDRESS,
             data: Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]),
             ..Default::default()
-        },
+        }))
+        .unwrap();
+    assert_eq!(
+        outcome.committed_failure,
+        Some(ArbitrumCommittedFailure::Internal)
     );
+    let result = outcome.result;
     assert!(matches!(
         result,
-        ExecutionResult::Revert { gas_used: 0, .. }
+        ExecutionResult::Revert { ref gas, .. } if gas.tx_gas_used() == 0
     ));
 
     let recipient = Address::repeat_byte(0x88);

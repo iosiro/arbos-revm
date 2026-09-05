@@ -269,9 +269,8 @@ fn test_e2e_nested_call_gas_forwarding() {
     let result = execute_tx(&mut evm, tx);
 
     match result {
-        ExecutionResult::Success {
-            output, gas_used, ..
-        } => {
+        ExecutionResult::Success { output, gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             // Should succeed and echo back
             assert_eq!(output.data().as_ref(), test_data);
             // Gas should be consumed for both contracts

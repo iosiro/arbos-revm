@@ -1,8 +1,7 @@
-use std::ops::Deref;
-
 use alloy_sol_types::{SolCall, sol};
 
 use crate::{
+    chain::ArbitrumChainTr,
     config::ArbitrumConfigTr,
     constants::{
         ARBITRUM_CONTRACT_TX_TYPE, ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE,
@@ -13,9 +12,11 @@ use crate::{
     context::ArbitrumContextMutTr,
     l1_fee,
     local_context::ArbitrumLocalContextTr,
+    result::ArbitrumCommittedFailure,
     state::{ArbState, ArbStateGetter, types::StorageBackedTr},
     transaction::{
-        ArbitrumInternalTx, ArbitrumTxTr, arbitrum_retry_tx_hash, arbitrum_submit_retryable_tx_hash,
+        ArbitrumInternalTx, ArbitrumRetryTx, ArbitrumTxProvenance, ArbitrumTxTr,
+        arbitrum_retry_tx_hash, arbitrum_submit_retryable_tx_hash,
     },
 };
 
@@ -74,15 +75,19 @@ use revm::{
     Inspector,
     context::{
         Block, Cfg, ContextTr, Host, JournalTr, LocalContextTr, Transaction,
-        result::{ExecutionResult, FromStringError, HaltReason, InvalidTransaction, SuccessReason},
+        result::{
+            ExecutionResult, FromStringError, HaltReason, InvalidTransaction, ResultGas,
+            SuccessReason,
+        },
     },
+    context_interface::journaled_state::{JournalCheckpoint, account::JournaledAccountTr},
     handler::{
         EthFrame, EvmTr, FrameResult, FrameTr, Handler, MainnetHandler,
         handler::EvmTrError,
         pre_execution::{calculate_caller_fee, validate_account_nonce_and_code_with_components},
     },
     inspector::{InspectorEvmTr, InspectorHandler},
-    interpreter::{Gas, InitialAndFloorGas, interpreter::EthInterpreter},
+    interpreter::{GasTracker, InitialAndFloorGas, interpreter::EthInterpreter},
     primitives::{
         Address, Bytes, Log, TxKind, U256, address, alloy_primitives::IntoLogData, keccak256,
     },
@@ -163,8 +168,7 @@ where
         // Return success with 0 gas used
         Ok(ExecutionResult::Success {
             reason: SuccessReason::Stop,
-            gas_used: 0,
-            gas_refunded: 0,
+            gas: ResultGas::default(),
             output: revm::context::result::Output::Call(Bytes::new()),
             logs: Vec::new(),
         })
@@ -360,8 +364,7 @@ where
         // Return success with 0 gas used
         Ok(ExecutionResult::Success {
             reason: SuccessReason::Stop,
-            gas_used: 0,
-            gas_refunded: 0,
+            gas: ResultGas::default(),
             output: revm::context::result::Output::Call(Bytes::new()),
             logs: Vec::new(),
         })
@@ -558,6 +561,21 @@ where
                     available_refund,
                     submission_fee,
                 );
+                let chain_id = U256::from(ctx.cfg().chain_id());
+                ctx.chain_mut().schedule_retry(ArbitrumRetryTx {
+                    chain_id,
+                    nonce: 0,
+                    from: caller,
+                    gas_fee_cap: base_fee,
+                    gas_limit: call.gasLimit,
+                    to: retry_to,
+                    value: call.callvalue,
+                    data: call.retryData.clone(),
+                    ticket_id,
+                    refund_to: fee_refund_address,
+                    max_refund: available_refund,
+                    submission_fee_refund: submission_fee,
+                });
                 logs.push(Log {
                     address: retryable_address,
                     data: RedeemScheduled {
@@ -582,8 +600,11 @@ where
         evm.frame_stack().clear();
         Ok(ExecutionResult::Success {
             reason: SuccessReason::Stop,
-            gas_used: if can_pay_for_redeem { call.gasLimit } else { 0 },
-            gas_refunded: 0,
+            gas: ResultGas::default().with_total_gas_spent(if can_pay_for_redeem {
+                call.gasLimit
+            } else {
+                0
+            }),
             output: revm::context::result::Output::Call(Bytes::copy_from_slice(
                 ticket_id.as_slice(),
             )),
@@ -600,7 +621,8 @@ where
         evm.ctx().local_mut().clear();
         evm.frame_stack().clear();
         ExecutionResult::Revert {
-            gas_used: 0,
+            gas: ResultGas::default(),
+            logs: Vec::new(),
             output: Bytes::new(),
         }
     }
@@ -680,20 +702,40 @@ where
         if persisted_version != 0 {
             evm.ctx().set_live_arbos_version(persisted_version);
         }
+        let block_number = evm.ctx().block().number().saturating_to::<u64>();
+        evm.ctx().chain_mut().begin_block(block_number);
         let tx_type = evm.ctx().tx().tx_type();
 
         match tx_type {
             ARBITRUM_DEPOSIT_TX_TYPE => match self.execute_deposit_tx(evm) {
                 Ok(result) => Ok(result),
-                Err(_) => Ok(self.commit_system_failure(evm)),
+                Err(_) => {
+                    let result = self.commit_system_failure(evm);
+                    evm.ctx()
+                        .chain_mut()
+                        .set_committed_failure(Some(ArbitrumCommittedFailure::Deposit));
+                    Ok(result)
+                }
             },
             ARBITRUM_INTERNAL_TX_TYPE => match self.execute_internal_tx(evm) {
                 Ok(result) => Ok(result),
-                Err(_) => Ok(self.commit_system_failure(evm)),
+                Err(_) => {
+                    let result = self.commit_system_failure(evm);
+                    evm.ctx()
+                        .chain_mut()
+                        .set_committed_failure(Some(ArbitrumCommittedFailure::Internal));
+                    Ok(result)
+                }
             },
             ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE => match self.execute_submit_retryable(evm) {
                 Ok(result) => Ok(result),
-                Err(_) => Ok(self.commit_system_failure(evm)),
+                Err(_) => {
+                    let result = self.commit_system_failure(evm);
+                    evm.ctx()
+                        .chain_mut()
+                        .set_committed_failure(Some(ArbitrumCommittedFailure::SubmitRetryable));
+                    Ok(result)
+                }
             },
             _ => {
                 let collect_tips =
@@ -729,6 +771,7 @@ where
     fn validate_against_state_and_deduct_caller(
         &self,
         evm: &mut Self::Evm,
+        init_and_floor_gas: &mut InitialAndFloorGas,
     ) -> Result<(), Self::Error> {
         let ctx = evm.ctx();
 
@@ -746,10 +789,11 @@ where
                 | ARBITRUM_INTERNAL_TX_TYPE
                 | ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE
         );
-        let poster_is_batch_poster = ctx
-            .tx()
-            .poster()
-            .is_none_or(|poster| poster == crate::constants::ARBOS_BATCH_POSTER_ADDRESS);
+        let poster_is_batch_poster = matches!(
+            ctx.tx().provenance(),
+            ArbitrumTxProvenance::BatchPoster(poster)
+                if poster == crate::constants::ARBOS_BATCH_POSTER_ADDRESS
+        );
         let l1_cost = if !ctx.cfg().is_fee_charge_disabled()
             && ctx.block().basefee() > 0
             && has_poster_cost
@@ -795,8 +839,26 @@ where
                 let paid_gas_price = ctx.tx().effective_gas_price(ctx.block().basefee() as u128);
                 let poster_gas = l1_fee::calculate_poster_gas(cost, U256::from(paid_gas_price));
                 ctx.local_mut().set_poster_gas(Some(poster_gas));
+                let charged_poster_fee =
+                    U256::from(paid_gas_price).saturating_mul(U256::from(poster_gas));
 
-                Some(cost)
+                // Nitro reserves poster gas before the execution allowance is
+                // validated. Fold it into the regular intrinsic component so
+                // REVM's transaction-level tracker cannot forward it to the
+                // first frame.
+                let initial_regular_gas = init_and_floor_gas
+                    .initial_regular_gas()
+                    .saturating_add(poster_gas);
+                if initial_regular_gas > ctx.tx().gas_limit() {
+                    return Err(InvalidTransaction::CallGasCostMoreThanGasLimit {
+                        initial_gas: initial_regular_gas,
+                        gas_limit: ctx.tx().gas_limit(),
+                    }
+                    .into());
+                }
+                init_and_floor_gas.set_initial_regular_gas(initial_regular_gas);
+
+                Some(charged_poster_fee)
             } else {
                 None
             }
@@ -807,6 +869,30 @@ where
         // Cache the L1 cost in local context
         ctx.local_mut().set_tx_l1_cost(l1_cost);
 
+        let per_block_limit = ctx
+            .arb_state(None, false)
+            .l2_pricing()
+            .per_block_gas_limit()
+            .get()
+            .map_err(|err| ERROR::from_string(format!("per-block gas limit: {err}")))?;
+        let arbos_version = ctx
+            .arb_state(None, false)
+            .arbos_version()
+            .get()
+            .map_err(|err| ERROR::from_string(format!("ArbOS version: {err}")))?;
+        let initial_compute_gas = init_and_floor_gas
+            .initial_total_gas()
+            .saturating_sub(ctx.local().poster_gas().unwrap_or(0));
+        if arbos_version >= 50
+            && ctx
+                .chain()
+                .block_gas_used()
+                .saturating_add(initial_compute_gas)
+                > per_block_limit
+        {
+            return Err(InvalidTransaction::CallerGasLimitMoreThanBlock.into());
+        }
+
         // Now do the standard validation with all_mut
         let (block, tx, cfg, journal, _, _) = ctx.all_mut();
 
@@ -814,28 +900,19 @@ where
         let mut caller = journal.load_account_with_code_mut(tx.caller())?.data;
 
         // Validate nonce and code (JournaledAccount derefs to Account)
-        validate_account_nonce_and_code_with_components(&caller.deref().info, tx, cfg)?;
-
-        let mut balance = *caller.balance();
-
-        // Deduct L1 fee if calculated
-        if let Some(l1_cost) = l1_cost {
-            let Some(new_balance) = balance.checked_sub(l1_cost) else {
-                return Err(InvalidTransaction::LackOfFundForMaxFee {
-                    fee: Box::new(l1_cost),
-                    balance: Box::new(balance),
-                }
-                .into());
-            };
-            balance = new_balance;
+        if tx.tx_type() != ARBITRUM_RETRY_TX_TYPE {
+            validate_account_nonce_and_code_with_components(&caller.account().info, tx, cfg)?;
         }
 
-        // Calculate and deduct L2 gas fee
+        let balance = *caller.balance();
+
+        // The maximum transaction gas debit already covers poster gas. It is
+        // settled from the used-gas amount and routed separately below.
         let balance = calculate_caller_fee(balance, tx, block, cfg)?;
 
         // Update caller balance and nonce
         caller.set_balance(balance);
-        if tx.kind().is_call() {
+        if tx.kind().is_call() && tx.tx_type() != ARBITRUM_RETRY_TX_TYPE {
             caller.bump_nonce();
         }
 
@@ -845,68 +922,60 @@ where
     fn execution(
         &mut self,
         evm: &mut Self::Evm,
-        init_and_floor_gas: &InitialAndFloorGas,
-    ) -> Result<FrameResult, Self::Error> {
-        let requested = evm
-            .ctx()
-            .tx()
-            .gas_limit()
-            .saturating_sub(init_and_floor_gas.initial_gas);
+        checkpoint: JournalCheckpoint,
+        gas: &mut GasTracker,
+    ) -> Result<Option<FrameResult>, Self::Error> {
+        let requested = gas.remaining();
+        let initial_gas = gas.limit().saturating_sub(requested);
+        let poster_gas = evm.ctx().local().poster_gas().unwrap_or(0);
+        let initial_compute_gas = initial_gas.saturating_sub(poster_gas);
         let arbos_version = evm
             .ctx()
             .arb_state(None, false)
             .arbos_version()
             .get()
             .map_err(|err| ERROR::from_string(format!("ArbOS version: {err}")))?;
+        let per_block_limit = evm
+            .ctx()
+            .arb_state(None, false)
+            .l2_pricing()
+            .per_block_gas_limit()
+            .get()
+            .map_err(|err| ERROR::from_string(format!("per-block gas limit: {err}")))?;
         let cap = if arbos_version >= 50 {
+            let block_execution_remaining = per_block_limit
+                .saturating_sub(evm.ctx().chain().block_gas_used())
+                .saturating_sub(initial_compute_gas);
             evm.ctx()
                 .arb_state(None, false)
                 .l2_pricing()
                 .per_tx_gas_limit()
                 .get()
                 .map_err(|err| ERROR::from_string(format!("per-tx gas limit: {err}")))?
-                .saturating_sub(init_and_floor_gas.initial_gas)
+                .saturating_sub(initial_gas)
+                .min(block_execution_remaining)
         } else {
-            evm.ctx()
-                .arb_state(None, false)
-                .l2_pricing()
-                .per_block_gas_limit()
-                .get()
-                .map_err(|err| ERROR::from_string(format!("per-block gas limit: {err}")))?
+            per_block_limit
         };
         let frame_gas = requested.min(cap);
         evm.ctx()
             .local_mut()
             .set_held_gas(requested.saturating_sub(frame_gas));
-        let first_frame_input = self.first_frame_input(evm, frame_gas)?;
-        let mut frame_result = self.run_exec_loop(evm, first_frame_input)?;
-        self.last_frame_result(evm, &mut frame_result)?;
-        Ok(frame_result)
-    }
+        gas.set_remaining(frame_gas);
 
-    fn last_frame_result(
-        &mut self,
-        evm: &mut Self::Evm,
-        frame_result: &mut FrameResult,
-    ) -> Result<(), Self::Error> {
-        let instruction_result = frame_result.interpreter_result().result;
-        let held_gas = evm.ctx().local().held_gas();
-        let transaction_gas_limit = evm.ctx().tx().gas_limit();
-        let gas = frame_result.gas_mut();
-        let remaining = gas.remaining();
-        let refunded = gas.refunded();
-
-        *gas = Gas::new_spent(transaction_gas_limit);
-        // Held gas never enters the interpreter and is always returned, even
-        // when execution exhausts its capped allowance.
-        gas.erase_cost(held_gas);
-        if instruction_result.is_ok_or_revert() {
-            gas.erase_cost(remaining);
+        let mut result = self.mainnet.execution(evm, checkpoint, gas)?;
+        let held_gas = requested.saturating_sub(frame_gas);
+        gas.set_remaining(gas.remaining().saturating_add(held_gas));
+        if let Some(frame_result) = result.as_mut() {
+            // `MainnetHandler::execution` copied the settled transaction gas
+            // into the frame result. Keep both views consistent after
+            // returning the allowance held outside the interpreter.
+            let mut settled = *frame_result.gas().tracker();
+            settled.set_remaining(settled.remaining().saturating_add(held_gas));
+            *frame_result.gas_mut().tracker_mut() = settled;
+            *gas = settled;
         }
-        if instruction_result.is_ok() {
-            gas.record_refund(refunded);
-        }
-        Ok(())
+        Ok(result)
     }
 
     /// Distributes transaction fees using ArbOS's single-dimensional fee rules.
@@ -935,10 +1004,8 @@ where
                 .map_err(|err| ERROR::from_string(format!("L2 gas backlog: {err}")))?;
         }
 
-        // Unlike Nitro's geth hook, this handler deducts the L1 poster charge
-        // directly in wei rather than inserting poster gas into the EVM gas
-        // budget. Consequently all gas reported by this frame is compute gas.
-        let compute_gas = gas_used;
+        let poster_gas = ctx.local().poster_gas().unwrap_or(0).min(gas_used);
+        let compute_gas = gas_used.saturating_sub(poster_gas);
         let base_fee = U256::from(ctx.block().basefee());
         let effective_gas_price =
             U256::from(ctx.tx().effective_gas_price(ctx.block().basefee() as u128));
@@ -979,7 +1046,7 @@ where
         let tip_reward = if collect_tips {
             effective_gas_price
                 .saturating_sub(base_fee)
-                .saturating_mul(U256::from(gas_used))
+                .saturating_mul(U256::from(compute_gas))
         } else {
             U256::ZERO
         };
@@ -1019,10 +1086,28 @@ where
         &mut self,
         evm: &mut Self::Evm,
         result: <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
+        result_gas: ResultGas,
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
-        // Get the execution result using the mainnet implementation
-        // Note: mainnet.execution_result already clears local context
-        self.mainnet.execution_result(evm, result)
+        let scheduled = evm.ctx().local_mut().take_scheduled_retries();
+        let filtered = evm.ctx().local_mut().take_filter_current_transaction();
+        let canonical_hash = evm.ctx().tx().canonical_hash();
+        let poster_gas = evm.ctx().local().poster_gas().unwrap_or(0);
+        // Mainnet commits the journal and clears transaction-local state.
+        let output = self.mainnet.execution_result(evm, result, result_gas)?;
+        if output.is_success() {
+            for retry in scheduled {
+                evm.ctx().chain_mut().schedule_retry(retry);
+            }
+        }
+        evm.ctx()
+            .chain_mut()
+            .record_block_gas(output.tx_gas_used().saturating_sub(poster_gas));
+        if filtered && let Some(hash) = canonical_hash {
+            evm.ctx().chain_mut().set_committed_failure(Some(
+                ArbitrumCommittedFailure::FilteredTransaction { hash },
+            ));
+        }
+        Ok(output)
     }
 
     /// Handles cleanup when an error occurs during execution.

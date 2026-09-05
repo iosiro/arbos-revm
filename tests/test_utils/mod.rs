@@ -48,7 +48,7 @@ pub fn setup_context() -> TestContext {
         block: BlockEnv::default(),
         cfg: ArbitrumConfig::default(),
         tx: ArbitrumTransaction::default(),
-        chain: (),
+        chain: Default::default(),
         local: ArbitrumLocalContext::default(),
         error: Ok(()),
     }
@@ -74,7 +74,7 @@ pub fn create_evm(context: TestContext) -> TestEvm {
     ArbitrumEvm::new_with_inspector(
         context,
         NoOpInspector {},
-        EthInstructions::default(),
+        EthInstructions::new_mainnet_with_spec(revm::primitives::hardfork::SpecId::default()),
         ArbitrumPrecompileProvider::new(revm::primitives::hardfork::SpecId::default()),
     )
 }

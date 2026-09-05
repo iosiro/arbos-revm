@@ -33,9 +33,8 @@ fn test_e2e_basic_execution() {
     let result = execute_tx(&mut evm, tx);
 
     match result {
-        ExecutionResult::Success {
-            output, gas_used, ..
-        } => {
+        ExecutionResult::Success { output, gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             assert!(gas_used > 0, "gas should have been consumed");
             assert!(output.data().is_empty() || output.data()[0] == 0);
         }
@@ -254,7 +253,8 @@ fn test_e2e_out_of_gas() {
     match result {
         ExecutionResult::Halt { .. } => {}
         ExecutionResult::Revert { .. } => {}
-        ExecutionResult::Success { gas_used, .. } => {
+        ExecutionResult::Success { gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             assert!(gas_used > 30_000, "if success, gas usage should be high");
         }
     }
@@ -276,14 +276,17 @@ fn test_e2e_gas_tracking() {
     let result = execute_tx(&mut evm, tx);
 
     match result {
-        ExecutionResult::Success { gas_used, .. } => {
+        ExecutionResult::Success { gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             assert!(gas_used > 0, "gas should have been consumed");
             assert!(gas_used < initial_gas, "not all gas should be used");
         }
-        ExecutionResult::Revert { gas_used, .. } => {
+        ExecutionResult::Revert { gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             assert!(gas_used > 0, "gas should have been consumed even on revert");
         }
-        ExecutionResult::Halt { gas_used, .. } => {
+        ExecutionResult::Halt { gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             assert!(gas_used > 0, "gas should have been consumed even on halt");
         }
     }
@@ -314,7 +317,8 @@ fn test_e2e_massive_gas_limit() {
 
     // Should not panic due to overflow - either success or proper error handling
     match result {
-        ExecutionResult::Success { gas_used, .. } => {
+        ExecutionResult::Success { gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             assert!(gas_used > 0, "gas should have been consumed");
             assert!(
                 gas_used < massive_gas,
@@ -370,10 +374,10 @@ fn test_e2e_gas_used_not_inflated_with_u64_max_gas_limit() {
         &mut evm,
         create_call_tx(program_address, vec![], 10_000_000),
     )
-    .gas_used();
+    .tx_gas_used();
     let mut huge_tx = create_call_tx(program_address, vec![], u64::MAX);
     huge_tx.nonce = 1;
-    let huge = execute_tx(&mut evm, huge_tx).gas_used();
+    let huge = execute_tx(&mut evm, huge_tx).tx_gas_used();
 
     assert!(huge < 1_000_000, "gas use was inflated to {huge}");
     assert!(
@@ -404,9 +408,8 @@ fn test_e2e_stylus_out_of_ink_during_execution() {
 
     // Should run out of gas/ink, not succeed
     match result {
-        ExecutionResult::Halt {
-            reason, gas_used, ..
-        } => {
+        ExecutionResult::Halt { reason, gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             // Expected - ran out of gas
             assert!(gas_used > 0, "should have used some gas before halting");
             // OutOfGas is the expected halt reason
@@ -417,11 +420,13 @@ fn test_e2e_stylus_out_of_ink_during_execution() {
                 reason
             );
         }
-        ExecutionResult::Revert { gas_used, .. } => {
+        ExecutionResult::Revert { gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             // Also acceptable - program might revert when it detects low gas
             assert!(gas_used > 0, "should have used some gas");
         }
-        ExecutionResult::Success { gas_used, .. } => {
+        ExecutionResult::Success { gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             // If it succeeds, it should have used nearly all the gas
             assert!(
                 gas_used > 90_000,
@@ -451,19 +456,22 @@ fn test_e2e_minimal_gas_for_stylus() {
     let result = execute_tx(&mut evm, tx);
 
     match result {
-        ExecutionResult::Halt { gas_used, .. } => {
+        ExecutionResult::Halt { gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             assert!(
                 gas_used <= minimal_gas,
                 "shouldn't use more gas than provided"
             );
         }
-        ExecutionResult::Revert { gas_used, .. } => {
+        ExecutionResult::Revert { gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             assert!(
                 gas_used <= minimal_gas,
                 "shouldn't use more gas than provided"
             );
         }
-        ExecutionResult::Success { gas_used, .. } => {
+        ExecutionResult::Success { gas, .. } => {
+            let gas_used = gas.tx_gas_used();
             assert!(
                 gas_used <= minimal_gas,
                 "shouldn't use more gas than provided"

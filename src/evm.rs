@@ -1,8 +1,15 @@
 use std::ops::{Deref, DerefMut};
 
 use crate::{
-    ArbitrumContextTr, constants::STYLUS_DISCRIMINANT, context::ArbitrumContextMutTr,
-    handler::ArbitrumHandler, transaction::ArbitrumTransactionError,
+    ArbitrumContextTr,
+    chain::ArbitrumChainTr,
+    constants::STYLUS_DISCRIMINANT,
+    context::ArbitrumContextMutTr,
+    handler::ArbitrumHandler,
+    local_context::ArbitrumLocalContextTr,
+    result::ArbitrumExecutionOutcome,
+    state::{ArbState, ArbStateGetter},
+    transaction::{ArbitrumRetryTx, ArbitrumTransaction, ArbitrumTransactionError},
 };
 use revm::{
     Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, Inspector,
@@ -15,13 +22,20 @@ use revm::{
         PrecompileProvider,
         instructions::{EthInstructions, InstructionProvider},
     },
-    interpreter::{InterpreterResult, interpreter::EthInterpreter, interpreter_action::FrameInit},
+    interpreter::{
+        FrameInput, InterpreterResult, interpreter::EthInterpreter, interpreter_action::FrameInit,
+    },
+    primitives::{U256, keccak256},
     state::EvmState,
 };
 
 pub struct ArbitrumEvm<CTX, INSP, P, I = EthInstructions<EthInterpreter, CTX>, F = EthFrame>(
     pub Evm<CTX, INSP, I, P, F>,
 );
+
+type ArbitrumEvmError<CTX> =
+    EVMError<<<CTX as ContextTr>::Db as Database>::Error, ArbitrumTransactionError>;
+type ScheduledRetryResult<CTX> = Result<Option<ExecutionResult<HaltReason>>, ArbitrumEvmError<CTX>>;
 
 impl<CTX, I, INSP, P, F> ArbitrumEvm<CTX, INSP, P, I, F> {
     /// Create a new EVM instance with a given context, inspector, instruction set, and precompile
@@ -101,6 +115,14 @@ where
         ItemOrResult<&mut Self::Frame, <Self::Frame as FrameTr>::FrameResult>,
         ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
     > {
+        let caller = match &frame_input.frame_input {
+            FrameInput::Call(inputs) => Some(inputs.caller),
+            FrameInput::Create(inputs) => Some(inputs.caller()),
+            FrameInput::Empty => None,
+        };
+        if let Some(caller) = caller {
+            self.0.ctx.local_mut().enter_frame(caller);
+        }
         self.0.frame_init(frame_input)
     }
 
@@ -138,6 +160,7 @@ where
         Option<<Self::Frame as FrameTr>::FrameResult>,
         ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
     > {
+        self.0.ctx.local_mut().exit_frame();
         self.0.frame_return_result(result)
     }
 
@@ -189,6 +212,7 @@ where
 
     #[inline]
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
+        self.0.ctx.chain_mut().set_committed_failure(None);
         self.0.ctx.set_tx(tx);
         ArbitrumHandler::default().run(self)
     }
@@ -223,6 +247,127 @@ where
     #[inline]
     fn commit(&mut self, state: Self::State) {
         self.0.db_mut().commit(state);
+    }
+}
+
+impl<CTX, INSP, INST, PRECOMPILES>
+    ArbitrumEvm<CTX, INSP, PRECOMPILES, INST, EthFrame<EthInterpreter>>
+where
+    CTX: ArbitrumContextMutTr<Tx = ArbitrumTransaction, Journal: JournalTr<State = EvmState>>
+        + ContextSetters,
+    INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
+{
+    /// Executes one transaction while preserving ArbOS's typed distinction
+    /// between committed receipt failures and execution errors.
+    pub fn transact_one_arbitrum(
+        &mut self,
+        tx: ArbitrumTransaction,
+    ) -> Result<
+        ArbitrumExecutionOutcome,
+        EVMError<<CTX::Db as Database>::Error, ArbitrumTransactionError>,
+    > {
+        self.0.ctx.chain_mut().set_committed_failure(None);
+        self.0.ctx.set_tx(tx);
+        let result = ArbitrumHandler::<
+            Self,
+            EVMError<<CTX::Db as Database>::Error, ArbitrumTransactionError>,
+            EthFrame<EthInterpreter>,
+        >::default()
+        .run(self)?;
+        let committed_failure = self.0.ctx.chain_mut().take_committed_failure();
+        Ok(ArbitrumExecutionOutcome {
+            result,
+            committed_failure,
+        })
+    }
+
+    /// Pops and executes the next retry scheduled by a committed transaction.
+    /// Returns `Ok(None)` when the backend queue is empty.
+    pub fn transact_next_scheduled_retry(&mut self) -> ScheduledRetryResult<CTX> {
+        let Some(retry) = self.0.ctx.chain_mut().next_scheduled_retry() else {
+            return Ok(None);
+        };
+        self.prepare_retry(&retry)?;
+        self.0.ctx.set_tx(retry.clone().into_transaction());
+        self.0
+            .ctx
+            .local_mut()
+            .set_current_retryable(Some(retry.ticket_id));
+
+        let result = ArbitrumHandler::<
+            Self,
+            EVMError<<CTX::Db as Database>::Error, ArbitrumTransactionError>,
+            EthFrame<EthInterpreter>,
+        >::default()
+        .run(self)?;
+        self.finish_retry(&retry, result.is_success())?;
+        Ok(Some(result))
+    }
+
+    fn prepare_retry(
+        &mut self,
+        retry: &ArbitrumRetryTx,
+    ) -> Result<(), EVMError<<CTX::Db as Database>::Error, ArbitrumTransactionError>> {
+        let escrow_hash =
+            keccak256([b"retryable escrow".as_slice(), retry.ticket_id.as_slice()].concat());
+        let escrow = revm::primitives::Address::from_slice(&escrow_hash[12..]);
+        if self
+            .0
+            .ctx
+            .journal_mut()
+            .transfer(escrow, retry.from, retry.value)
+            .map_err(EVMError::Database)?
+            .is_some()
+        {
+            return Err(EVMError::Transaction(
+                ArbitrumTransactionError::RetryPreparationFailed,
+            ));
+        }
+        let prepaid = retry
+            .gas_fee_cap
+            .saturating_mul(U256::from(retry.gas_limit));
+        self.0
+            .ctx
+            .journal_mut()
+            .balance_incr(retry.from, prepaid)
+            .map_err(EVMError::Database)?;
+        Ok(())
+    }
+
+    fn finish_retry(
+        &mut self,
+        retry: &ArbitrumRetryTx,
+        success: bool,
+    ) -> Result<(), EVMError<<CTX::Db as Database>::Error, ArbitrumTransactionError>> {
+        if success {
+            self.0
+                .ctx
+                .arb_state(None, false)
+                .retryable(retry.ticket_id)
+                .clear()
+                .map_err(|_| {
+                    EVMError::Transaction(ArbitrumTransactionError::RetryPreparationFailed)
+                })?;
+        } else {
+            let escrow_hash =
+                keccak256([b"retryable escrow".as_slice(), retry.ticket_id.as_slice()].concat());
+            let escrow = revm::primitives::Address::from_slice(&escrow_hash[12..]);
+            if self
+                .0
+                .ctx
+                .journal_mut()
+                .transfer(retry.from, escrow, retry.value)
+                .map_err(EVMError::Database)?
+                .is_some()
+            {
+                return Err(EVMError::Transaction(
+                    ArbitrumTransactionError::RetryPreparationFailed,
+                ));
+            }
+        }
+        self.0.ctx.journal_mut().commit_tx();
+        Ok(())
     }
 }
 

@@ -12,14 +12,32 @@ use revm::{
 };
 
 use crate::constants::{
-    ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE, ARBOS_ADDRESS, ARBOS_STATE_ADDRESS,
+    ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE, ARBOS_ADDRESS, ARBOS_BATCH_POSTER_ADDRESS,
+    ARBOS_STATE_ADDRESS,
 };
+
+/// Origin metadata that affects ArbOS fee charging and filtering.
+///
+/// This is deliberately explicit: absence of a poster address cannot safely
+/// distinguish a batch transaction from a delayed-inbox or exempt message.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ArbitrumTxProvenance {
+    /// Transaction data was posted by this batch poster.
+    BatchPoster(Address),
+    /// Transaction arrived through the delayed inbox and has no poster cost.
+    DelayedInbox,
+    /// System or otherwise explicitly L1-poster-cost-exempt transaction.
+    #[default]
+    Exempt,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ArbitrumTransactionError {
     Base(InvalidTransaction),
     L1FeeCalculationFailed,
+    RetryPreparationFailed,
 }
 
 impl TransactionError for ArbitrumTransactionError {}
@@ -29,11 +47,22 @@ impl std::fmt::Display for ArbitrumTransactionError {
         match self {
             Self::Base(e) => e.fmt(f),
             Self::L1FeeCalculationFailed => write!(f, "L1 fee calculation failed"),
+            Self::RetryPreparationFailed => write!(f, "scheduled retry preparation failed"),
         }
     }
 }
 
 impl std::error::Error for ArbitrumTransactionError {}
+
+#[cfg(feature = "alloy")]
+impl alloy_evm::InvalidTxError for ArbitrumTransactionError {
+    fn as_invalid_tx_err(&self) -> Option<&InvalidTransaction> {
+        match self {
+            Self::Base(error) => Some(error),
+            Self::L1FeeCalculationFailed | Self::RetryPreparationFailed => None,
+        }
+    }
+}
 
 impl From<InvalidTransaction> for ArbitrumTransactionError {
     fn from(value: InvalidTransaction) -> Self {
@@ -55,8 +84,29 @@ pub struct ArbitrumTransaction {
     /// The enveloped EIP-2718 transaction bytes for L1 cost calculation.
     /// This contains the full serialized transaction used to compute L1 data costs.
     pub enveloped_tx: Option<Bytes>,
-    /// The poster address that submitted this transaction to L1 (batch poster)
+    /// Legacy poster projection retained for source compatibility.
     pub poster: Option<Address>,
+    /// Canonical transaction identity used by ArbOS filtering.
+    pub canonical_hash: Option<B256>,
+    /// Explicit message provenance used by poster-fee rules.
+    pub provenance: ArbitrumTxProvenance,
+}
+
+#[cfg(feature = "alloy")]
+impl alloy_evm::IntoTxEnv<Self> for ArbitrumTransaction {
+    fn into_tx_env(self) -> Self {
+        self
+    }
+}
+
+#[cfg(feature = "alloy")]
+impl alloy_evm::FromRecoveredTx<alloy_consensus::TxEnvelope> for ArbitrumTransaction {
+    fn from_recovered_tx(tx: &alloy_consensus::TxEnvelope, sender: Address) -> Self {
+        Self::new_with_enveloped(
+            TxEnv::from_recovered_tx(tx, sender),
+            Bytes::from(alloy_eips::eip2718::Encodable2718::encoded_2718(tx)),
+        )
+    }
 }
 
 impl ArbitrumTransaction {
@@ -65,15 +115,20 @@ impl ArbitrumTransaction {
             base,
             enveloped_tx: None,
             poster: None,
+            canonical_hash: None,
+            provenance: ArbitrumTxProvenance::Exempt,
         }
     }
 
     /// Create a new transaction with enveloped bytes for L1 cost calculation
     pub fn new_with_enveloped(base: TxEnv, enveloped_tx: Bytes) -> Self {
+        let canonical_hash = keccak256(&enveloped_tx);
         Self {
             base,
             enveloped_tx: Some(enveloped_tx),
-            poster: None,
+            poster: Some(ARBOS_BATCH_POSTER_ADDRESS),
+            canonical_hash: Some(canonical_hash),
+            provenance: ArbitrumTxProvenance::BatchPoster(ARBOS_BATCH_POSTER_ADDRESS),
         }
     }
 
@@ -83,11 +138,32 @@ impl ArbitrumTransaction {
         enveloped_tx: Bytes,
         poster: Address,
     ) -> Self {
+        let canonical_hash = keccak256(&enveloped_tx);
         Self {
             base,
             enveloped_tx: Some(enveloped_tx),
             poster: Some(poster),
+            canonical_hash: Some(canonical_hash),
+            provenance: ArbitrumTxProvenance::BatchPoster(poster),
         }
+    }
+
+    /// Marks an enveloped transaction as delayed-inbox sourced.
+    pub fn new_delayed(base: TxEnv, enveloped_tx: Bytes) -> Self {
+        let canonical_hash = keccak256(&enveloped_tx);
+        Self {
+            base,
+            canonical_hash: Some(canonical_hash),
+            enveloped_tx: Some(enveloped_tx),
+            poster: None,
+            provenance: ArbitrumTxProvenance::DelayedInbox,
+        }
+    }
+
+    /// Overrides the canonical identity when the backend already decoded it.
+    pub fn with_canonical_hash(mut self, hash: B256) -> Self {
+        self.canonical_hash = Some(hash);
+        self
     }
 }
 
@@ -134,6 +210,67 @@ pub fn arbitrum_retry_tx_hash(
     .encode(&mut encoded);
     encoded.extend_from_slice(&payload);
     keccak256(encoded)
+}
+
+/// Backend-ready representation of Nitro's derived type-0x68 retry transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ArbitrumRetryTx {
+    pub chain_id: U256,
+    pub nonce: u64,
+    pub from: Address,
+    pub gas_fee_cap: U256,
+    pub gas_limit: u64,
+    pub to: Option<Address>,
+    pub value: U256,
+    pub data: Bytes,
+    pub ticket_id: B256,
+    pub refund_to: Address,
+    pub max_refund: U256,
+    pub submission_fee_refund: U256,
+}
+
+impl ArbitrumRetryTx {
+    pub fn hash(&self) -> B256 {
+        arbitrum_retry_tx_hash(
+            self.chain_id,
+            self.nonce,
+            self.from,
+            self.gas_fee_cap,
+            self.gas_limit,
+            self.to,
+            self.value,
+            &self.data,
+            self.ticket_id,
+            self.refund_to,
+            self.max_refund,
+            self.submission_fee_refund,
+        )
+    }
+
+    pub fn into_transaction(self) -> ArbitrumTransaction {
+        let hash = self.hash();
+        let gas_price = self.gas_fee_cap.try_into().unwrap_or(u128::MAX);
+        ArbitrumTransaction {
+            base: TxEnv {
+                tx_type: crate::constants::ARBITRUM_RETRY_TX_TYPE,
+                caller: self.from,
+                gas_limit: self.gas_limit,
+                gas_price,
+                gas_priority_fee: Some(0),
+                kind: self.to.map_or(TxKind::Create, TxKind::Call),
+                value: self.value,
+                data: self.data,
+                nonce: self.nonce,
+                chain_id: self.chain_id.try_into().ok(),
+                ..Default::default()
+            },
+            enveloped_tx: None,
+            poster: None,
+            canonical_hash: Some(hash),
+            provenance: ArbitrumTxProvenance::Exempt,
+        }
+    }
 }
 
 /// Computes the canonical EIP-2718 hash for an `ArbitrumSubmitRetryableTx`
@@ -293,6 +430,12 @@ pub trait ArbitrumTxTr: Transaction {
     /// Returns the poster address that submitted this transaction.
     fn poster(&self) -> Option<Address>;
 
+    /// Canonical transaction hash supplied or derived by the backend.
+    fn canonical_hash(&self) -> Option<B256>;
+
+    /// Provenance controlling delayed-inbox and poster-cost behavior.
+    fn provenance(&self) -> ArbitrumTxProvenance;
+
     /// Drops the transaction tip before validation and execution, matching
     /// Nitro's mutation of the execution message when tips are not collected.
     fn drop_tip(&mut self, base_fee: u128);
@@ -305,6 +448,14 @@ impl ArbitrumTxTr for ArbitrumTransaction {
 
     fn poster(&self) -> Option<Address> {
         self.poster
+    }
+
+    fn canonical_hash(&self) -> Option<B256> {
+        self.canonical_hash
+    }
+
+    fn provenance(&self) -> ArbitrumTxProvenance {
+        self.provenance
     }
 
     fn drop_tip(&mut self, base_fee: u128) {
@@ -337,6 +488,14 @@ impl ArbitrumTxTr for TxEnv {
 
     fn poster(&self) -> Option<Address> {
         None
+    }
+
+    fn canonical_hash(&self) -> Option<B256> {
+        None
+    }
+
+    fn provenance(&self) -> ArbitrumTxProvenance {
+        ArbitrumTxProvenance::Exempt
     }
 
     fn drop_tip(&mut self, base_fee: u128) {
@@ -766,6 +925,21 @@ impl ArbitrumTxTr for ArbitrumTypedTransaction {
             Self::Standard(tx) => tx.poster(),
             // System transactions don't have a poster
             Self::Deposit(_) | Self::Internal(_) => None,
+        }
+    }
+
+    fn canonical_hash(&self) -> Option<B256> {
+        match self {
+            Self::Standard(tx) => tx.canonical_hash(),
+            Self::Deposit(tx) => Some(tx.hash()),
+            Self::Internal(tx) => Some(tx.hash()),
+        }
+    }
+
+    fn provenance(&self) -> ArbitrumTxProvenance {
+        match self {
+            Self::Standard(tx) => tx.provenance(),
+            Self::Deposit(_) | Self::Internal(_) => ArbitrumTxProvenance::Exempt,
         }
     }
 

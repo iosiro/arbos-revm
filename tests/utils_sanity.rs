@@ -9,6 +9,7 @@ use test_utils::*;
 use alloy_sol_types::{SolCall, SolError, SolEvent, sol};
 use arbos_revm::state::l2_pricing::GasConstraint;
 use arbos_revm::{
+    ArbitrumChainTr,
     constants::{
         ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBOS_ADDRESS,
         ARBOS_STATE_ADDRESS, FILTERED_TRANSACTIONS_STATE_ADDRESS, STYLUS_DISCRIMINANT,
@@ -814,15 +815,13 @@ fn arbos_test_burns_requested_gas_and_rejects_non_u64() {
         burned,
         revm::context::result::ExecutionResult::Success { .. }
     ));
-    assert_eq!(burned.gas_used() - baseline.gas_used(), 10_000);
+    assert_eq!(burned.tx_gas_used() - baseline.tx_gas_used(), 10_000);
 
     let oversized = execute_burn(U256::from(u64::MAX) + U256::ONE);
     assert!(matches!(
         oversized,
-        revm::context::result::ExecutionResult::Halt {
-            gas_used: 100_000,
-            ..
-        }
+        revm::context::result::ExecutionResult::Halt { ref gas, .. }
+            if gas.tx_gas_used() == 100_000
     ));
 }
 
@@ -1200,7 +1199,7 @@ fn constraint_backlog_update_touches_only_nitro_backlog_word() {
         .unwrap();
 
     // One length read plus one backlog read/write, matching BacklogUpdateCost.
-    assert_eq!(gas.spent(), 800 + 800 + 20_000);
+    assert_eq!(gas.total_gas_spent(), 800 + 800 + 20_000);
     assert_eq!(
         context
             .arb_state(None, true)
@@ -1350,7 +1349,7 @@ fn retryable_clear_matches_nitro_raw_state_and_gas() {
 
     // Seven fixed fields, calldata length plus three 32-byte chunks, and the
     // calldata-length SLOAD: 11 resets * 5000 + 800.
-    assert_eq!(gas.spent(), 55_800);
+    assert_eq!(gas.total_gas_spent(), 55_800);
     assert_eq!(
         context
             .journal_mut()
@@ -1486,14 +1485,55 @@ fn test_submit_retryable_creates_ticket_and_schedules_redeem() {
     };
     assert_eq!(logs.len(), 2);
     let ticket_id = B256::from_slice(output.data());
-    let mut state = evm.0.ctx.arb_state(None, true);
-    let mut retryable = state.retryable(ticket_id);
-    assert_eq!(retryable.from().get().unwrap(), caller);
-    assert_eq!(retryable.to().get().unwrap(), Some(retry_to));
-    assert_eq!(retryable.callvalue().get().unwrap(), U256::from(99));
-    assert_eq!(retryable.beneficiary().get().unwrap(), beneficiary);
-    assert_eq!(retryable.num_tries().get().unwrap(), 1);
-    assert_eq!(state.timeout_queue().size().unwrap(), 1);
+    {
+        let mut state = evm.0.ctx.arb_state(None, true);
+        let mut retryable = state.retryable(ticket_id);
+        assert_eq!(retryable.from().get().unwrap(), caller);
+        assert_eq!(retryable.to().get().unwrap(), Some(retry_to));
+        assert_eq!(retryable.callvalue().get().unwrap(), U256::from(99));
+        assert_eq!(retryable.beneficiary().get().unwrap(), beneficiary);
+        assert_eq!(retryable.num_tries().get().unwrap(), 1);
+        assert_eq!(state.timeout_queue().size().unwrap(), 1);
+    }
+
+    let scheduled = evm.0.ctx.chain().scheduled_retries();
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].ticket_id, ticket_id);
+    assert_eq!(
+        scheduled[0].hash(),
+        B256::from_slice(logs[1].topics()[2].as_slice())
+    );
+
+    let retry_result = evm
+        .transact_next_scheduled_retry()
+        .expect("scheduled retry execution failed")
+        .expect("scheduled retry queue was empty");
+    assert!(matches!(
+        retry_result,
+        revm::context::result::ExecutionResult::Success { .. }
+    ));
+    assert!(evm.0.ctx.chain().scheduled_retries().is_empty());
+    assert_eq!(
+        evm.0
+            .ctx
+            .journal_mut()
+            .load_account(retry_to)
+            .unwrap()
+            .data
+            .info
+            .balance,
+        U256::from(99)
+    );
+    assert_eq!(
+        evm.0
+            .ctx
+            .arb_state(None, true)
+            .retryable(ticket_id)
+            .timeout()
+            .get()
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -1562,17 +1602,14 @@ fn test_filtered_submit_retryable_redirects_refunds_and_skips_redeem() {
         },
     );
     let revm::context::result::ExecutionResult::Success {
-        output,
-        logs,
-        gas_used,
-        ..
+        output, logs, gas, ..
     } = result
     else {
         panic!("filtered submit retryable did not succeed: {result:?}");
     };
     assert_eq!(B256::from_slice(output.data()), ticket_id);
     assert_eq!(logs.len(), 1);
-    assert_eq!(gas_used, call.gasLimit);
+    assert_eq!(gas.tx_gas_used(), call.gasLimit);
     {
         let mut state = evm.0.ctx.arb_state(None, true);
         let mut retryable = state.retryable(ticket_id);
@@ -1782,10 +1819,60 @@ fn test_batch_posting_report_updates_nitro_l1_ledger() {
     }
     .abi_encode();
     let mut evm = execute_internal_call(context, data);
+    {
+        let mut state = evm.0.ctx.arb_state(None, true);
+        let mut pricing = state.l1_pricing();
+        assert_eq!(pricing.last_update_time().get().unwrap(), 150);
+        assert_eq!(pricing.units_since_update().get().unwrap(), 50);
+        assert_eq!(
+            pricing
+                .batch_poster_table()
+                .get(poster)
+                .funds_due()
+                .get()
+                .unwrap(),
+            U256::from(600)
+        );
+        assert_eq!(
+            pricing.funds_due_for_rewards().get().unwrap(),
+            revm::primitives::I256::try_from(500).unwrap()
+        );
+        assert_eq!(
+            pricing.last_surplus().get().unwrap(),
+            revm::primitives::I256::try_from(-1_100).unwrap()
+        );
+        assert_eq!(pricing.price_per_unit().get().unwrap(), U256::from(107));
+    }
+
+    // A second report in the same backend instance must consume the first
+    // report's controller state rather than reinitializing transaction-local
+    // pricing data.
+    let second = batchPostingReportCall {
+        batchTimestamp: U256::from(175),
+        batchPosterAddress: poster,
+        batchNumber: 8,
+        batchDataGas: 300,
+        l1BaseFeeWei: U256::from(3),
+    }
+    .abi_encode();
+    let second_result = execute_tx(
+        &mut evm,
+        revm::context::TxEnv {
+            tx_type: ARBITRUM_INTERNAL_TX_TYPE,
+            caller: ARBOS_ADDRESS,
+            kind: revm::primitives::TxKind::Call(ARBOS_STATE_ADDRESS),
+            data: second.into(),
+            gas_limit: 0,
+            ..Default::default()
+        },
+    );
+    assert!(matches!(
+        second_result,
+        revm::context::result::ExecutionResult::Success { .. }
+    ));
     let mut state = evm.0.ctx.arb_state(None, true);
     let mut pricing = state.l1_pricing();
-    assert_eq!(pricing.last_update_time().get().unwrap(), 150);
-    assert_eq!(pricing.units_since_update().get().unwrap(), 50);
+    assert_eq!(pricing.last_update_time().get().unwrap(), 175);
     assert_eq!(
         pricing
             .batch_poster_table()
@@ -1793,17 +1880,9 @@ fn test_batch_posting_report_updates_nitro_l1_ledger() {
             .funds_due()
             .get()
             .unwrap(),
-        U256::from(600)
+        U256::from(1_800)
     );
-    assert_eq!(
-        pricing.funds_due_for_rewards().get().unwrap(),
-        revm::primitives::I256::try_from(500).unwrap()
-    );
-    assert_eq!(
-        pricing.last_surplus().get().unwrap(),
-        revm::primitives::I256::try_from(-1_100).unwrap()
-    );
-    assert_eq!(pricing.price_per_unit().get().unwrap(), U256::from(107));
+    assert_eq!(pricing.units_since_update().get().unwrap(), 25);
 }
 
 #[test]

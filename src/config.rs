@@ -3,6 +3,7 @@ use std::ops::{Deref, DerefMut};
 use auto_impl::auto_impl;
 use revm::{
     context::{Cfg, CfgEnv},
+    context_interface::cfg::GasParams,
     primitives::hardfork::SpecId,
 };
 
@@ -33,7 +34,7 @@ pub struct ArbitrumConfig<SPEC = SpecId> {
 impl<SPEC> ArbitrumConfig<SPEC> {
     pub fn new_with_spec(spec: SPEC) -> Self
     where
-        SPEC: Into<SpecId> + Copy,
+        SPEC: Into<SpecId> + Clone,
     {
         Self {
             inner: CfgEnv::new_with_spec(spec),
@@ -47,7 +48,7 @@ impl<SPEC> ArbitrumConfig<SPEC> {
 
 impl<SPEC> Default for ArbitrumConfig<SPEC>
 where
-    SPEC: Into<SpecId> + Copy + Default,
+    SPEC: Into<SpecId> + Clone + Default,
 {
     fn default() -> Self {
         Self {
@@ -60,7 +61,7 @@ where
     }
 }
 
-impl<SPEC: Into<SpecId> + Copy> Cfg for ArbitrumConfig<SPEC> {
+impl<SPEC: Into<SpecId> + Clone> Cfg for ArbitrumConfig<SPEC> {
     type Spec = SPEC;
 
     fn chain_id(&self) -> u64 {
@@ -72,11 +73,14 @@ impl<SPEC: Into<SpecId> + Copy> Cfg for ArbitrumConfig<SPEC> {
     }
 
     fn tx_gas_limit_cap(&self) -> u64 {
-        self.inner.tx_gas_limit_cap()
+        // ArbOS applies its state-configured per-transaction/per-block gas
+        // constraints in the handler. Ethereum's EIP-7825 cap must not reject
+        // an Arbitrum transaction before those rules run.
+        u64::MAX
     }
 
     fn spec(&self) -> Self::Spec {
-        self.inner.spec()
+        self.inner.spec().clone()
     }
 
     fn max_blobs_per_tx(&self) -> Option<u64> {
@@ -96,7 +100,10 @@ impl<SPEC: Into<SpecId> + Copy> Cfg for ArbitrumConfig<SPEC> {
     }
 
     fn is_eip3541_disabled(&self) -> bool {
-        self.inner.is_eip3541_disabled()
+        // Stylus programs deliberately use the 0xEF-prefixed ArbOS bytecode envelope. Ethereum's
+        // EIP-3541 rejection would prevent those programs from being deployed before ArbOS can
+        // decode and activate them.
+        true
     }
 
     fn is_balance_check_disabled(&self) -> bool {
@@ -104,7 +111,11 @@ impl<SPEC: Into<SpecId> + Copy> Cfg for ArbitrumConfig<SPEC> {
     }
 
     fn is_block_gas_limit_disabled(&self) -> bool {
-        self.inner.is_block_gas_limit_disabled()
+        // ArbOS applies its state-configured per-block gas constraint in the
+        // handler, including cumulative gas from earlier transactions in the
+        // same block. REVM's Ethereum block limit would reject transactions
+        // before that versioned ArbOS logic can cap their execution allowance.
+        true
     }
 
     fn is_nonce_check_disabled(&self) -> bool {
@@ -127,6 +138,26 @@ impl<SPEC: Into<SpecId> + Copy> Cfg for ArbitrumConfig<SPEC> {
         self.inner.is_eip7623_disabled()
     }
 
+    fn is_eip7708_disabled(&self) -> bool {
+        self.inner.is_eip7708_disabled()
+    }
+
+    fn is_eip8246_delayed_clear_disabled(&self) -> bool {
+        self.inner.is_eip8246_delayed_clear_disabled()
+    }
+
+    fn gas_params(&self) -> &GasParams {
+        self.inner.gas_params()
+    }
+
+    fn is_amsterdam_eip8037_enabled(&self) -> bool {
+        self.inner.is_amsterdam_eip8037_enabled()
+    }
+
+    fn is_amsterdam_eip2780_enabled(&self) -> bool {
+        self.inner.is_amsterdam_eip2780_enabled()
+    }
+
     fn memory_limit(&self) -> u64 {
         self.inner.memory_limit()
     }
@@ -134,7 +165,7 @@ impl<SPEC: Into<SpecId> + Copy> Cfg for ArbitrumConfig<SPEC> {
 
 impl<SPEC> ArbitrumConfigTr for ArbitrumConfig<SPEC>
 where
-    SPEC: Into<SpecId> + Copy + Copy,
+    SPEC: Into<SpecId> + Clone,
 {
     fn arbos_version(&self) -> u64 {
         self.arbos_version
@@ -157,7 +188,7 @@ where
     }
 }
 
-impl<SPEC: Into<SpecId> + Copy> ArbitrumConfig<SPEC> {
+impl<SPEC: Into<SpecId> + Clone> ArbitrumConfig<SPEC> {
     pub fn new(inner: CfgEnv<SPEC>) -> Self {
         Self {
             inner,
@@ -169,9 +200,27 @@ impl<SPEC: Into<SpecId> + Copy> ArbitrumConfig<SPEC> {
     }
 }
 
+impl<SPEC> From<CfgEnv<SPEC>> for ArbitrumConfig<SPEC>
+where
+    SPEC: Into<SpecId> + Clone,
+{
+    fn from(inner: CfgEnv<SPEC>) -> Self {
+        Self::new(inner)
+    }
+}
+
+impl<SPEC> From<ArbitrumConfig<SPEC>> for CfgEnv<SPEC>
+where
+    SPEC: Into<SpecId> + Clone,
+{
+    fn from(config: ArbitrumConfig<SPEC>) -> Self {
+        config.inner
+    }
+}
+
 impl<SPEC> Deref for ArbitrumConfig<SPEC>
 where
-    SPEC: Into<SpecId> + Copy,
+    SPEC: Into<SpecId> + Clone,
 {
     type Target = CfgEnv<SPEC>;
 
@@ -182,7 +231,7 @@ where
 
 impl<SPEC> DerefMut for ArbitrumConfig<SPEC>
 where
-    SPEC: Into<SpecId> + Copy,
+    SPEC: Into<SpecId> + Clone,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner

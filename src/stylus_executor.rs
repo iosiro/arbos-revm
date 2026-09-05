@@ -23,8 +23,7 @@ use revm::{
     inspector::{InspectorEvmTr, JournalExt},
     interpreter::{
         CallInput, FrameInput, Gas, InputsImpl, InstructionResult, InterpreterAction,
-        InterpreterResult, gas::memory_gas, interpreter::EthInterpreter,
-        interpreter_types::InputsTr,
+        InterpreterResult, interpreter::EthInterpreter, interpreter_types::InputsTr,
     },
     primitives::{Address, B256, Bytes, FixedBytes, Log, U256, alloy_primitives::U64},
 };
@@ -535,7 +534,7 @@ where
             (cost, wasm_open_pages)
         };
 
-        if !gas.record_cost(call_cost) {
+        if !gas.record_regular_cost(call_cost) {
             debug!(
                 target: "arbos-revm::stylus",
                 bytecode_address = %stylus_ctx.bytecode_address,
@@ -596,6 +595,9 @@ where
 
         let outcome = match instance.run_main(&bytecode, stylus_config, ink_limit) {
             Err(e) | Ok(UserOutcome::Failure(e)) => {
+                if format!("{e:?}").contains("memory.fill value exceeds 8 bits") {
+                    self.ctx().local_mut().filter_current_transaction();
+                }
                 debug!(
                     target: "arbos-revm::stylus",
                     bytecode_address = %stylus_ctx.bytecode_address,
@@ -659,7 +661,11 @@ where
             .set_stylus_pages_open(stylus_open_pages);
 
         if !output.is_empty() && self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_FIXES {
-            let evm_cost = memory_gas(output.len().div_ceil(32));
+            let evm_cost = self
+                .ctx()
+                .cfg()
+                .gas_params()
+                .memory_cost(output.len().div_ceil(32));
 
             if gas.limit() < evm_cost {
                 debug!(

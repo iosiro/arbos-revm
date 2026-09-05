@@ -10,7 +10,9 @@ use test_utils::{create_evm, execute_tx, fund_account, setup_context};
 use arbos_revm::state::{
     ArbState, ArbStateGetter, arbos_state::ArbosStateParams, types::StorageBackedTr,
 };
-use arbos_revm::{constants::ARBOS_L1_PRICER_FUNDS_ADDRESS, transaction::ArbitrumTransaction};
+use arbos_revm::{
+    ArbitrumChainTr, constants::ARBOS_L1_PRICER_FUNDS_ADDRESS, transaction::ArbitrumTransaction,
+};
 use revm::{
     ExecuteEvm,
     context::{ContextTr, JournalTr, TxEnv, result::ExecutionResult},
@@ -30,6 +32,48 @@ fn balance(evm: &mut test_utils::TestEvm, address: Address) -> U256 {
 }
 
 #[test]
+fn block_gas_limit_is_cumulative_across_transactions_and_resets_per_block() {
+    let caller = Address::repeat_byte(0x09);
+    let mut context = setup_context();
+    context.cfg.arbos_version = 60;
+    context.block.number = U256::from(7);
+    context
+        .arb_state(None, false)
+        .initialize(&ArbosStateParams::for_arbos_version(60))
+        .unwrap();
+    context
+        .arb_state(None, false)
+        .l2_pricing()
+        .per_block_gas_limit()
+        .set(30_000)
+        .unwrap();
+    fund_account(&mut context, caller, U256::from(100_000_000_u64));
+    let tx = TxEnv {
+        caller,
+        gas_limit: 30_000,
+        gas_price: 0,
+        kind: TxKind::Call(Address::repeat_byte(0x0a)),
+        ..Default::default()
+    };
+    let mut evm = create_evm(context);
+    assert!(
+        evm.transact_one(ArbitrumTransaction::from(tx.clone()))
+            .is_ok()
+    );
+    assert_eq!(evm.0.ctx.chain().block_gas_used(), 21_000);
+    assert!(
+        evm.transact_one(ArbitrumTransaction::from(tx.clone()))
+            .is_err()
+    );
+
+    evm.0.ctx.block.number = U256::from(8);
+    let mut next_tx = tx;
+    next_tx.nonce = 1;
+    assert!(evm.transact_one(ArbitrumTransaction::from(next_tx)).is_ok());
+    assert_eq!(evm.0.ctx.chain().block_gas_used(), 21_000);
+}
+
+#[test]
 fn poster_fee_updates_recognized_l1_fees_and_pool_balance() {
     let caller = Address::repeat_byte(0x11);
     let recipient = Address::repeat_byte(0x22);
@@ -46,7 +90,8 @@ fn poster_fee_updates_recognized_l1_fees_and_pool_balance() {
         .price_per_unit()
         .set(U256::from(10))
         .unwrap();
-    fund_account(&mut context, caller, U256::from(1_000_000_000_u64));
+    let initial_balance = U256::from(1_000_000_000_u64);
+    fund_account(&mut context, caller, initial_balance);
 
     let tx = TxEnv {
         tx_type: 2,
@@ -63,6 +108,7 @@ fn poster_fee_updates_recognized_l1_fees_and_pool_balance() {
             vec![1, 2, 3, 4].into(),
         ))
         .expect("transaction execution failed");
+    let gas_used = result.tx_gas_used();
     assert!(matches!(result, ExecutionResult::Success { .. }));
 
     let pool_balance = balance(&mut evm, ARBOS_L1_PRICER_FUNDS_ADDRESS);
@@ -82,12 +128,58 @@ fn poster_fee_updates_recognized_l1_fees_and_pool_balance() {
         .units_since_update()
         .get()
         .unwrap();
-    assert!(!pool_balance.is_zero());
+    let expected_poster_gas = U256::from(units).saturating_mul(U256::from(10)) / U256::from(100);
+    assert_eq!(pool_balance, expected_poster_gas * U256::from(100));
     assert_eq!(recognized, pool_balance);
+    assert_eq!(
+        initial_balance - balance(&mut evm, caller),
+        U256::from(gas_used * 100)
+    );
     assert_eq!(
         units,
         arbos_revm::l1_fee::compressed_data_units(&vec![1, 2, 3, 4].into(), 1).unwrap()
     );
+}
+
+#[test]
+fn delayed_inbox_provenance_skips_poster_charging() {
+    let caller = Address::repeat_byte(0x31);
+    let initial_balance = U256::from(100_000_000_u64);
+    let mut context = setup_context();
+    context.cfg.arbos_version = 60;
+    context.block.basefee = 100;
+    context
+        .arb_state(None, false)
+        .initialize(&ArbosStateParams::for_arbos_version(60))
+        .unwrap();
+    fund_account(&mut context, caller, initial_balance);
+
+    let mut evm = create_evm(context);
+    let result = evm
+        .transact_one(ArbitrumTransaction::new_delayed(
+            TxEnv {
+                tx_type: 2,
+                caller,
+                gas_limit: 30_000,
+                gas_price: 100,
+                kind: TxKind::Call(Address::repeat_byte(0x32)),
+                ..Default::default()
+            },
+            Bytes::from_static(&[1, 2, 3, 4]),
+        ))
+        .unwrap();
+    assert!(matches!(result, ExecutionResult::Success { .. }));
+    assert_eq!(
+        evm.0
+            .ctx
+            .arb_state(None, true)
+            .l1_pricing()
+            .units_since_update()
+            .get()
+            .unwrap(),
+        0
+    );
+    assert_eq!(balance(&mut evm, ARBOS_L1_PRICER_FUNDS_ADDRESS), U256::ZERO);
 }
 
 #[test]
@@ -217,7 +309,7 @@ fn run_fee_routing(version: u64, collect_tips: bool) -> (u64, U256, U256, U256, 
     let mut evm = create_evm(context);
     let result = execute_tx(&mut evm, tx);
     let gas_used = match result {
-        ExecutionResult::Success { gas_used, .. } => gas_used,
+        ExecutionResult::Success { gas, .. } => gas.tx_gas_used(),
         other => panic!("transaction failed: {other:?}"),
     };
     (
@@ -338,7 +430,7 @@ fn zero_gas_price_does_not_grow_l2_backlog() {
                 ..Default::default()
             },
         );
-        let gas_used = result.gas_used();
+        let gas_used = result.tx_gas_used();
         let backlog = evm
             .0
             .ctx
@@ -404,10 +496,7 @@ fn arbos_gas_caps_limit_execution_but_refund_held_gas() {
         let (result, charged) = run_gas_cap(version);
         assert!(matches!(
             result,
-            ExecutionResult::Halt {
-                gas_used: 22_000,
-                ..
-            }
+            ExecutionResult::Halt { ref gas, .. } if gas.tx_gas_used() == 22_000
         ));
         assert_eq!(charged, U256::from(22_000));
     }

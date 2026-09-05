@@ -397,7 +397,7 @@ where
 
     fn get(&mut self) -> Result<T, ArbosStateError> {
         if let Some(gas) = &mut self.gas
-            && !gas.record_cost(ISTANBUL_SLOAD_GAS)
+            && !gas.record_regular_cost(ISTANBUL_SLOAD_GAS)
         {
             return Err(ArbosStateError::OutOfGas);
         }
@@ -422,10 +422,10 @@ where
 
         if let Some(gas) = &mut self.gas {
             if value.is_zero() {
-                if !gas.record_cost(SSTORE_RESET) {
+                if !gas.record_regular_cost(SSTORE_RESET) {
                     return Err(ArbosStateError::OutOfGas);
                 }
-            } else if !gas.record_cost(SSTORE_SET) {
+            } else if !gas.record_regular_cost(SSTORE_SET) {
                 return Err(ArbosStateError::OutOfGas);
             }
         }

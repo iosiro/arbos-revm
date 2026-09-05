@@ -13,13 +13,14 @@ use crate::{
     config::ArbitrumConfigTr,
     constants::ARBOS_VERSION_STYLUS_CONTRACT_LIMIT,
     generate_state_mut_table,
+    local_context::ArbitrumLocalContextTr,
     macros::{emit_event, interpreter_return, interpreter_revert},
     precompile_impl,
     precompiles::{
         ArbPrecompileLogic, ExtendedPrecompile, StateMutability, decode_call, selector_or_revert,
     },
     state::{ArbState, ArbStateGetter, try_state, types::StorageBackedTr},
-    transaction::arbitrum_retry_tx_hash,
+    transaction::{ArbitrumRetryTx, arbitrum_retry_tx_hash},
     try_record_cost,
 };
 
@@ -176,6 +177,9 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
         match selector {
             ArbRetryableTx::cancelCall::SELECTOR => {
                 let call = decode_call!(gas, ArbRetryableTx::cancelCall, input);
+                if context.local().current_retryable() == Some(call.ticketId) {
+                    interpreter_revert!(gas, Bytes::from_static(b"retryable cannot modify itself"));
+                }
 
                 let current_time = context.block().timestamp().saturating_to::<u64>();
 
@@ -421,6 +425,9 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
             }
             ArbRetryableTx::redeemCall::SELECTOR => {
                 let call = decode_call!(gas, ArbRetryableTx::redeemCall, input);
+                if context.local().current_retryable() == Some(call.ticketId) {
+                    interpreter_revert!(gas, Bytes::from_static(b"retryable cannot modify itself"));
+                }
 
                 let current_time = context.block().timestamp().saturating_to::<u64>();
 
@@ -506,8 +513,8 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
                         arb_state.l2_pricing().backlog_update_cost(arbos_version)
                     )
                 };
-                let event_cost = revm::interpreter::gas::log_cost(4, 4 * 32)
-                    .expect("RedeemScheduled log dimensions are valid");
+                let event_cost = revm::interpreter::gas::LOG
+                    .saturating_add(context.cfg().gas_params().log_cost(4, 4 * 32));
                 let future_cost = event_cost
                     .saturating_add(revm::interpreter::gas::COPY)
                     .saturating_add(backlog_update_cost);
@@ -536,6 +543,24 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
                     max_refund,
                     submission_fee_refund,
                 );
+                let chain_id = U256::from(context.cfg().chain_id());
+                let gas_fee_cap = U256::from(context.block().basefee());
+                context
+                    .local_mut()
+                    .schedule_retry_on_commit(ArbitrumRetryTx {
+                        chain_id,
+                        nonce,
+                        from,
+                        gas_fee_cap,
+                        gas_limit: gas_to_donate,
+                        to,
+                        value: callvalue,
+                        data: calldata,
+                        ticket_id: call.ticketId,
+                        refund_to: caller_address,
+                        max_refund,
+                        submission_fee_refund,
+                    });
 
                 emit_event!(
                     context,

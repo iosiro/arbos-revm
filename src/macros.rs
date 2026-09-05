@@ -45,7 +45,7 @@ pub(crate) fn interpreter_result_revert_out_of_gas(gas: &mut Gas) -> Interpreter
 }
 
 pub(crate) fn record_cost_return(gas: &mut Gas, cost: u64) -> Option<InterpreterResult> {
-    if !gas.record_cost(cost) {
+    if !gas.record_regular_cost(cost) {
         Some(interpreter_result_revert_out_of_gas(gas))
     } else {
         None
@@ -107,17 +107,11 @@ pub(crate) use interpreter_revert;
 
 macro_rules! emit_event {
     ($context:expr, $log:expr, $gas:expr) => {
-        let log_cost = revm::interpreter::gas::log_cost(
-            $log.data.topics().len() as u8,
-            $log.data.data.len() as u64,
+        let log_cost = revm::interpreter::gas::LOG.saturating_add(
+            revm::context::Cfg::gas_params($context.cfg())
+                .log_cost($log.data.topics().len() as u8, $log.data.data.len() as u64),
         );
-        if let Some(log_cost) = log_cost {
-            $crate::macros::try_record_cost!(&mut $gas, log_cost)
-        } else {
-            return Some($crate::macros::interpreter_result_revert_out_of_gas(
-                &mut $gas,
-            ));
-        }
+        $crate::macros::try_record_cost!(&mut $gas, log_cost);
 
         $context.journal_mut().log($log);
     };

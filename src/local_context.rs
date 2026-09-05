@@ -2,8 +2,11 @@ use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
 use revm::{
     context::LocalContextTr,
+    interpreter::CallScheme,
     primitives::{Address, B256, U256},
 };
+
+use crate::transaction::ArbitrumRetryTx;
 
 pub trait ArbitrumLocalContextTr: LocalContextTr {
     fn stylus_pages_ever(&self) -> u16;
@@ -26,6 +29,18 @@ pub trait ArbitrumLocalContextTr: LocalContextTr {
     fn set_poster_units(&mut self, units: Option<u64>);
     fn held_gas(&self) -> u64;
     fn set_held_gas(&mut self, gas: u64);
+    fn enter_precompile_call(&mut self, scheme: CallScheme);
+    fn exit_precompile_call(&mut self);
+    fn direct_call_scheme(&self) -> Option<CallScheme>;
+    fn current_retryable(&self) -> Option<B256>;
+    fn set_current_retryable(&mut self, ticket_id: Option<B256>);
+    fn enter_frame(&mut self, caller: Address);
+    fn exit_frame(&mut self);
+    fn parent_frame_caller(&self) -> Option<Address>;
+    fn schedule_retry_on_commit(&mut self, retry: ArbitrumRetryTx);
+    fn take_scheduled_retries(&mut self) -> Vec<ArbitrumRetryTx>;
+    fn filter_current_transaction(&mut self);
+    fn take_filter_current_transaction(&mut self) -> bool;
 }
 
 /// Local context that is filled by execution.
@@ -52,6 +67,18 @@ pub struct ArbitrumLocalContext {
     pub poster_units: Option<u64>,
     /// Compute gas held outside the first frame by ArbOS's transaction cap.
     pub held_gas: u64,
+    /// Direct opcode scheme for nested precompile invocations. Unlike
+    /// `is_static`, this does not inherit a static ancestor's read-only flag.
+    pub precompile_call_schemes: Vec<CallScheme>,
+    /// Ticket currently executing as a scheduled retry transaction.
+    pub current_retryable: Option<B256>,
+    /// Caller metadata for live EVM frames, maintained by `ArbitrumEvm`.
+    pub frame_callers: Vec<Address>,
+    /// Retry transactions staged by this transaction. The handler moves these
+    /// into chain state only after successful journal commit.
+    pub scheduled_retries_on_commit: Vec<ArbitrumRetryTx>,
+    /// Backend-visible equivalent of Nitro's `StateDB.FilterTx` side effect.
+    pub filter_current_transaction: bool,
 }
 
 impl Default for ArbitrumLocalContext {
@@ -68,6 +95,11 @@ impl Default for ArbitrumLocalContext {
             poster_gas: None,
             poster_units: None,
             held_gas: 0,
+            precompile_call_schemes: Vec::new(),
+            current_retryable: None,
+            frame_callers: Vec::new(),
+            scheduled_retries_on_commit: Vec::new(),
+            filter_current_transaction: false,
         }
     }
 }
@@ -85,6 +117,11 @@ impl LocalContextTr for ArbitrumLocalContext {
         self.stylus_pages_open = 0;
         self.stylus_pages_ever = 0;
         self.active_stylus_addresses.clear();
+        self.precompile_call_schemes.clear();
+        self.current_retryable = None;
+        self.frame_callers.clear();
+        self.scheduled_retries_on_commit.clear();
+        self.filter_current_transaction = false;
     }
 
     fn shared_memory_buffer(&self) -> &Rc<RefCell<Vec<u8>>> {
@@ -193,6 +230,58 @@ impl ArbitrumLocalContextTr for ArbitrumLocalContext {
 
     fn set_held_gas(&mut self, gas: u64) {
         self.held_gas = gas;
+    }
+
+    fn enter_precompile_call(&mut self, scheme: CallScheme) {
+        self.precompile_call_schemes.push(scheme);
+    }
+
+    fn exit_precompile_call(&mut self) {
+        self.precompile_call_schemes.pop();
+    }
+
+    fn direct_call_scheme(&self) -> Option<CallScheme> {
+        self.precompile_call_schemes.last().copied()
+    }
+
+    fn current_retryable(&self) -> Option<B256> {
+        self.current_retryable
+    }
+
+    fn set_current_retryable(&mut self, ticket_id: Option<B256>) {
+        self.current_retryable = ticket_id;
+    }
+
+    fn enter_frame(&mut self, caller: Address) {
+        self.frame_callers.push(caller);
+    }
+
+    fn exit_frame(&mut self) {
+        self.frame_callers.pop();
+    }
+
+    fn parent_frame_caller(&self) -> Option<Address> {
+        self.frame_callers
+            .len()
+            .checked_sub(2)
+            .and_then(|index| self.frame_callers.get(index))
+            .copied()
+    }
+
+    fn schedule_retry_on_commit(&mut self, retry: ArbitrumRetryTx) {
+        self.scheduled_retries_on_commit.push(retry);
+    }
+
+    fn take_scheduled_retries(&mut self) -> Vec<ArbitrumRetryTx> {
+        std::mem::take(&mut self.scheduled_retries_on_commit)
+    }
+
+    fn filter_current_transaction(&mut self) {
+        self.filter_current_transaction = true;
+    }
+
+    fn take_filter_current_transaction(&mut self) -> bool {
+        std::mem::take(&mut self.filter_current_transaction)
     }
 }
 
