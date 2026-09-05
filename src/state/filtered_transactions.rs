@@ -87,7 +87,7 @@ impl<'a, CTX: ArbitrumContextTr> FilteredTransactions<'a, CTX> {
             .load_account_mut(FILTERED_TRANSACTIONS_STATE_ADDRESS)
             .map(|mut account| {
                 if account.nonce() == 0 {
-                    account.set_nonce(1);
+                    _ = account.bump_nonce();
                 }
             })
             .map_err(|_| {

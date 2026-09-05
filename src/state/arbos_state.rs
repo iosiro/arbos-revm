@@ -198,7 +198,7 @@ impl<'a, CTX: ArbitrumContextTr> ArbStateWrapper<'a, CTX> {
             .load_account_mut(ARBOS_STATE_ADDRESS)
             .map(|mut account| {
                 if account.nonce() == 0 {
-                    account.set_nonce(1);
+                    _ = account.bump_nonce();
                 }
             })
         {
