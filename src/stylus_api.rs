@@ -23,9 +23,10 @@ use tracing::{debug, trace, warn};
 
 use crate::{
     ArbitrumContextTr, ArbitrumEvm, Utf8OrHex, buffer,
+    config::ArbitrumConfigTr,
     local_context::ArbitrumLocalContextTr,
     state::{ArbState, ArbStateGetter},
-    stylus_executor::stylus_call_cost,
+    stylus_executor::{stylus_call_cost, stylus_page_limit_penalty},
 };
 
 pub(crate) type HostCallFunc = dyn Fn(
@@ -453,6 +454,7 @@ where
 
             if let Ok(FrameResult::Create(create_outcome)) = result {
                 if InstructionResult::Revert == *create_outcome.instruction_result() {
+                    gas.erase_cost(create_outcome.gas().remaining().saturating_add(gas_stipend));
                     let output = create_outcome.output().to_vec();
                     debug!(
                         target: "arbos-revm::stylus-api",
@@ -464,8 +466,8 @@ where
                         "Stylus create reverted"
                     );
                     return (
-                        [vec![0x00], output].concat(),
-                        VecReader::new(vec![]),
+                        [vec![0x01], Address::ZERO.to_vec()].concat(),
+                        VecReader::new(output),
                         ArbGas(gas.spent()),
                     );
                 }
@@ -744,6 +746,12 @@ where
 
                 let cost = stylus_call_cost(count, open, ever, free_pages, page_gas);
                 context.local_mut().add_stylus_pages_open(count);
+                let new_open = context.local().stylus_pages_open();
+                let cost = cost.saturating_add(stylus_page_limit_penalty(
+                    context.cfg().arbos_version(),
+                    stylus_params.page_limit,
+                    new_open,
+                ));
                 (Status::Success.into(), VecReader::new(vec![]), ArbGas(cost))
             }
 

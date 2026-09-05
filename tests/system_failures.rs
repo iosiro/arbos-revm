@@ -9,8 +9,11 @@ use test_utils::{create_evm, execute_tx, setup_context};
 
 use alloy_sol_types::{SolCall, sol};
 use arbos_revm::{
-    constants::{ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBOS_ADDRESS},
-    state::{ArbState, arbos_state::ArbosStateParams},
+    constants::{
+        ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBOS_ADDRESS,
+        ARBOS_L1_PRICER_FUNDS_ADDRESS, HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE_ARBITRUM,
+    },
+    state::{ArbState, ArbStateGetter, arbos_state::ArbosStateParams, types::StorageBackedTr},
 };
 use revm::{
     context::{ContextTr, Host, JournalTr, TxEnv, result::ExecutionResult},
@@ -91,6 +94,175 @@ fn start_block_records_parent_hash_in_eip2935_history_ring() {
             .unwrap()
             .data,
         U256::from_be_bytes(expected_parent_hash.0)
+    );
+
+    let result = execute_tx(
+        &mut evm,
+        TxEnv {
+            caller: Address::repeat_byte(0x71),
+            kind: TxKind::Call(HISTORY_STORAGE_ADDRESS),
+            data: Bytes::copy_from_slice(&U256::from(4).to_be_bytes::<32>()),
+            gas_limit: 100_000,
+            ..Default::default()
+        },
+    );
+    match result {
+        ExecutionResult::Success { output, .. } => {
+            assert_eq!(output.data().as_ref(), expected_parent_hash.as_slice());
+        }
+        other => panic!("history-contract call failed: {other:?}"),
+    }
+}
+
+#[test]
+fn arbos_40_installs_callable_history_contract_on_initialization_and_upgrade() {
+    for initial_version in [40, 60] {
+        let mut context = setup_context();
+        context
+            .arb_state(None, false)
+            .initialize(&ArbosStateParams::for_arbos_version(initial_version))
+            .unwrap();
+        let account = context
+            .journal_mut()
+            .load_account(HISTORY_STORAGE_ADDRESS)
+            .unwrap();
+        assert_eq!(account.data.info.nonce, 1);
+        assert_eq!(
+            account.data.info.code.as_ref().unwrap().original_bytes(),
+            Bytes::from_static(HISTORY_STORAGE_CODE_ARBITRUM)
+        );
+    }
+
+    let mut context = setup_context();
+    context
+        .arb_state(None, false)
+        .initialize(&ArbosStateParams::for_arbos_version(39))
+        .unwrap();
+    context
+        .arb_state(None, false)
+        .upgrade_arbos_version(40)
+        .unwrap();
+    let account = context
+        .journal_mut()
+        .load_account(HISTORY_STORAGE_ADDRESS)
+        .unwrap();
+    assert_eq!(account.data.info.nonce, 1);
+    assert_eq!(
+        account.data.info.code.as_ref().unwrap().original_bytes(),
+        Bytes::from_static(HISTORY_STORAGE_CODE_ARBITRUM)
+    );
+}
+
+#[test]
+fn scheduled_upgrades_apply_nitro_pricing_owner_and_brotli_migrations() {
+    let owner = Address::repeat_byte(0x42);
+    let mut context = setup_context();
+    let mut params = ArbosStateParams::for_arbos_version(9);
+    params.initial_chain_owner = owner;
+    context.arb_state(None, false).initialize(&params).unwrap();
+    context
+        .journal_mut()
+        .load_account(ARBOS_L1_PRICER_FUNDS_ADDRESS)
+        .unwrap();
+    context
+        .journal_mut()
+        .balance_incr(ARBOS_L1_PRICER_FUNDS_ADDRESS, U256::from(1234))
+        .unwrap();
+    context
+        .arb_state(None, false)
+        .upgrade_arbos_version(11)
+        .unwrap();
+    let mut state = context.arb_state(None, false);
+    assert_eq!(
+        state.l1_pricing().l1_fees_available().get().unwrap(),
+        U256::from(1234)
+    );
+    assert_eq!(
+        state.l1_pricing().per_batch_gas_cost().get().unwrap(),
+        210_000
+    );
+    assert_eq!(
+        state.l1_pricing().amortized_cost_cap_bips().get().unwrap(),
+        0
+    );
+    assert!(state.chain_owners().all().unwrap().is_empty());
+
+    let mut context = setup_context();
+    context
+        .arb_state(None, false)
+        .initialize(&ArbosStateParams::for_arbos_version(19))
+        .unwrap();
+    context
+        .arb_state(None, false)
+        .upgrade_arbos_version(20)
+        .unwrap();
+    assert_eq!(
+        context
+            .arb_state(None, false)
+            .brotli_compression_level()
+            .get()
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn historical_start_block_version_gates_match_nitro() {
+    let mut context = setup_context();
+    context.cfg.arbos_version = 2;
+    context
+        .arb_state(None, false)
+        .initialize(&ArbosStateParams::for_arbos_version(2))
+        .unwrap();
+    context
+        .arb_state(None, false)
+        .l2_pricing()
+        .speed_limit_per_second()
+        .set(1)
+        .unwrap();
+    context
+        .arb_state(None, false)
+        .l2_pricing()
+        .gas_backlog()
+        .set(100)
+        .unwrap();
+    let mut evm = create_evm(context);
+    let result = execute_tx(
+        &mut evm,
+        TxEnv {
+            tx_type: ARBITRUM_INTERNAL_TX_TYPE,
+            caller: ARBOS_ADDRESS,
+            data: startBlockCall {
+                l1BaseFee: U256::ZERO,
+                l1BlockNumber: 5,
+                l2BlockNumber: 10,
+                timeLastBlock: 1,
+            }
+            .abi_encode()
+            .into(),
+            ..Default::default()
+        },
+    );
+    assert!(matches!(result, ExecutionResult::Success { .. }));
+    assert_eq!(
+        evm.0
+            .ctx
+            .arb_state(None, false)
+            .l2_pricing()
+            .gas_backlog()
+            .get()
+            .unwrap(),
+        90
+    );
+    assert_eq!(
+        evm.0
+            .ctx
+            .arb_state(None, false)
+            .blockhashes()
+            .l1_block_number()
+            .get()
+            .unwrap(),
+        6
     );
 }
 

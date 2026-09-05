@@ -27,6 +27,8 @@
     ;; Init code: 6005600c60003960056000f360006000f3
     ;; This deploys runtime code: 60006000f3 (PUSH1 0, PUSH1 0, RETURN)
     (data (i32.const 700) "\60\05\60\0c\60\00\39\60\05\60\00\f3\60\00\60\00\f3")
+    ;; Init code at 720 reverts with deadbeef.
+    (data (i32.const 720) "\63\de\ad\be\ef\60\00\52\60\04\60\1c\fd")
 
     (func (export "user_entrypoint") (param $args_len i32) (result i32)
         (local $selector i32)
@@ -153,6 +155,27 @@
         )
 
         ;; Unknown selector - return empty
+        ;; 0x04/0x05 = CREATE/CREATE2 with reverting init code, return returndata.
+        (if (i32.or
+                (i32.eq (local.get $selector) (i32.const 4))
+                (i32.eq (local.get $selector) (i32.const 5)))
+            (then
+                (memory.fill (i32.const 256) (i32.const 0) (i32.const 64))
+                (if (i32.eq (local.get $selector) (i32.const 4))
+                    (then
+                        (call $create1 (i32.const 720) (i32.const 13) (i32.const 256)
+                            (i32.const 320) (i32.const 340)))
+                    (else
+                        (call $create2 (i32.const 720) (i32.const 13) (i32.const 256)
+                            (i32.const 288) (i32.const 320) (i32.const 340)))
+                )
+                (local.set $return_len (call $return_data_size))
+                (drop (call $read_return_data (i32.const 601) (i32.const 0) (local.get $return_len)))
+                (call $write_result (i32.const 601) (local.get $return_len))
+                (return (i32.const 0))
+            )
+        )
+
         (call $write_result (i32.const 0) (i32.const 0))
         (i32.const 0)
     )

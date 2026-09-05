@@ -50,12 +50,13 @@ use crate::{
     constants::{
         ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, ARBOS_VERSION_STYLUS_FIXES, COST_SCALAR_PERCENT,
         MEMORY_EXPONENTS, MIN_CACHED_GAS_UNITS, MIN_INIT_GAS_UNITS, STYLUS_DISCRIMINANT,
+        STYLUS_FRAGMENT_DISCRIMINANT, STYLUS_ROOT_DISCRIMINANT,
     },
     context::ArbitrumContextTr,
     local_context::ArbitrumLocalContextTr,
     state::{
         ArbState, ArbStateGetter,
-        program::ProgramInfo,
+        program::{ProgramInfo, StylusParams},
         types::{ArbosStateError, StorageBackedTr},
     },
     stylus_api::StylusHandler,
@@ -165,6 +166,31 @@ pub fn cached_gas_cost(
     let dyno = (cached_init_cost as u64)
         .saturating_mul(cached_init_cost_scaler as u64 * COST_SCALAR_PERCENT);
     base.saturating_add(dyno.div_ceil(100))
+}
+
+pub(crate) fn stylus_page_limit_penalty(arbos_version: u64, page_limit: u16, new_open: u16) -> u64 {
+    if arbos_version >= 59 && page_limit > 0 && new_open > page_limit {
+        u64::MAX
+    } else {
+        0
+    }
+}
+
+fn fragment_read_gas_cost(is_cold: bool, code_size: u64) -> Option<u64> {
+    let access = if is_cold { 2_600_u64 } else { 100_u64 };
+    let words = code_size.checked_add(31)? / 32;
+    access.checked_add(words.checked_mul(3)?)
+}
+
+fn restore_open_pages_on_error<T, E>(
+    local: &mut impl ArbitrumLocalContextTr,
+    previous_open: u16,
+    result: Result<T, E>,
+) -> Result<T, E> {
+    if result.is_err() {
+        local.set_stylus_pages_open(previous_open);
+    }
+    result
 }
 
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
@@ -317,7 +343,13 @@ where
                     .ok()?
                     .data;
 
-                let bytecode = match stylus_code(&bytecode, stylus_params.max_wasm_size) {
+                let bytecode = match stylus_code_with_fragments(
+                    context,
+                    &bytecode,
+                    &stylus_params,
+                    false,
+                    None,
+                ) {
                     Ok(Some(code)) => code,
                     Ok(None) => return None,
                     Err(e) => {
@@ -531,6 +563,11 @@ where
             if !cached {
                 cost = cost.saturating_add(init_cost);
             }
+            cost = cost.saturating_add(stylus_page_limit_penalty(
+                arbos_version,
+                stylus_params.page_limit,
+                wasm_open_pages.saturating_add(stylus_data.footprint),
+            ));
 
             (cost, wasm_open_pages)
         };
@@ -559,9 +596,12 @@ where
         let evm_api =
             self.build_api_requestor(inputs.clone(), stylus_ctx.is_static, api_request_handler);
 
-        let mut instance = match unsafe {
+        let deserialized = unsafe {
             NativeInstance::deserialize(serialized.as_slice(), compile_config, evm_api, evm_data)
-        } {
+        };
+        let deserialized =
+            restore_open_pages_on_error(self.ctx().local_mut(), stylus_open_pages, deserialized);
+        let mut instance = match deserialized {
             Ok(instance) => instance,
             Err(err) => {
                 warn!(
@@ -810,6 +850,100 @@ pub fn stylus_code(bytecode: &[u8], max_wasm_size: u32) -> Result<Option<Bytes>,
     }
 }
 
+/// Resolves either classic inline Stylus bytecode or the ArbOS 60 root/fragment
+/// representation. Fragment count and declared decompressed length are consensus
+/// activation checks; already-active programs remain callable after owner params change.
+pub fn stylus_code_with_fragments<CTX: ArbitrumContextTr>(
+    context: &mut CTX,
+    bytecode: &[u8],
+    params: &StylusParams,
+    activating: bool,
+    mut gas: Option<&mut Gas>,
+) -> Result<Option<Bytes>, Vec<u8>> {
+    if bytecode.starts_with(STYLUS_FRAGMENT_DISCRIMINANT) {
+        return Err(b"fragmented stylus programs cannot be activated directly; activate the root program instead".to_vec());
+    }
+    if !bytecode.starts_with(STYLUS_ROOT_DISCRIMINANT) {
+        return stylus_code(bytecode, params.max_wasm_size);
+    }
+    if context.cfg().arbos_version() < ARBOS_VERSION_STYLUS_CONTRACT_LIMIT {
+        return Err(b"specified bytecode is not a Stylus program".to_vec());
+    }
+    if bytecode.len() < 8 || !(bytecode.len() - 8).is_multiple_of(20) {
+        return Err(b"invalid stylus program root".to_vec());
+    }
+    let dictionary = bytecode[3];
+    let decompressed_len = u32::from_be_bytes(bytecode[4..8].try_into().unwrap());
+    let addresses = &bytecode[8..];
+    let count = addresses.len() / 20;
+    if count == 0 {
+        return Err(b"invalid wasm: fragment count cannot be zero".to_vec());
+    }
+    if activating {
+        if decompressed_len > params.max_wasm_size {
+            return Err(format!(
+                "invalid wasm: decompressedLength {decompressed_len} is greater then MaxWasmSize {}",
+                params.max_wasm_size
+            ).into_bytes());
+        }
+        if count > params.max_fragment_count as usize {
+            return Err(format!(
+                "invalid wasm: fragment count exceeds limit of {}",
+                params.max_fragment_count
+            )
+            .into_bytes());
+        }
+    }
+    let mut compressed = Vec::new();
+    for raw in addresses.as_chunks::<20>().0 {
+        let address = Address::from_slice(raw);
+        // JournalTr has no read-only access-list query. Loading only the account
+        // metadata reports its pre-access warmth; reserve a maximum-sized copy
+        // before asking the database to materialize the fragment code.
+        let account = context
+            .journal_mut()
+            .load_account(address)
+            .map_err(|_| b"failed to read stylus fragment account".to_vec())?;
+        let was_cold = account.is_cold;
+        if let Some(gas) = gas.as_deref_mut() {
+            let reserve = fragment_read_gas_cost(was_cold, context.cfg().max_code_size() as u64)
+                .ok_or_else(|| b"fragment copy gas overflow".to_vec())?;
+            if gas.remaining() < reserve {
+                gas.spend_all();
+                return Err(b"out of gas".to_vec());
+            }
+        }
+        let loaded = context
+            .journal_mut()
+            .code(address)
+            .map_err(|_| b"failed to read stylus fragment".to_vec())?;
+        let fragment = loaded.data.clone();
+        if let Some(gas) = gas.as_deref_mut() {
+            let cost = fragment_read_gas_cost(was_cold, fragment.len() as u64)
+                .ok_or_else(|| b"fragment copy gas overflow".to_vec())?;
+            if !gas.record_cost(cost) {
+                return Err(b"out of gas".to_vec());
+            }
+        }
+        let Some(payload) = fragment.strip_prefix(STYLUS_FRAGMENT_DISCRIMINANT) else {
+            return Err(b"invalid stylus program fragment".to_vec());
+        };
+        compressed.extend_from_slice(payload);
+    }
+    let mut classic = STYLUS_DISCRIMINANT.to_vec();
+    classic.push(dictionary);
+    classic.extend_from_slice(&compressed);
+    let wasm = stylus_code(&classic, params.max_wasm_size)?;
+    if activating
+        && wasm
+            .as_ref()
+            .is_some_and(|wasm| wasm.len() != decompressed_len as usize)
+    {
+        return Err(b"invalid wasm: decompressed length mismatch".to_vec());
+    }
+    Ok(wasm)
+}
+
 /// Compile Stylus bytecode
 pub fn stylus_compile(bytecode: &Bytes, compile_config: &CompileConfig) -> Result<Vec<u8>, String> {
     let serialized = native::compile(
@@ -894,6 +1028,36 @@ mod tests {
 
         assert!(stylus_code(&bytecode, 1023).is_err());
         assert_eq!(stylus_code(&bytecode, 1024).unwrap().unwrap().len(), 1024);
+    }
+
+    #[test]
+    fn stylus_page_limit_is_consensus_enforced_from_arbos_59() {
+        assert_eq!(stylus_page_limit_penalty(58, 128, 129), 0);
+        assert_eq!(stylus_page_limit_penalty(59, 128, 128), 0);
+        assert_eq!(stylus_page_limit_penalty(59, 128, 129), u64::MAX);
+        assert_eq!(stylus_page_limit_penalty(61, 0, u16::MAX), 0);
+    }
+
+    #[test]
+    fn fragment_read_gas_matches_nitro_word_vectors() {
+        assert_eq!(fragment_read_gas_cost(true, 0), Some(2_600));
+        assert_eq!(fragment_read_gas_cost(true, 1), Some(2_603));
+        assert_eq!(fragment_read_gas_cost(true, 32), Some(2_603));
+        assert_eq!(fragment_read_gas_cost(true, 33), Some(2_606));
+        assert_eq!(fragment_read_gas_cost(false, 33), Some(106));
+        assert_eq!(fragment_read_gas_cost(false, u64::MAX), None);
+    }
+
+    #[test]
+    fn deserialize_failure_restores_pre_call_open_pages() {
+        let mut local = crate::local_context::ArbitrumLocalContext::default();
+        local.add_stylus_pages_open(7);
+        local.add_stylus_pages_open(11);
+        let failed: Result<(), &str> = Err("bad cached module");
+        assert!(restore_open_pages_on_error(&mut local, 7, failed).is_err());
+        assert_eq!(local.stylus_pages_open(), 7);
+        // Ever-open pages are transaction-scoped and intentionally remain high.
+        assert_eq!(local.stylus_pages_ever(), 18);
     }
 
     #[test]

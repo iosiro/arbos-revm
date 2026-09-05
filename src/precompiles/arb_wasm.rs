@@ -11,9 +11,10 @@ use crate::{
         ArbPrecompileLogic, ExtendedPrecompile, StateMutability, decode_call, selector_or_revert,
     },
     state::{
-        ArbState, ArbStateGetter, program::activate_program, try_state, types::StorageBackedTr,
+        ArbState, ArbStateGetter, program::activate_program_metered, try_state,
+        types::StorageBackedTr,
     },
-    stylus_executor::stylus_code,
+    stylus_executor::stylus_code_with_fragments,
     try_record_cost,
 };
 
@@ -279,7 +280,13 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                     .unwrap_or_default()
                     .data;
 
-                let bytecode = match stylus_code(&bytecode, params.max_wasm_size) {
+                let bytecode = match stylus_code_with_fragments(
+                    context,
+                    &bytecode,
+                    &params,
+                    true,
+                    Some(&mut gas),
+                ) {
                     Ok(Some(code)) => code,
                     Ok(None) => {
                         interpreter_revert!(gas, IArbWasm::ProgramNotWasm {}.abi_encode());
@@ -289,8 +296,10 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmPrecompile {
                     }
                 };
 
-                let activation_info =
-                    try_or_halt!(gas, activate_program(context, code_hash, &bytecode, cached));
+                let activation_info = try_or_halt!(
+                    gas,
+                    activate_program_metered(context, code_hash, &bytecode, cached, Some(&mut gas))
+                );
 
                 let data_fee = U256::from(activation_info.data_fee);
                 if call_value < data_fee {
@@ -899,8 +908,11 @@ mod tests {
     use wasmer::wat2wasm;
 
     use crate::{
-        ArbitrumContext, config::ArbitrumConfig, constants::STYLUS_DISCRIMINANT,
-        local_context::ArbitrumLocalContext, transaction::ArbitrumTransaction,
+        ArbitrumContext,
+        config::ArbitrumConfig,
+        constants::{STYLUS_DISCRIMINANT, STYLUS_FRAGMENT_DISCRIMINANT, STYLUS_ROOT_DISCRIMINANT},
+        local_context::ArbitrumLocalContext,
+        transaction::ArbitrumTransaction,
     };
 
     use super::*;
@@ -954,6 +966,82 @@ mod tests {
             .set_code(code_address, Bytecode::new_raw(Bytes::from(wasm)));
 
         code_address
+    }
+
+    #[test]
+    fn arbos_60_root_program_resolves_fragments() {
+        let mut context = setup();
+        let wasm = wat2wasm(include_bytes!("../../test-data/memory.wat")).unwrap();
+        let compressed = brotli::compress(&wasm, 11, 22, brotli::Dictionary::Empty).unwrap();
+        let midpoint = compressed.len() / 2;
+        let mut addresses = Vec::new();
+        for payload in [&compressed[..midpoint], &compressed[midpoint..]] {
+            let mut fragment = STYLUS_FRAGMENT_DISCRIMINANT.to_vec();
+            fragment.extend_from_slice(payload);
+            let address = Address::from_slice(&keccak256(&fragment)[12..]);
+            context.journal_mut().load_account(address).unwrap();
+            context
+                .journal_mut()
+                .set_code(address, Bytecode::new_raw(fragment.into()));
+            addresses.push(address);
+        }
+        let mut root = STYLUS_ROOT_DISCRIMINANT.to_vec();
+        root.push(0); // empty Brotli dictionary
+        root.extend_from_slice(&(wasm.len() as u32).to_be_bytes());
+        for address in addresses {
+            root.extend_from_slice(address.as_slice());
+        }
+        let params = crate::state::program::StylusParams::for_arbos_version(60);
+        let resolved = stylus_code_with_fragments(&mut context, &root, &params, true, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.as_ref(), wasm.as_ref());
+        let mut insufficient = Gas::new(100);
+        assert!(
+            stylus_code_with_fragments(
+                &mut context,
+                &root,
+                &params,
+                true,
+                Some(&mut insufficient),
+            )
+            .is_err()
+        );
+        assert_eq!(insufficient.remaining(), 0);
+        assert!(
+            stylus_code_with_fragments(
+                &mut context,
+                STYLUS_FRAGMENT_DISCRIMINANT,
+                &params,
+                true,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn successful_activation_deducts_native_variable_gas() {
+        use crate::state::{ArbState, arbos_state::ArbosStateParams};
+
+        let mut context = setup();
+        context
+            .arb_state(None, false)
+            .initialize(&ArbosStateParams::default())
+            .unwrap();
+        let wasm = Bytes::from(
+            wat2wasm(include_bytes!("../../test-data/memory.wat"))
+                .unwrap()
+                .into_owned(),
+        );
+        let mut gas = Gas::new(10_000_000);
+        let before = gas.remaining();
+        activate_program_metered(&mut context, keccak256(&wasm), &wasm, false, Some(&mut gas))
+            .unwrap();
+        assert!(
+            gas.remaining() < before,
+            "native activation consumed no gas"
+        );
     }
 
     #[test]

@@ -227,16 +227,26 @@ where
                     )
                     .map_err(|err| ERROR::from_string(err.to_string()))?;
             }
+            let time_passed = if arbos_version < 3 {
+                call.l2BlockNumber
+            } else {
+                call.timeLastBlock
+            };
+            let l1_block_number = if arbos_version < 8 {
+                call.l1BlockNumber.wrapping_add(1)
+            } else {
+                call.l1BlockNumber
+            };
             let old_l1_block = ctx
                 .arb_state(None, false)
                 .blockhashes()
                 .l1_block_number()
                 .get()
                 .map_err(|err| ERROR::from_string(err.to_string()))?;
-            if call.l1BlockNumber > old_l1_block {
+            if l1_block_number > old_l1_block {
                 ctx.arb_state(None, false)
                     .blockhashes()
-                    .record_new_l1_block(call.l1BlockNumber - 1, previous_hash, arbos_version)
+                    .record_new_l1_block(l1_block_number - 1, previous_hash, arbos_version)
                     .map_err(|err| ERROR::from_string(err.to_string()))?;
             }
             for _ in 0..2 {
@@ -247,7 +257,7 @@ where
             }
             ctx.arb_state(None, false)
                 .l2_pricing()
-                .update_pricing_model(call.timeLastBlock, arbos_version)
+                .update_pricing_model(time_passed, arbos_version)
                 .map_err(|err| ERROR::from_string(err.to_string()))?;
             let upgraded = ctx
                 .arb_state(None, false)
@@ -696,15 +706,18 @@ where
                 Err(_) => Ok(self.commit_system_failure(evm)),
             },
             _ => {
-                let collect_tips =
-                    {
-                        let version = evm.ctx().cfg().arbos_version();
-                        version == 9
+                let collect_tips = {
+                    let version = evm.ctx().cfg().arbos_version();
+                    let sequencer_message = evm.ctx().tx().poster().is_none_or(|poster| {
+                        poster == crate::constants::ARBOS_BATCH_POSTER_ADDRESS
+                    });
+                    sequencer_message
+                        && (version == 9
                             || (version >= 60
                                 && evm.ctx().arb_state(None, false).collect_tips().map_err(
                                     |err| ERROR::from_string(format!("collect tips: {err}")),
-                                )?)
-                    };
+                                )?))
+                };
                 if !collect_tips {
                     let base_fee = evm.ctx().block().basefee() as u128;
                     evm.ctx().drop_transaction_tip(base_fee);
@@ -944,6 +957,10 @@ where
             U256::from(ctx.tx().effective_gas_price(ctx.block().basefee() as u128));
         let l1_cost = ctx.local().tx_l1_cost().unwrap_or(U256::ZERO);
 
+        let sequencer_message = ctx
+            .tx()
+            .poster()
+            .is_none_or(|poster| poster == crate::constants::ARBOS_BATCH_POSTER_ADDRESS);
         let (network_fee_account, infra_fee_account, min_base_fee, collect_tips) = {
             let mut state = ctx.arb_state(None, false);
             let network = state
@@ -959,11 +976,12 @@ where
                 .min_base_fee_wei()
                 .get()
                 .map_err(|err| ERROR::from_string(format!("minimum base fee: {err}")))?;
-            let collect = arbos_version == 9
-                || (arbos_version >= 60
-                    && state
-                        .collect_tips()
-                        .map_err(|err| ERROR::from_string(format!("collect tips: {err}")))?);
+            let collect = sequencer_message
+                && (arbos_version == 9
+                    || (arbos_version >= 60
+                        && state
+                            .collect_tips()
+                            .map_err(|err| ERROR::from_string(format!("collect tips: {err}")))?));
             (network, infra, minimum, collect)
         };
 

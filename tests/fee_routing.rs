@@ -265,6 +265,42 @@ fn arbos_9_collects_tips_regardless_of_storage_flag() {
     assert_eq!(charged, U256::from(120 * gas_used));
 }
 
+#[test]
+fn delayed_inbox_transactions_never_collect_tips() {
+    for version in [9, 60] {
+        let caller = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x22);
+        let network = Address::repeat_byte(0x33);
+        let mut context = setup_context();
+        context.cfg.arbos_version = version;
+        context.block.basefee = 100;
+        let mut params = ArbosStateParams::for_arbos_version(version);
+        params.network_fee_account = network;
+        params.collect_tips = true;
+        context.arb_state(None, false).initialize(&params).unwrap();
+        fund_account(&mut context, caller, U256::from(100_000_000_u64));
+
+        let mut evm = create_evm(context);
+        let result = evm
+            .transact_one(ArbitrumTransaction::new_with_enveloped_and_poster(
+                TxEnv {
+                    tx_type: 2,
+                    caller,
+                    gas_limit: 30_000,
+                    gas_price: 120,
+                    gas_priority_fee: Some(20),
+                    kind: TxKind::Call(recipient),
+                    ..Default::default()
+                },
+                Bytes::new(),
+                Address::repeat_byte(0xdd),
+            ))
+            .unwrap();
+        let gas_used = result.gas_used();
+        assert_eq!(balance(&mut evm, network), U256::from(100 * gas_used));
+    }
+}
+
 fn observed_gas_price(version: u64, collect_tips: bool) -> U256 {
     let caller = Address::repeat_byte(0x61);
     let contract = Address::repeat_byte(0x62);

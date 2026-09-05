@@ -1,6 +1,6 @@
 use revm::{
     DatabaseCommit, InspectCommitEvm, InspectEvm,
-    context::{ContextError, ContextSetters, ContextTr, JournalTr},
+    context::{Cfg, ContextError, ContextSetters, ContextTr, JournalTr},
 };
 
 use revm::{
@@ -9,7 +9,9 @@ use revm::{
         EthFrame, EvmTr, FrameInitOrResult, FrameResult, ItemOrResult, PrecompileProvider,
         evm::ContextDbError, instructions::InstructionProvider,
     },
-    inspector::{InspectorEvmTr, InspectorHandler, JournalExt, handler::frame_end},
+    inspector::{
+        InspectorEvmTr, InspectorHandler, JournalExt, handler::frame_end, inspect_instructions,
+    },
     interpreter::interpreter_action::FrameInit,
     state::EvmState,
 };
@@ -20,7 +22,12 @@ use revm::{
 };
 
 use crate::{
-    ArbitrumContextTr, ArbitrumEvm, constants::STYLUS_DISCRIMINANT, context::ArbitrumContextMutTr,
+    ArbitrumContextTr, ArbitrumEvm,
+    config::ArbitrumConfigTr,
+    constants::{
+        ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, STYLUS_DISCRIMINANT, STYLUS_ROOT_DISCRIMINANT,
+    },
+    context::ArbitrumContextMutTr,
     handler::ArbitrumHandler,
 };
 
@@ -91,15 +98,11 @@ where
     fn inspect_frame_run(
         &mut self,
     ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
-        if self
-            .frame_stack
-            .get()
-            .interpreter
-            .bytecode
-            .bytes()
-            .starts_with(STYLUS_DISCRIMINANT)
-            && let Some(next_action) = self.inspect_frame_run_stylus()
-        {
+        let code = self.frame_stack.get().interpreter.bytecode.bytes();
+        let is_stylus = code.starts_with(STYLUS_DISCRIMINANT)
+            || (self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
+                && code.starts_with(STYLUS_ROOT_DISCRIMINANT));
+        if is_stylus && let Some(next_action) = self.inspect_frame_run_stylus() {
             let frame = self.0.frame_stack.get();
             let context = &mut self.0.ctx;
             let mut result = frame.process_next_action(context, next_action);
@@ -112,7 +115,29 @@ where
             return result;
         }
 
-        self.0.inspect_frame_run()
+        let frame = self.0.frame_stack.get();
+        let context = &mut self.0.ctx;
+        let instructions = &mut self.0.instruction;
+        let inspector = &mut self.0.inspector;
+        let mut action = inspect_instructions(
+            context,
+            &mut frame.interpreter,
+            &mut *inspector,
+            instructions.instruction_table(),
+        );
+        crate::evm::validate_arbos_create_output(
+            &mut action,
+            matches!(frame.data, revm::handler::FrameData::Create(_)),
+            context.cfg().arbos_version(),
+            context.cfg().spec().into(),
+            context.cfg().is_eip3541_explicitly_disabled(),
+        );
+        let mut result = frame.process_next_action(context, action);
+        if let Ok(ItemOrResult::Result(frame_result)) = &mut result {
+            frame_end(context, inspector, &frame.input, frame_result);
+            frame.set_finished(true);
+        }
+        result
     }
 
     fn all_inspector(

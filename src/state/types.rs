@@ -507,6 +507,27 @@ where
         Ok(out)
     }
 
+    /// Clears the enumerable list while preserving the reverse mapping.
+    ///
+    /// Nitro used this at ArbOS 11 so owners could repair reverse indices that
+    /// older versions could leave stale.
+    pub fn clear_list(&mut self) -> Result<(), ArbosStateError> {
+        let size = self.size()?;
+        for index in 1..=size {
+            let slot = map_address(&self.slot, &B256::from(U256::from(index)));
+            StorageBackedAddress::new(self.context, self.gas.as_deref_mut(), self.is_static, slot)
+                .set(Address::ZERO)?;
+        }
+        let size_slot = self.size_slot();
+        StorageBackedU256::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            size_slot,
+        )
+        .set(U256::ZERO)
+    }
+
     pub fn contains(&mut self, address: Address) -> Result<bool, ArbosStateError> {
         let by_address = substorage(&self.slot, &[0]);
         let slot = map_address(&by_address, &B256::left_padding_from(address.as_slice()));

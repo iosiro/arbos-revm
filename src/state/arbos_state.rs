@@ -14,8 +14,8 @@ use crate::{
         ARBOS_STATE_BLOCKHASHES_KEY, ARBOS_STATE_FEATURES_KEY, ARBOS_STATE_L1_PRICING_KEY,
         ARBOS_STATE_L2_PRICING_KEY, ARBOS_STATE_NATIVE_TOKEN_OWNER_KEY, ARBOS_STATE_PROGRAMS_KEY,
         ARBOS_STATE_RETRYABLES_KEY, ARBOS_STATE_SEND_MERKLE_KEY,
-        ARBOS_STATE_TRANSACTION_FILTERER_KEY, ARBOS_VERSION_COLLECT_TIPS,
-        INITIAL_MAX_FRAGMENT_COUNT, MAX_ARBOS_VERSION_SUPPORTED,
+        ARBOS_STATE_TRANSACTION_FILTERER_KEY, ARBOS_VERSION_COLLECT_TIPS, HISTORY_STORAGE_ADDRESS,
+        HISTORY_STORAGE_CODE_ARBITRUM, INITIAL_MAX_FRAGMENT_COUNT, MAX_ARBOS_VERSION_SUPPORTED,
     },
     state::{
         address_table::AddressTable,
@@ -256,6 +256,36 @@ where
         Ok(())
     }
 
+    fn install_history_storage_contract(&mut self) -> Result<(), ArbosStateError> {
+        {
+            let mut account = self
+                .context
+                .journal_mut()
+                .load_account_mut(HISTORY_STORAGE_ADDRESS)
+                .map_err(|_| ArbosStateError::Context("load history-storage account".into()))?;
+            match account.data.nonce() {
+                0 => {
+                    if !account.data.bump_nonce() {
+                        return Err(ArbosStateError::Context(
+                            "set history-storage account nonce".into(),
+                        ));
+                    }
+                }
+                1 => {}
+                nonce => {
+                    return Err(ArbosStateError::Context(format!(
+                        "history-storage account has unexpected nonce {nonce}"
+                    )));
+                }
+            }
+        }
+        self.context.journal_mut().set_code(
+            HISTORY_STORAGE_ADDRESS,
+            Bytecode::new_raw(Bytes::from_static(HISTORY_STORAGE_CODE_ARBITRUM)),
+        );
+        Ok(())
+    }
+
     pub fn initialize(&mut self, params: &ArbosStateParams) -> Result<(), ArbosStateError> {
         if params.arbos_version > MAX_ARBOS_VERSION_SUPPORTED {
             return Err(ArbosStateError::UnsupportedArbosVersion(
@@ -263,6 +293,9 @@ where
             ));
         }
         self.install_precompile_code_through(params.arbos_version)?;
+        if params.arbos_version >= 40 {
+            self.install_history_storage_contract()?;
+        }
         self.arbos_version().set(params.arbos_version)?;
         self.upgrade_version().set(params.upgrade_version)?;
         self.upgrade_timestamp().set(params.upgrade_timestamp)?;
@@ -345,6 +378,27 @@ where
         while current < upgrade_to {
             let next = current + 1;
             match next {
+                10 => {
+                    let balance = self
+                        .context
+                        .journal_mut()
+                        .load_account(crate::constants::ARBOS_L1_PRICER_FUNDS_ADDRESS)
+                        .map_err(|_| ArbosStateError::Context("load L1-pricer funds pool".into()))?
+                        .data
+                        .info
+                        .balance;
+                    self.l1_pricing().l1_fees_available().set(balance)?;
+                }
+                11 => {
+                    self.l1_pricing().per_batch_gas_cost().set(210_000)?;
+                    if self.l1_pricing().amortized_cost_cap_bips().get()? == u64::MAX {
+                        self.l1_pricing().amortized_cost_cap_bips().set(0)?;
+                    }
+                    self.chain_owners().clear_list()?;
+                }
+                20 => {
+                    self.brotli_compression_level().set(1)?;
+                }
                 30 => {
                     self.programs().initialize(
                         &StylusParams::for_arbos_version(30),
@@ -364,6 +418,7 @@ where
                     self.programs().stylus_params().set(&params)?;
                 }
                 40 => {
+                    self.install_history_storage_contract()?;
                     let mut params = self.programs().stylus_params().get()?;
                     if params.version != 2 {
                         return Err(ArbosStateError::UnexpectedStylusVersion {

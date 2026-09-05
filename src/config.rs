@@ -16,6 +16,10 @@ pub trait ArbitrumConfigTr: Cfg {
     fn debug_mode(&self) -> bool;
     fn disable_auto_cache(&self) -> bool;
     fn disable_auto_activate(&self) -> bool;
+    /// Whether the embedding explicitly disabled EIP-3541 validation.
+    fn is_eip3541_explicitly_disabled(&self) -> bool {
+        Cfg::is_eip3541_disabled(self)
+    }
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -96,7 +100,10 @@ impl<SPEC: Into<SpecId> + Copy> Cfg for ArbitrumConfig<SPEC> {
     }
 
     fn is_eip3541_disabled(&self) -> bool {
-        self.inner.is_eip3541_disabled()
+        // REVM's generic check rejects every 0xEF-prefixed deployment. ArbOS
+        // applies the narrower check in its frame runner so valid Stylus
+        // components can be deployed.
+        true
     }
 
     fn is_balance_check_disabled(&self) -> bool {
@@ -154,6 +161,10 @@ where
 
     fn disable_auto_activate(&self) -> bool {
         self.disable_auto_activate
+    }
+
+    fn is_eip3541_explicitly_disabled(&self) -> bool {
+        self.inner.is_eip3541_disabled()
     }
 }
 

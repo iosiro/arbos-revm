@@ -595,13 +595,24 @@ use super::{ArbState, ArbStateGetter};
 /// Compiles, activates, and stores a Stylus program. Returns activation metadata
 /// including the data fee so callers can optionally charge for it.
 ///
-/// This function does **not** meter gas — callers are responsible for charging
-/// any fixed activation costs before calling.
+/// Callers charge the fixed activation costs before entering this function;
+/// when `gas` is supplied, native instrumentation consumes its variable cost
+/// from the same meter.
 pub fn activate_program<CTX: ArbitrumContextTr>(
     context: &mut CTX,
     code_hash: B256,
     wasm_bytecode: &Bytes,
     cached: bool,
+) -> Result<ActivationInfo, String> {
+    activate_program_metered(context, code_hash, wasm_bytecode, cached, None)
+}
+
+pub fn activate_program_metered<CTX: ArbitrumContextTr>(
+    context: &mut CTX,
+    code_hash: B256,
+    wasm_bytecode: &Bytes,
+    cached: bool,
+    gas: Option<&mut Gas>,
 ) -> Result<ActivationInfo, String> {
     let params = context
         .arb_state(None, false)
@@ -620,7 +631,7 @@ pub fn activate_program<CTX: ArbitrumContextTr>(
     let serialized = stylus_compile(wasm_bytecode, &compile_config)?;
 
     let (module, stylus_data) = stylus_activate(
-        None,
+        gas,
         wasm_bytecode,
         code_hash,
         arbos_version,

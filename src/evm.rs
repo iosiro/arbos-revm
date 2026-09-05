@@ -1,23 +1,64 @@
 use std::ops::{Deref, DerefMut};
 
 use crate::{
-    ArbitrumContextTr, constants::STYLUS_DISCRIMINANT, context::ArbitrumContextMutTr,
-    handler::ArbitrumHandler, transaction::ArbitrumTransactionError,
+    ArbitrumContextTr,
+    config::ArbitrumConfigTr,
+    constants::{
+        ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, STYLUS_DISCRIMINANT, STYLUS_FRAGMENT_DISCRIMINANT,
+        STYLUS_ROOT_DISCRIMINANT,
+    },
+    context::ArbitrumContextMutTr,
+    handler::ArbitrumHandler,
+    transaction::ArbitrumTransactionError,
 };
 use revm::{
     Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, Inspector,
     context::{
-        ContextError, ContextSetters, ContextTr, Evm, FrameStack, JournalTr,
+        Cfg, ContextError, ContextSetters, ContextTr, Evm, FrameStack, JournalTr,
         result::{EVMError, ExecutionResult, HaltReason, ResultAndState},
     },
     handler::{
-        EthFrame, EvmTr, FrameInitOrResult, FrameResult, FrameTr, Handler, ItemOrResult,
+        EthFrame, EvmTr, FrameData, FrameInitOrResult, FrameResult, FrameTr, Handler, ItemOrResult,
         PrecompileProvider,
         instructions::{EthInstructions, InstructionProvider},
     },
-    interpreter::{InterpreterResult, interpreter::EthInterpreter, interpreter_action::FrameInit},
+    interpreter::{
+        InstructionResult, InterpreterAction, InterpreterResult, interpreter::EthInterpreter,
+        interpreter_action::FrameInit,
+    },
+    primitives::hardfork::{LONDON, SpecId},
     state::EvmState,
 };
+
+pub(crate) fn validate_arbos_create_output(
+    action: &mut InterpreterAction,
+    is_create: bool,
+    arbos_version: u64,
+    spec: SpecId,
+    eip3541_disabled: bool,
+) {
+    if !is_create || eip3541_disabled || !spec.is_enabled_in(LONDON) {
+        return;
+    }
+    let InterpreterAction::Return(result) = action else {
+        return;
+    };
+    if !result.result.is_ok() || result.output.first() != Some(&0xef) {
+        return;
+    }
+
+    let code = result.output.as_ref();
+    let classic = arbos_version >= 30
+        && code.len() > STYLUS_DISCRIMINANT.len()
+        && code.starts_with(STYLUS_DISCRIMINANT);
+    let component = arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
+        && code.len() > STYLUS_ROOT_DISCRIMINANT.len()
+        && (code.starts_with(STYLUS_ROOT_DISCRIMINANT)
+            || code.starts_with(STYLUS_FRAGMENT_DISCRIMINANT));
+    if !classic && !component {
+        result.result = InstructionResult::CreateContractStartingWithEF;
+    }
+}
 
 pub struct ArbitrumEvm<CTX, INSP, P, I = EthInstructions<EthInterpreter, CTX>, F = EthFrame>(
     pub Evm<CTX, INSP, I, P, F>,
@@ -110,15 +151,11 @@ where
         FrameInitOrResult<Self::Frame>,
         ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
     > {
-        if self
-            .frame_stack()
-            .get()
-            .interpreter
-            .bytecode
-            .bytes()
-            .starts_with(STYLUS_DISCRIMINANT)
-            && let Some(action) = self.frame_run_stylus()
-        {
+        let code = self.frame_stack().get().interpreter.bytecode.bytes();
+        let is_stylus = code.starts_with(STYLUS_DISCRIMINANT)
+            || (self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
+                && code.starts_with(STYLUS_ROOT_DISCRIMINANT));
+        if is_stylus && let Some(action) = self.frame_run_stylus() {
             let frame = self.0.frame_stack.get();
             let context = &mut self.0.ctx;
             return frame.process_next_action(context, action).inspect(|i| {
@@ -128,7 +165,24 @@ where
             });
         }
 
-        self.0.frame_run()
+        let frame = self.0.frame_stack.get();
+        let context = &mut self.0.ctx;
+        let instructions = &mut self.0.instruction;
+        let mut action = frame
+            .interpreter
+            .run_plain(instructions.instruction_table(), context);
+        validate_arbos_create_output(
+            &mut action,
+            matches!(frame.data, FrameData::Create(_)),
+            context.cfg().arbos_version(),
+            context.cfg().spec().into(),
+            context.cfg().is_eip3541_explicitly_disabled(),
+        );
+        frame.process_next_action(context, action).inspect(|item| {
+            if item.is_result() {
+                frame.set_finished(true);
+            }
+        })
     }
 
     fn frame_return_result(
