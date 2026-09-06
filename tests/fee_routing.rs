@@ -520,3 +520,31 @@ fn arbos_gas_caps_limit_execution_but_refund_held_gas() {
         assert_eq!(charged, U256::from(22_000));
     }
 }
+
+#[test]
+fn absent_gas_constraints_preserve_the_transaction_budget() {
+    let caller = Address::repeat_byte(0x83);
+    let contract = Address::repeat_byte(0x84);
+    let mut context = setup_context();
+    context.block.basefee = 1;
+    fund_account(&mut context, caller, U256::from(100_000));
+    context.journal_mut().load_account(contract).unwrap();
+    context
+        .journal_mut()
+        .set_code(contract, Bytecode::new_raw(Bytes::from_static(&[0x00])));
+
+    let mut evm = create_evm(context);
+    let result = execute_tx(
+        &mut evm,
+        TxEnv {
+            caller,
+            gas_limit: 30_000,
+            gas_price: 1,
+            kind: TxKind::Call(contract),
+            ..Default::default()
+        },
+    );
+
+    assert!(result.is_success());
+    assert_eq!(result.gas_used(), 21_000);
+}
