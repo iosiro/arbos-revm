@@ -81,6 +81,8 @@ pub fn arb_wasm_cache_precompile<CTX: ArbitrumContextTr>() -> ExtendedPrecompile
 struct ArbWasmCache {}
 
 impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmCache {
+    const MIN_ARBOS_VERSION: u64 = 30;
+
     const STATE_MUT_TABLE: &'static [([u8; 4], StateMutability)] = generate_state_mut_table! {
         IArbWasmCache => {
             isCacheManagerCall(View),
@@ -91,6 +93,14 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmCache {
             codehashIsCachedCall(View),
         }
     };
+
+    fn method_version(selector: [u8; 4]) -> (u64, Option<u64>) {
+        match selector {
+            IArbWasmCache::cacheCodehashCall::SELECTOR => (30, Some(30)),
+            IArbWasmCache::cacheProgramCall::SELECTOR => (31, None),
+            _ => (30, None),
+        }
+    }
 
     fn inner(
         context: &mut CTX,
@@ -141,6 +151,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmCache {
             }
             IArbWasmCache::cacheCodehashCall::SELECTOR => {
                 if !try_state!(gas, has_access(context, caller_address, &mut gas)) {
+                    gas.spend_all();
                     interpreter_revert!(gas);
                 }
 
@@ -156,24 +167,34 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmCache {
                         .get()
                 );
 
-                let mut program_info = if let Some(program_info) = try_state!(
+                let mut program_info = try_state!(
                     gas,
                     context
                         .arb_state(Some(&mut gas), is_static)
                         .programs()
                         .program_info(&codehash)
-                ) {
-                    program_info
-                } else {
+                )
+                .unwrap_or_default();
+                if program_info.version != params.version {
                     interpreter_revert!(
                         gas,
                         IArbWasmCache::ProgramNeedsUpgrade {
-                            version: 0,
+                            version: program_info.version,
                             stylusVersion: params.version
                         }
                         .abi_encode()
                     );
-                };
+                }
+                let max_age = u64::from(params.expiry_days).saturating_mul(86_400);
+                if program_info.age > max_age {
+                    interpreter_revert!(
+                        gas,
+                        IArbWasmCache::ProgramExpired {
+                            ageInSeconds: program_info.age
+                        }
+                        .abi_encode()
+                    );
+                }
 
                 let output = IArbWasmCache::cacheCodehashCall::abi_encode_returns(
                     &IArbWasmCache::cacheCodehashReturn {},
@@ -183,6 +204,29 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmCache {
                     // already cached, no-op
                     interpreter_return!(gas, Bytes::from(output));
                 }
+
+                emit_event!(
+                    context,
+                    Log {
+                        address: *target_address,
+                        data: IArbWasmCache::UpdateProgramCache {
+                            manager: caller_address,
+                            codehash,
+                            cached: true
+                        }
+                        .into_log_data()
+                    },
+                    gas
+                );
+                try_record_cost!(gas, program_info.init_cost as u64);
+                try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .programs()
+                        .module_hash(&codehash)
+                        .get()
+                );
 
                 program_info.cached = true;
 
@@ -198,6 +242,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmCache {
             }
             IArbWasmCache::cacheProgramCall::SELECTOR => {
                 if !try_state!(gas, has_access(context, caller_address, &mut gas)) {
+                    gas.spend_all();
                     interpreter_revert!(gas);
                 }
 
@@ -223,8 +268,29 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmCache {
                     context
                         .arb_state(Some(&mut gas), is_static)
                         .programs()
-                        .get_active_program(&params, &code_hash)
-                );
+                        .program_info(&code_hash)
+                )
+                .unwrap_or_default();
+                if program_info.version != params.version {
+                    interpreter_revert!(
+                        gas,
+                        IArbWasmCache::ProgramNeedsUpgrade {
+                            version: program_info.version,
+                            stylusVersion: params.version
+                        }
+                        .abi_encode()
+                    );
+                }
+                let max_age = u64::from(params.expiry_days).saturating_mul(86_400);
+                if program_info.age > max_age {
+                    interpreter_revert!(
+                        gas,
+                        IArbWasmCache::ProgramExpired {
+                            ageInSeconds: program_info.age
+                        }
+                        .abi_encode()
+                    );
+                }
 
                 let output = IArbWasmCache::cacheProgramCall::abi_encode_returns(
                     &IArbWasmCache::cacheProgramReturn {},
@@ -275,6 +341,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbWasmCache {
             }
             IArbWasmCache::evictCodehashCall::SELECTOR => {
                 if !try_state!(gas, has_access(context, caller_address, &mut gas)) {
+                    gas.spend_all();
                     interpreter_revert!(gas);
                 }
 

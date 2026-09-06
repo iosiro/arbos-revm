@@ -55,6 +55,7 @@ pub fn setup_context() -> TestContext {
 }
 
 /// Setup a test context with ArbOS state initialized
+#[allow(dead_code)]
 pub fn setup_context_with_arbos_state() -> TestContext {
     let mut context = setup_context();
 
@@ -74,17 +75,19 @@ pub fn create_evm(context: TestContext) -> TestEvm {
         context,
         NoOpInspector {},
         EthInstructions::default(),
-        ArbitrumPrecompileProvider::default(),
+        ArbitrumPrecompileProvider::new(revm::primitives::hardfork::SpecId::default()),
     )
 }
 
 /// Deploy a WAT program to the test context and return its address
+#[allow(dead_code)]
 pub fn deploy_wat_program(context: &mut TestContext, wat: &[u8]) -> Address {
     let wasm_bytes = wasmer::wat2wasm(wat).expect("failed to compile WAT");
     deploy_wasm_program(context, &wasm_bytes)
 }
 
 /// Deploy a WASM program to the test context and return its address
+#[allow(dead_code)]
 pub fn deploy_wasm_program(context: &mut TestContext, wasm: &[u8]) -> Address {
     // Compress with brotli using empty dictionary
     let compressed = brotli::compress(wasm, 11, 22, brotli::Dictionary::Empty)

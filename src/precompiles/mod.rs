@@ -15,9 +15,14 @@ use revm::{
     },
 };
 
+use crate::state::{ArbState, ArbStateGetter};
+
 mod arb_address_table;
 mod arb_aggregator;
+mod arb_bls;
 mod arb_debug;
+mod arb_filtered_transactions_manager;
+mod arb_function_table;
 mod arb_gas_info;
 mod arb_info;
 mod arb_native_token_manager;
@@ -28,12 +33,13 @@ mod arb_statistics;
 mod arb_sys;
 pub mod arb_wasm;
 mod arb_wasm_cache;
+mod arbos_test;
 
 use crate::{
     ArbitrumContextTr,
-    macros::{interpreter_return, interpreter_revert},
+    config::ArbitrumConfigTr,
+    macros::interpreter_revert,
     precompiles::{arb_wasm::arb_wasm_precompile, arb_wasm_cache::arb_wasm_cache_precompile},
-    state::{ArbState, ArbStateGetter, try_state, types::StorageBackedTr},
     try_record_cost,
 };
 
@@ -41,9 +47,9 @@ macro_rules! selector_or_revert {
     ($gas:expr, $input:expr) => {{
         if $input.len() < 4 {
             $gas.spend_all();
-            return Some(crate::macros::interpreter_result_return_with_output(
+            return Some(crate::macros::interpreter_result_revert_with_output(
                 &mut $gas,
-                revm::primitives::Bytes::from_static(b"Input too short"),
+                revm::primitives::Bytes::new(),
             ));
         }
 
@@ -51,9 +57,9 @@ macro_rules! selector_or_revert {
             Ok(selector) => selector,
             Err(_) => {
                 $gas.spend_all();
-                return Some(crate::macros::interpreter_result_return_with_output(
+                return Some(crate::macros::interpreter_result_revert_with_output(
                     &mut $gas,
-                    revm::primitives::Bytes::from_static(b"Invalid selector"),
+                    revm::primitives::Bytes::new(),
                 ));
             }
         }
@@ -85,7 +91,15 @@ impl<CTX: ArbitrumContextTr> ArbitrumPrecompileProvider<CTX> {
             // Arbitrum specific precompiles can be added here
             Precompile::Extended(arb_address_table::arb_address_table_precompile::<CTX>()),
             Precompile::Extended(arb_aggregator::arb_aggregator_precompile::<CTX>()),
+            Precompile::Extended(arb_bls::arb_bls_precompile::<CTX>()),
             Precompile::Extended(arb_debug::arb_debug_precompile::<CTX>()),
+            Precompile::Extended(
+                arb_filtered_transactions_manager::arb_filtered_transactions_manager_precompile::<
+                    CTX,
+                >(),
+            ),
+            Precompile::Extended(arb_function_table::arb_function_table_precompile::<CTX>()),
+            Precompile::Extended(arbos_test::arbos_test_precompile::<CTX>()),
             Precompile::Extended(arb_gas_info::arb_gas_info_precompile::<CTX>()),
             Precompile::Extended(arb_info::arb_info_precompile::<CTX>()),
             Precompile::Extended(
@@ -117,13 +131,7 @@ impl<CTX: ArbitrumContextTr> Clone for ArbitrumPrecompileProvider<CTX> {
 
 impl<CTX: ArbitrumContextTr> Default for ArbitrumPrecompileProvider<CTX> {
     fn default() -> Self {
-        let spec = SpecId::default();
-        let registry = PrecompileRegistry::new(PrecompileSpecId::from_spec_id(spec));
-
-        Self {
-            registry: Arc::new(registry),
-            spec,
-        }
+        Self::new(SpecId::default())
     }
 }
 
@@ -137,10 +145,7 @@ impl<CTX: ArbitrumContextTr> PrecompileProvider<CTX> for ArbitrumPrecompileProvi
             return false;
         }
 
-        self.registry = Arc::new(PrecompileRegistry::new(PrecompileSpecId::from_spec_id(
-            new_spec,
-        )));
-        self.spec = new_spec;
+        *self = Self::new(new_spec);
         true
     }
 
@@ -154,15 +159,6 @@ impl<CTX: ArbitrumContextTr> PrecompileProvider<CTX> for ArbitrumPrecompileProvi
             return Ok(None);
         };
 
-        // revert for mutating calls to code addresses other than their own
-        if !inputs.is_static && inputs.target_address != inputs.bytecode_address {
-            return Ok(Some(InterpreterResult {
-                result: InstructionResult::Revert,
-                output: Bytes::default(),
-                gas: Gas::new(inputs.gas_limit),
-            }));
-        }
-
         // extract input bytes
         let input_bytes = match &inputs.input {
             CallInput::SharedBuffer(range) => ctx
@@ -172,6 +168,20 @@ impl<CTX: ArbitrumContextTr> PrecompileProvider<CTX> for ArbitrumPrecompileProvi
                 .unwrap_or_default(),
             CallInput::Bytes(b) => b.to_vec(),
         };
+
+        // Nitro permits DELEGATECALL/CALLCODE only for pure methods. View and
+        // state-mutating methods must execute against their registered address.
+        if inputs.target_address != inputs.bytecode_address
+            && precompile
+                .state_mutability(&input_bytes)
+                .is_some_and(|purity| purity >= StateMutability::View)
+        {
+            return Ok(Some(InterpreterResult {
+                result: InstructionResult::Revert,
+                output: Bytes::default(),
+                gas: Gas::new_spent(inputs.gas_limit),
+            }));
+        }
 
         precompile.call(
             ctx,
@@ -297,6 +307,7 @@ pub struct ExtendedPrecompile<CTX: ContextTr> {
     id: PrecompileId,
     address: Address,
     handler: Arc<ExtendedPrecompileFn<CTX>>,
+    mutability: ExtendedPrecompileMutabilityFn,
 }
 
 impl<CTX: ContextTr> Clone for ExtendedPrecompile<CTX> {
@@ -305,6 +316,7 @@ impl<CTX: ContextTr> Clone for ExtendedPrecompile<CTX> {
             id: self.id.clone(),
             address: self.address,
             handler: Arc::clone(&self.handler),
+            mutability: self.mutability,
         }
     }
 }
@@ -319,11 +331,16 @@ impl<CTX: ContextTr> Debug for ExtendedPrecompile<CTX> {
 }
 
 impl<CTX: ContextTr> ExtendedPrecompile<CTX> {
-    pub fn new(id: PrecompileId, address: Address, handler: ExtendedPrecompileFn<CTX>) -> Self {
+    pub fn new(
+        id: PrecompileId,
+        address: Address,
+        implementation: ExtendedPrecompileImplementation<CTX>,
+    ) -> Self {
         Self {
             id,
             address,
-            handler: Arc::new(handler),
+            handler: Arc::new(implementation.handler),
+            mutability: implementation.mutability,
         }
     }
 
@@ -335,6 +352,10 @@ impl<CTX: ContextTr> ExtendedPrecompile<CTX> {
     #[inline]
     pub fn address(&self) -> &Address {
         &self.address
+    }
+
+    fn state_mutability(&self, input: &[u8]) -> Option<StateMutability> {
+        (self.mutability)(input)
     }
 
     #[inline]
@@ -363,6 +384,49 @@ pub type ExtendedPrecompileFn<CTX> = fn(
     u64,
 ) -> Result<Option<InterpreterResult>, String>;
 
+pub type ExtendedPrecompileMutabilityFn = fn(&[u8]) -> Option<StateMutability>;
+
+pub struct ExtendedPrecompileImplementation<CTX: ContextTr> {
+    handler: ExtendedPrecompileFn<CTX>,
+    mutability: ExtendedPrecompileMutabilityFn,
+}
+
+impl<CTX: ContextTr> ExtendedPrecompileImplementation<CTX> {
+    pub fn new(
+        handler: ExtendedPrecompileFn<CTX>,
+        mutability: ExtendedPrecompileMutabilityFn,
+    ) -> Self {
+        Self {
+            handler,
+            mutability,
+        }
+    }
+}
+
+impl<CTX: ArbitrumContextTr> ExtendedPrecompileImplementation<CTX> {
+    pub(crate) fn for_logic<Logic: ArbPrecompileLogic<CTX>>() -> Self {
+        Self::new(
+            |context, input, target_address, caller_address, call_value, is_static, gas_limit| {
+                Ok(Logic::run(
+                    context,
+                    input,
+                    target_address,
+                    caller_address,
+                    call_value,
+                    is_static,
+                    gas_limit,
+                ))
+            },
+            |input| {
+                let selector: [u8; 4] = input.get(..4)?.try_into().ok()?;
+                Logic::STATE_MUT_TABLE
+                    .iter()
+                    .find_map(|(candidate, purity)| (*candidate == selector).then_some(*purity))
+            },
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum Precompile<CTX: ContextTr> {
     Simple(revm::precompile::Precompile),
@@ -384,6 +448,13 @@ impl<CTX: ContextTr> Precompile<CTX> {
         match self {
             Self::Simple(p) => p.address(),
             Self::Extended(p) => p.address(),
+        }
+    }
+
+    fn state_mutability(&self, input: &[u8]) -> Option<StateMutability> {
+        match self {
+            Self::Simple(_) => None,
+            Self::Extended(precompile) => precompile.state_mutability(input),
         }
     }
 
@@ -438,8 +509,26 @@ impl<CTX: ContextTr> Precompile<CTX> {
 }
 
 pub(crate) trait ArbPrecompileLogic<CTX: ArbitrumContextTr> {
+    /// First ArbOS version in which this precompile exists. Calls before this
+    /// version behave like calls to an empty account and retain all gas.
+    const MIN_ARBOS_VERSION: u64 = 0;
+
+    /// Nitro's ArbOwner wrapper refunds all precompile gas when an authorized
+    /// owner's underlying method succeeds.
+    const REFUND_ALL_ON_SUCCESS: bool = false;
+
+    /// Nitro's transaction-filter manager wrapper charges only its role lookup
+    /// to unauthorized callers and makes authorized calls entirely free.
+    const FREE_FOR_FILTERERS: bool = false;
+
     /// File-local state mutability table
     const STATE_MUT_TABLE: &'static [([u8; 4], StateMutability)];
+
+    /// Per-method activation range, inclusive. Nitro treats methods outside
+    /// this range as unknown selectors and consumes all supplied gas.
+    fn method_version(_selector: [u8; 4]) -> (u64, Option<u64>) {
+        (Self::MIN_ARBOS_VERSION, None)
+    }
 
     /// Inner execution
     fn inner(
@@ -463,34 +552,72 @@ pub(crate) trait ArbPrecompileLogic<CTX: ArbitrumContextTr> {
     ) -> Option<InterpreterResult> {
         let mut gas = Gas::new(gas_limit);
 
+        let arbos_version = context.cfg().arbos_version();
+        if arbos_version < Self::MIN_ARBOS_VERSION {
+            return Some(crate::macros::interpreter_result_return(&mut gas));
+        }
+
         let selector = selector_or_revert!(gas, input);
 
-        let args_cost =
-            revm::interpreter::gas::VERYLOW * (input.len() as u64).saturating_sub(4).div_ceil(32);
-
-        try_record_cost!(gas, args_cost);
+        if Self::FREE_FOR_FILTERERS {
+            let authorized = match context
+                .arb_state(Some(&mut gas), true)
+                .transaction_filterers()
+                .contains(caller_address)
+            {
+                Ok(authorized) => authorized,
+                Err(_) => interpreter_revert!(gas, Bytes::new()),
+            };
+            let outcome = Self::inner(
+                context,
+                input,
+                target_address,
+                caller_address,
+                call_value,
+                is_static,
+                gas_limit,
+            )?;
+            return Some(InterpreterResult {
+                result: outcome.result,
+                gas: if authorized { Gas::new(gas_limit) } else { gas },
+                output: outcome.output,
+            });
+        }
 
         let purity = match Self::STATE_MUT_TABLE
             .iter()
             .find(|(sel, _)| *sel == selector)
         {
             Some((_, p)) => *p,
-            None => interpreter_return!(gas),
+            None => {
+                gas.spend_all();
+                interpreter_revert!(gas, Bytes::new());
+            }
         };
+
+        let (minimum, maximum) = Self::method_version(selector);
+        if arbos_version < minimum || maximum.is_some_and(|maximum| arbos_version > maximum) {
+            gas.spend_all();
+            interpreter_revert!(gas, Bytes::new());
+        }
+
+        let args_cost =
+            revm::interpreter::gas::VERYLOW * (input.len() as u64).saturating_sub(4).div_ceil(32);
+
+        try_record_cost!(gas, args_cost);
 
         if purity != StateMutability::Pure {
             try_record_cost!(gas, ISTANBUL_SLOAD_GAS);
         }
 
         if purity >= StateMutability::NonPayable && is_static {
-            let _ = try_state!(
-                gas,
-                context
-                    .arb_state(Some(&mut gas), is_static)
-                    .l2_pricing()
-                    .per_tx_gas_limit()
-                    .get()
-            );
+            gas.spend_all();
+            interpreter_revert!(gas, Bytes::new());
+        }
+
+        if call_value > U256::ZERO && purity < StateMutability::Payable {
+            gas.spend_all();
+            interpreter_revert!(gas, Bytes::new());
         }
 
         // call the inner logic
@@ -508,6 +635,14 @@ pub(crate) trait ArbPrecompileLogic<CTX: ArbitrumContextTr> {
             // final precompile return value must be error
             interpreter_revert!(gas);
         };
+
+        if Self::REFUND_ALL_ON_SUCCESS && outcome.result.is_ok() {
+            return Some(InterpreterResult {
+                result: outcome.result,
+                gas: Gas::new(gas_limit),
+                output: outcome.output,
+            });
+        }
 
         gas.spend_all();
         gas.erase_cost(outcome.gas.remaining());
@@ -529,9 +664,10 @@ macro_rules! decode_call {
         match <$call as alloy_sol_types::SolCall>::abi_decode($input) {
             Ok(value) => value,
             Err(_) => {
+                $gas.spend_all();
                 return Some(crate::macros::interpreter_result_revert_with_output(
                     &mut $gas,
-                    revm::primitives::Bytes::from_static(b"Invalid calldata"),
+                    revm::primitives::Bytes::new(),
                 ));
             }
         }
@@ -572,16 +708,6 @@ pub enum StateMutability {
 #[macro_export]
 macro_rules! precompile_impl {
     ($logic:ty) => {
-        |context, input, target_address, caller_address, call_value, is_static, gas_limit| {
-            Ok(<$logic>::run(
-                context,
-                input,
-                target_address,
-                caller_address,
-                call_value,
-                is_static,
-                gas_limit,
-            ))
-        }
+        $crate::precompiles::ExtendedPrecompileImplementation::for_logic::<$logic>()
     };
 }

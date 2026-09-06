@@ -181,13 +181,8 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbAddressTablePrecompi
                         .address_table()
                         .decompress(data)
                 );
-                let new_offset = offset.saturating_add(consumed);
-
                 let output = ArbAddressTable::decompressCall::abi_encode_returns(
-                    &ArbAddressTable::decompressReturn::from((
-                        decompressed,
-                        U256::from(new_offset),
-                    )),
+                    &ArbAddressTable::decompressReturn::from((decompressed, U256::from(consumed))),
                 );
                 interpreter_return!(gas, Bytes::from(output));
             }

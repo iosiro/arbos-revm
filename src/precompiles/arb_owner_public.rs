@@ -7,7 +7,9 @@ use revm::{
 };
 
 use crate::{
-    ArbitrumContextTr, generate_state_mut_table,
+    ArbitrumContextTr,
+    config::ArbitrumConfigTr,
+    generate_state_mut_table,
     macros::{emit_event, interpreter_return, interpreter_revert},
     precompile_impl,
     precompiles::{
@@ -71,6 +73,33 @@ interface ArbOwnerPublic {
     ///
     function isCalldataPriceIncreaseEnabled() external view returns (bool);
 
+    /// @notice Gets the maximum number of fragments in a Stylus contract.
+    /// Available in ArbOS version 60.
+    function getMaxStylusContractFragments() external view returns (uint8 maxFragments);
+
+    /// @notice Gets the parent-chain gas floor charged per calldata token.
+    /// Available in ArbOS version 50.
+    function getParentGasFloorPerToken() external view returns (uint64 gasFloorPerToken);
+
+    /// @notice Gets whether transaction priority fees are collected.
+    /// Available in ArbOS version 60.
+    function getCollectTips() external view returns (bool collectTips);
+
+    /// @notice Gets the timestamp at which native-token management activates.
+    /// Available in ArbOS version 50.
+    function getNativeTokenManagementFrom() external view returns (uint64 timestamp);
+
+    /// @notice Gets the timestamp at which transaction filtering activates.
+    /// Available in ArbOS version 60.
+    function getTransactionFilteringFrom() external view returns (uint64 timestamp);
+
+    function isTransactionFilterer(address filterer) external view returns (bool);
+
+    function getAllTransactionFilterers() external view returns (address[] memory);
+
+    /// @notice Zero means that filtered funds fall back to the network fee account.
+    function getFilteredFundsRecipient() external view returns (address);
+
     event ChainOwnerRectified(address rectifiedOwner);
 }
 
@@ -99,8 +128,38 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPublicPrecompil
             getBrotliCompressionLevelCall(View),
             getScheduledUpgradeCall(View),
             isCalldataPriceIncreaseEnabledCall(View),
+            getMaxStylusContractFragmentsCall(View),
+            getParentGasFloorPerTokenCall(View),
+            getCollectTipsCall(View),
+            getNativeTokenManagementFromCall(View),
+            getTransactionFilteringFromCall(View),
+            isTransactionFiltererCall(View),
+            getAllTransactionFilterersCall(View),
+            getFilteredFundsRecipientCall(View),
         }
     };
+
+    fn method_version(selector: [u8; 4]) -> (u64, Option<u64>) {
+        let minimum = match selector {
+            ArbOwnerPublic::getInfraFeeAccountCall::SELECTOR => 5,
+            ArbOwnerPublic::rectifyChainOwnerCall::SELECTOR => 11,
+            ArbOwnerPublic::getBrotliCompressionLevelCall::SELECTOR
+            | ArbOwnerPublic::getScheduledUpgradeCall::SELECTOR => 20,
+            ArbOwnerPublic::isCalldataPriceIncreaseEnabledCall::SELECTOR => 40,
+            ArbOwnerPublic::isNativeTokenOwnerCall::SELECTOR
+            | ArbOwnerPublic::getAllNativeTokenOwnersCall::SELECTOR => 41,
+            ArbOwnerPublic::getParentGasFloorPerTokenCall::SELECTOR
+            | ArbOwnerPublic::getNativeTokenManagementFromCall::SELECTOR => 50,
+            ArbOwnerPublic::getMaxStylusContractFragmentsCall::SELECTOR
+            | ArbOwnerPublic::getCollectTipsCall::SELECTOR
+            | ArbOwnerPublic::getTransactionFilteringFromCall::SELECTOR
+            | ArbOwnerPublic::isTransactionFiltererCall::SELECTOR
+            | ArbOwnerPublic::getAllTransactionFilterersCall::SELECTOR
+            | ArbOwnerPublic::getFilteredFundsRecipientCall::SELECTOR => 60,
+            _ => 0,
+        };
+        (minimum, None)
+    }
 
     fn inner(
         context: &mut CTX,
@@ -192,13 +251,24 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPublicPrecompil
             }
             ArbOwnerPublic::getInfraFeeAccountCall::SELECTOR => {
                 let _ = decode_call!(gas, ArbOwnerPublic::getInfraFeeAccountCall, input);
-                let infra_fee_account = try_state!(
-                    gas,
-                    context
-                        .arb_state(Some(&mut gas), is_static)
-                        .infra_fee_account()
-                        .get()
-                );
+                let version = context.cfg().arbos_version();
+                let infra_fee_account = if version < 6 {
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .network_fee_account()
+                            .get()
+                    )
+                } else {
+                    try_state!(
+                        gas,
+                        context
+                            .arb_state(Some(&mut gas), is_static)
+                            .infra_fee_account()
+                            .get()
+                    )
+                };
                 let output =
                     ArbOwnerPublic::getInfraFeeAccountCall::abi_encode_returns(&infra_fee_account);
                 interpreter_return!(gas, Bytes::from(output));
@@ -233,6 +303,12 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPublicPrecompil
                         .upgrade_timestamp()
                         .get()
                 );
+                let (upgrade_version, upgrade_timestamp) =
+                    if context.cfg().arbos_version() >= upgrade_version {
+                        (0, 0)
+                    } else {
+                        (upgrade_version, upgrade_timestamp)
+                    };
                 let output = ArbOwnerPublic::getScheduledUpgradeCall::abi_encode_returns(
                     &ArbOwnerPublic::getScheduledUpgradeReturn {
                         arbosVersion: upgrade_version,
@@ -249,13 +325,132 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPublicPrecompil
                 );
                 let enabled = {
                     let mut arb_state = context.arb_state(Some(&mut gas), is_static);
-                    let value = try_state!(gas, arb_state.l1_pricing().gas_floor_per_token().get());
-                    value != 0
+                    try_state!(gas, arb_state.features().get()).bit(0)
                 };
                 let output = ArbOwnerPublic::isCalldataPriceIncreaseEnabledCall::abi_encode_returns(
                     &enabled,
                 );
 
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbOwnerPublic::getMaxStylusContractFragmentsCall::SELECTOR => {
+                let _ = decode_call!(
+                    gas,
+                    ArbOwnerPublic::getMaxStylusContractFragmentsCall,
+                    input
+                );
+                let max_fragments = try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .programs()
+                        .stylus_params()
+                        .get()
+                )
+                .max_fragment_count;
+                let output = ArbOwnerPublic::getMaxStylusContractFragmentsCall::abi_encode_returns(
+                    &max_fragments,
+                );
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbOwnerPublic::getParentGasFloorPerTokenCall::SELECTOR => {
+                let _ = decode_call!(gas, ArbOwnerPublic::getParentGasFloorPerTokenCall, input);
+                let floor = try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .l1_pricing()
+                        .gas_floor_per_token()
+                        .get()
+                );
+                let output =
+                    ArbOwnerPublic::getParentGasFloorPerTokenCall::abi_encode_returns(&floor);
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbOwnerPublic::getCollectTipsCall::SELECTOR => {
+                let _ = decode_call!(gas, ArbOwnerPublic::getCollectTipsCall, input);
+                let collect = try_state!(
+                    gas,
+                    context.arb_state(Some(&mut gas), is_static).collect_tips()
+                );
+                let output = ArbOwnerPublic::getCollectTipsCall::abi_encode_returns(&collect);
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbOwnerPublic::getNativeTokenManagementFromCall::SELECTOR => {
+                let _ = decode_call!(gas, ArbOwnerPublic::getNativeTokenManagementFromCall, input);
+                let timestamp = try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .native_token_enabled_time()
+                        .get()
+                );
+                let output = ArbOwnerPublic::getNativeTokenManagementFromCall::abi_encode_returns(
+                    &timestamp,
+                );
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbOwnerPublic::getTransactionFilteringFromCall::SELECTOR => {
+                let _ = decode_call!(gas, ArbOwnerPublic::getTransactionFilteringFromCall, input);
+                if context.cfg().arbos_version() < 60 {
+                    interpreter_revert!(gas, Bytes::from("method requires ArbOS 60"));
+                }
+                let timestamp = try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .transaction_filtering_enabled_time()
+                        .get()
+                );
+                let output =
+                    ArbOwnerPublic::getTransactionFilteringFromCall::abi_encode_returns(&timestamp);
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbOwnerPublic::isTransactionFiltererCall::SELECTOR => {
+                let call = decode_call!(gas, ArbOwnerPublic::isTransactionFiltererCall, input);
+                if context.cfg().arbos_version() < 60 {
+                    interpreter_revert!(gas, Bytes::from("method requires ArbOS 60"));
+                }
+                let member = try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .transaction_filterers()
+                        .contains(call.filterer)
+                );
+                let output = ArbOwnerPublic::isTransactionFiltererCall::abi_encode_returns(&member);
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbOwnerPublic::getAllTransactionFilterersCall::SELECTOR => {
+                let _ = decode_call!(gas, ArbOwnerPublic::getAllTransactionFilterersCall, input);
+                if context.cfg().arbos_version() < 60 {
+                    interpreter_revert!(gas, Bytes::from("method requires ArbOS 60"));
+                }
+                let filterers = try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .transaction_filterers()
+                        .all()
+                );
+                let output =
+                    ArbOwnerPublic::getAllTransactionFilterersCall::abi_encode_returns(&filterers);
+                interpreter_return!(gas, Bytes::from(output));
+            }
+            ArbOwnerPublic::getFilteredFundsRecipientCall::SELECTOR => {
+                let _ = decode_call!(gas, ArbOwnerPublic::getFilteredFundsRecipientCall, input);
+                if context.cfg().arbos_version() < 60 {
+                    interpreter_revert!(gas, Bytes::from("method requires ArbOS 60"));
+                }
+                let recipient = try_state!(
+                    gas,
+                    context
+                        .arb_state(Some(&mut gas), is_static)
+                        .filtered_funds_recipient()
+                        .get()
+                );
+                let output =
+                    ArbOwnerPublic::getFilteredFundsRecipientCall::abi_encode_returns(&recipient);
                 interpreter_return!(gas, Bytes::from(output));
             }
             ArbOwnerPublic::rectifyChainOwnerCall::SELECTOR => {
@@ -265,11 +460,11 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbOwnerPublicPrecompil
                 try_state!(gas, arb_state.chain_owners().rectify(call.ownerToRectify));
 
                 let log = Log {
+                    address: address!("0x000000000000000000000000000000000000006b"),
                     data: ArbOwnerPublic::ChainOwnerRectified {
                         rectifiedOwner: call.ownerToRectify,
                     }
                     .into_log_data(),
-                    ..Default::default()
                 };
 
                 emit_event!(context, log, gas);

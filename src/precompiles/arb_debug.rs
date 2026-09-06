@@ -1,5 +1,7 @@
 use crate::{
-    ArbitrumContextTr, generate_state_mut_table,
+    ArbitrumContextTr,
+    config::ArbitrumConfigTr,
+    generate_state_mut_table,
     macros::{emit_event, interpreter_return, interpreter_revert},
     precompile_impl,
     precompiles::{
@@ -26,6 +28,12 @@ interface ArbDebug {
 
     /// @notice Emit events with values based on the args provided
     function events(bool flag, bytes32 value) external payable returns (address, uint256);
+
+    /// @notice Overwrite an existing contract's code
+    function overwriteContractCode(
+        address target,
+        bytes calldata newCode
+    ) external returns (bytes memory oldCode);
 
     /// @notice Tries (and fails) to emit logs in a view context
     function eventsView() external view;
@@ -68,6 +76,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbDebugPrecompile {
     const STATE_MUT_TABLE: &'static [([u8; 4], StateMutability)] = generate_state_mut_table! {
         ArbDebug => {
             becomeChainOwnerCall(NonPayable),
+            overwriteContractCodeCall(NonPayable),
             eventsCall(Payable),
             eventsViewCall(View),
             customRevertCall(Pure),
@@ -76,16 +85,28 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbDebugPrecompile {
         }
     };
 
+    fn method_version(selector: [u8; 4]) -> (u64, Option<u64>) {
+        if selector == ArbDebug::panicCall::SELECTOR {
+            (30, None)
+        } else {
+            (0, None)
+        }
+    }
+
     fn inner(
         context: &mut CTX,
         input: &[u8],
         _target_address: &Address,
         caller_address: Address,
-        _call_value: U256,
+        call_value: U256,
         is_static: bool,
         gas_limit: u64,
     ) -> Option<InterpreterResult> {
         let mut gas = Gas::new(gas_limit);
+        if !context.cfg().debug_mode() {
+            gas.spend_all();
+            interpreter_revert!(gas, Bytes::from("debug precompiles are disabled"));
+        }
         let selector = selector_or_revert!(gas, input);
 
         match selector {
@@ -105,34 +126,48 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbDebugPrecompile {
             ArbDebug::eventsCall::SELECTOR => {
                 let call = decode_call!(gas, ArbDebug::eventsCall, input);
 
-                events(
+                if let Some(error) = events(
                     context,
                     caller_address,
                     is_static,
-                    gas_limit,
+                    &mut gas,
                     call.flag,
                     B256::from(call.value),
-                );
+                ) {
+                    return Some(error);
+                }
 
                 interpreter_return!(
                     gas,
                     ArbDebug::eventsCall::abi_encode_returns(&ArbDebug::eventsReturn::from((
-                        address!("0x00000000000000000000000000000000000000ff"),
-                        U256::from(gas_limit),
+                        caller_address,
+                        call_value,
                     )))
+                );
+            }
+            ArbDebug::overwriteContractCodeCall::SELECTOR => {
+                let call = decode_call!(gas, ArbDebug::overwriteContractCodeCall, input);
+                let old_code = context
+                    .journal_mut()
+                    .code(call.target)
+                    .ok()
+                    .unwrap_or_default()
+                    .data;
+                context.journal_mut().set_code(
+                    call.target,
+                    // Nitro SetCode accepts arbitrary bytes; do not interpret
+                    // an 0xef01 prefix as an EIP-7702 designator here.
+                    revm::state::Bytecode::new_legacy(call.newCode.clone()),
+                );
+                interpreter_return!(
+                    gas,
+                    ArbDebug::overwriteContractCodeCall::abi_encode_returns(&old_code)
                 );
             }
             ArbDebug::eventsViewCall::SELECTOR => {
                 let _ = decode_call!(gas, ArbDebug::eventsViewCall, input);
 
-                events(
-                    context,
-                    caller_address,
-                    is_static,
-                    gas_limit,
-                    true,
-                    B256::ZERO,
-                )
+                events(context, caller_address, true, &mut gas, true, B256::ZERO)
             }
             ArbDebug::legacyErrorCall::SELECTOR => {
                 let _ = decode_call!(gas, ArbDebug::legacyErrorCall, input);
@@ -147,8 +182,11 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbDebugPrecompile {
             ArbDebug::customRevertCall::SELECTOR => {
                 let call = decode_call!(gas, ArbDebug::customRevertCall, input);
 
-                let error =
-                    ArbDebug::Custom::new((call.number, "example custom revert".to_string(), true));
+                let error = ArbDebug::Custom::new((
+                    call.number,
+                    "This spider family wards off bugs: /\\oo/\\ //\\(oo)//\\ /\\oo/\\".to_string(),
+                    true,
+                ));
 
                 interpreter_revert!(gas, error.abi_encode());
             }
@@ -161,16 +199,14 @@ fn events<CTX: ArbitrumContextTr>(
     context: &mut CTX,
     caller_address: Address,
     is_static: bool,
-    gas_limit: u64,
+    gas: &mut Gas,
     flag: bool,
     value: B256,
 ) -> Option<InterpreterResult> {
-    let mut gas = Gas::new(gas_limit);
-
     if is_static {
         return Some(InterpreterResult {
             result: InstructionResult::StateChangeDuringStaticCall,
-            gas,
+            gas: *gas,
             output: Bytes::default(),
         });
     }
@@ -181,7 +217,7 @@ fn events<CTX: ArbitrumContextTr>(
             address: address!("0x00000000000000000000000000000000000000ff"),
             data: ArbDebug::Basic { flag: !flag, value }.to_log_data(),
         },
-        gas
+        *gas
     );
 
     emit_event!(
@@ -192,13 +228,12 @@ fn events<CTX: ArbitrumContextTr>(
                 flag,
                 value,
                 not: !flag,
-                conn: address!("0x00000000000000000000000000000000000000aa"),
+                conn: address!("0x00000000000000000000000000000000000000ff"),
                 caller: caller_address
             }
             .to_log_data(),
         },
-        gas
+        *gas
     );
-
-    interpreter_return!(gas);
+    None
 }

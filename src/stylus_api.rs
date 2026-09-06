@@ -12,20 +12,19 @@ use revm::{
     },
     interpreter::{
         CallInput, CallInputs, CreateInputs, FrameInput, Gas, InputsImpl, InstructionResult,
-        InterpreterAction, InterpreterResult,
-        gas::{initcode_cost, warm_cold_cost},
-        interpreter::EthInterpreter,
+        InterpreterAction, InterpreterResult, gas::warm_cold_cost, interpreter::EthInterpreter,
         interpreter_action::FrameInit,
     },
-    primitives::{Address, Log, hardfork::SpecId},
+    primitives::{Address, Log, U256, hardfork::SpecId},
 };
 use tracing::{debug, trace, warn};
 
 use crate::{
     ArbitrumContextTr, ArbitrumEvm, Utf8OrHex, buffer,
+    config::ArbitrumConfigTr,
     local_context::ArbitrumLocalContextTr,
     state::{ArbState, ArbStateGetter},
-    stylus_executor::stylus_call_cost,
+    stylus_executor::{stylus_call_cost, stylus_page_limit_penalty},
 };
 
 pub(crate) type HostCallFunc = dyn Fn(
@@ -57,16 +56,74 @@ impl RequestHandler<VecReader> for StylusHandler {
     }
 }
 
-pub fn wasm_account_touch<CTX>(context: CTX, is_cold: bool, with_code: bool) -> u64
+pub fn wasm_account_touch<CTX>(_context: CTX, is_cold: bool, with_code: bool) -> u64
 where
     CTX: ArbitrumContextTr,
 {
     let code_cost = if with_code {
-        context.cfg().max_code_size() as u64 / 24576 * 700
+        // Foundry may lift REVM's deployment-size override to `usize::MAX` for
+        // test contracts. ArbOS still prices this host operation against the
+        // consensus default code-size limit.
+        700
     } else {
         0
     };
     code_cost + warm_cold_cost(is_cold)
+}
+
+const CALL_VALUE_TRANSFER_GAS: u64 = 9_000;
+const CALL_NEW_ACCOUNT_GAS: u64 = 25_000;
+const CALL_STIPEND: u64 = 2_300;
+
+fn stylus_call_base_cost(is_cold: bool, is_empty: bool, transfers_value: bool) -> u64 {
+    let mut cost = warm_cold_cost(is_cold);
+    if transfers_value {
+        cost = cost.saturating_add(CALL_VALUE_TRANSFER_GAS);
+        if is_empty {
+            cost = cost.saturating_add(CALL_NEW_ACCOUNT_GAS);
+        }
+    }
+    cost
+}
+
+fn stylus_call_gas(
+    gas_left: u64,
+    gas_requested: u64,
+    base_cost: u64,
+    transfers_value: bool,
+) -> Option<u64> {
+    if base_cost > gas_left {
+        return None;
+    }
+    let available = gas_left - base_cost;
+    let eip150_limit = (available / 64) * 63 + (available % 64) * 63 / 64;
+    let mut gas = min(eip150_limit, gas_requested);
+    if transfers_value {
+        gas = gas.saturating_add(CALL_STIPEND);
+    }
+    Some(gas)
+}
+
+fn stylus_call_scheme(
+    req_type: EvmApiMethod,
+    requested_value: U256,
+    parent_value: U256,
+) -> (revm::interpreter::CallScheme, revm::interpreter::CallValue) {
+    match req_type {
+        EvmApiMethod::DelegateCall => (
+            revm::interpreter::CallScheme::DelegateCall,
+            revm::interpreter::CallValue::Apparent(parent_value),
+        ),
+        EvmApiMethod::StaticCall => (
+            revm::interpreter::CallScheme::StaticCall,
+            revm::interpreter::CallValue::Transfer(U256::ZERO),
+        ),
+        EvmApiMethod::ContractCall => (
+            revm::interpreter::CallScheme::Call,
+            revm::interpreter::CallValue::Transfer(requested_value),
+        ),
+        _ => unreachable!("non-call request passed to handle_contract_call"),
+    }
 }
 
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
@@ -127,39 +184,34 @@ where
                 "Rejecting Stylus call with value in static context"
             );
             return (
-                Status::WriteProtection.into(),
+                // Nitro's call request protocol reports every EVM call error as
+                // status byte 2 and charges zero for this pre-frame rejection.
+                Status::OutOfGas.into(),
                 VecReader::new(vec![]),
-                ArbGas(gas_left),
+                ArbGas(0),
             );
         }
 
-        let gas_limit = if self
+        let account = self
             .ctx()
-            .cfg()
-            .spec()
-            .into()
-            //.into_eth_spec()
-            .is_enabled_in(SpecId::TANGERINE)
-        {
-            min(gas_left - gas_left / 64, gas_limit)
-        } else {
-            gas_limit
-        };
-
-        let mut gas = Gas::new(gas_limit);
-        if !gas.record_cost(warm_cold_cost(
-            self.ctx()
-                .journal_mut()
-                .load_account(bytecode_address)
-                .unwrap()
-                .is_cold,
-        )) {
+            .journal_mut()
+            .load_account(bytecode_address)
+            .unwrap();
+        let transfers_value = matches!(req_type, EvmApiMethod::ContractCall) && !value.is_zero();
+        let base_cost =
+            stylus_call_base_cost(account.is_cold, account.data.is_empty(), transfers_value);
+        let Some(call_gas_limit) = stylus_call_gas(gas_left, gas_limit, base_cost, transfers_value)
+        else {
             return (
                 Status::OutOfGas.into(),
                 VecReader::new(vec![]),
-                ArbGas(gas.spent()),
+                ArbGas(gas_left),
             );
-        }
+        };
+
+        let mut gas = Gas::new(call_gas_limit);
+
+        let (scheme, call_value) = stylus_call_scheme(req_type, value, input.call_value);
 
         let first_frame_input = FrameInput::Call(Box::new(CallInputs {
             input: CallInput::Bytes(calldata),
@@ -168,8 +220,8 @@ where
             bytecode_address,
             target_address,
             caller,
-            value: revm::interpreter::CallValue::Transfer(value),
-            scheme: revm::interpreter::CallScheme::Call,
+            value: call_value,
+            scheme,
             is_static,
             known_bytecode: None,
         }));
@@ -223,7 +275,11 @@ where
                     "Stylus host call finished"
                 );
 
-                return (status.into(), VecReader::new(output), ArbGas(gas.spent()));
+                return (
+                    status.into(),
+                    VecReader::new(output),
+                    ArbGas(base_cost.saturating_add(gas.spent())),
+                );
             }
         }
 
@@ -237,7 +293,7 @@ where
         (
             Status::Failure.into(),
             VecReader::new(vec![]),
-            ArbGas(gas.spent()),
+            ArbGas(base_cost.saturating_add(gas.spent())),
         )
     }
 
@@ -306,7 +362,6 @@ where
             return error_response;
         }
 
-        let mut gas_cost = 0;
         let len = init_code.len();
 
         if len != 0 && spec.is_enabled_in(SpecId::SHANGHAI) {
@@ -321,23 +376,21 @@ where
                 );
                 return error_response;
             }
-            gas_cost = initcode_cost(len);
         }
 
-        let scheme = if is_create_2 {
-            if let Some(check_cost) = revm::interpreter::gas::create2_cost(len)
-                .and_then(|cost| gas_cost.checked_add(cost))
-            {
-                gas_cost = check_cost;
+        let (scheme, gas_cost) = if is_create_2 {
+            if let Some(cost) = revm::interpreter::gas::create2_cost(len) {
+                (
+                    CreateScheme::Create2 {
+                        salt: salt.unwrap(),
+                    },
+                    cost,
+                )
             } else {
                 return error_response;
-            };
-            CreateScheme::Create2 {
-                salt: salt.unwrap(),
             }
         } else {
-            gas_cost += revm::interpreter::gas::CREATE;
-            CreateScheme::Create
+            (CreateScheme::Create, revm::interpreter::gas::CREATE)
         };
 
         if gas_remaining < gas_cost {
@@ -351,19 +404,19 @@ where
             return (
                 [vec![0x00], "out of gas".as_bytes().to_vec()].concat(),
                 VecReader::new(vec![]),
-                ArbGas(0),
+                ArbGas(gas_remaining),
             );
         }
 
-        let gas_limit = gas_remaining - gas_cost;
-
+        let gas_after_base = gas_remaining - gas_cost;
         let gas_stipend = if spec.is_enabled_in(SpecId::TANGERINE) {
-            gas_limit / 64
+            gas_after_base / 64
         } else {
             0
         };
 
-        let mut gas = Gas::new(gas_limit);
+        let mut gas = Gas::new(gas_remaining);
+        _ = gas.record_cost(gas_cost);
         _ = gas.record_cost(gas_stipend);
 
         let first_frame_input = FrameInput::Create(Box::new(CreateInputs {
@@ -399,6 +452,7 @@ where
 
             if let Ok(FrameResult::Create(create_outcome)) = result {
                 if InstructionResult::Revert == *create_outcome.instruction_result() {
+                    gas.erase_cost(create_outcome.gas().remaining().saturating_add(gas_stipend));
                     let output = create_outcome.output().to_vec();
                     debug!(
                         target: "arbos-revm::stylus-api",
@@ -410,15 +464,16 @@ where
                         "Stylus create reverted"
                     );
                     return (
-                        [vec![0x00], output].concat(),
-                        VecReader::new(vec![]),
+                        [vec![0x01], Address::ZERO.to_vec()].concat(),
+                        VecReader::new(output),
                         ArbGas(gas.spent()),
                     );
                 }
 
-                if let Some(address) = create_outcome.address {
-                    gas.erase_cost(create_outcome.gas().remaining() + gas_stipend);
-
+                gas.erase_cost(create_outcome.gas().remaining().saturating_add(gas_stipend));
+                if create_outcome.instruction_result().is_ok()
+                    && let Some(address) = create_outcome.address
+                {
                     debug!(
                         target: "arbos-revm::stylus-api",
                         target_address = %input.target_address,
@@ -434,6 +489,12 @@ where
                         ArbGas(gas.spent()),
                     );
                 }
+
+                return (
+                    [vec![0x01], Address::ZERO.to_vec()].concat(),
+                    VecReader::new(vec![]),
+                    ArbGas(gas.spent()),
+                );
             }
         }
 
@@ -645,15 +706,31 @@ where
 
             EvmApiMethod::AccountCode => {
                 let address = buffer::take_address(&mut data);
+                let gas_left = buffer::take_u64(&mut data);
+
+                // Load account info (without code) to determine warm/cold and compute gas
+                let account = context.load_account_code_hash(address).unwrap();
+                let gas = wasm_account_touch(&mut *context, account.is_cold, true);
+
+                // If not enough gas, return empty code (matching nitro behavior)
+                if gas_left < gas {
+                    return (vec![], VecReader::new(vec![]), ArbGas(gas));
+                }
+
                 let code = context.load_account_code(address).unwrap();
-                let gas = wasm_account_touch(context, code.is_cold, true);
                 (vec![], VecReader::new(code.to_vec()), ArbGas(gas))
             }
 
             EvmApiMethod::AccountCodeHash => {
                 let address = buffer::take_address(&mut data);
-                let code_hash = context.load_account_code_hash(address).unwrap();
-                let gas = wasm_account_touch(context, code_hash.is_cold, false);
+                // Use load_account to get the raw code_hash (KECCAK_EMPTY for no-code
+                // accounts) instead of Host::load_account_code_hash which applies
+                // EIP-1052 EXTCODEHASH semantics (B256::ZERO for empty accounts).
+                // The Stylus host wraps StateDB.GetCodeHash, not the EXTCODEHASH opcode.
+                let account = context.journal_mut().load_account(address).unwrap();
+                let is_cold = account.is_cold;
+                let code_hash = account.data.info.code_hash;
+                let gas = wasm_account_touch(&mut *context, is_cold, false);
                 (code_hash.to_vec(), VecReader::new(vec![]), ArbGas(gas))
             }
 
@@ -674,6 +751,12 @@ where
 
                 let cost = stylus_call_cost(count, open, ever, free_pages, page_gas);
                 context.local_mut().add_stylus_pages_open(count);
+                let new_open = context.local().stylus_pages_open();
+                let cost = cost.saturating_add(stylus_page_limit_penalty(
+                    context.cfg().arbos_version(),
+                    stylus_params.page_limit,
+                    new_open,
+                ));
                 (Status::Success.into(), VecReader::new(vec![]), ArbGas(cost))
             }
 
@@ -713,5 +796,49 @@ impl From<Status> for Vec<u8> {
             Status::OutOfGas => vec![2],
             Status::WriteProtection => vec![3],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stylus_call_cost_matches_nitro_vectors() {
+        assert_eq!(stylus_call_base_cost(false, false, false), 100);
+        assert_eq!(stylus_call_base_cost(true, false, false), 2_600);
+        assert_eq!(stylus_call_base_cost(false, false, true), 9_100);
+        assert_eq!(stylus_call_base_cost(true, true, true), 36_600);
+
+        // Nitro applies EIP-150 after deducting the complete base cost.
+        assert_eq!(
+            stylus_call_gas(100_000, u64::MAX, 36_600, true),
+            Some(62_409 + CALL_STIPEND)
+        );
+        assert_eq!(stylus_call_gas(36_599, u64::MAX, 36_600, true), None);
+
+        // The stipend is added after the requested-gas cap.
+        assert_eq!(stylus_call_gas(100_000, 7_000, 9_100, true), Some(9_300));
+        assert_eq!(stylus_call_gas(100_000, 7_000, 100, false), Some(7_000));
+    }
+
+    #[test]
+    fn stylus_call_schemes_preserve_nitro_value_semantics() {
+        use revm::interpreter::{CallScheme, CallValue};
+
+        let requested = U256::from(7);
+        let parent = U256::from(11);
+        assert_eq!(
+            stylus_call_scheme(EvmApiMethod::ContractCall, requested, parent),
+            (CallScheme::Call, CallValue::Transfer(requested))
+        );
+        assert_eq!(
+            stylus_call_scheme(EvmApiMethod::DelegateCall, U256::ZERO, parent),
+            (CallScheme::DelegateCall, CallValue::Apparent(parent))
+        );
+        assert_eq!(
+            stylus_call_scheme(EvmApiMethod::StaticCall, U256::ZERO, parent),
+            (CallScheme::StaticCall, CallValue::Transfer(U256::ZERO))
+        );
     }
 }

@@ -15,7 +15,7 @@ use revm::{
     },
 };
 
-use crate::{ArbitrumContextTr, constants::ARBOS_STATE_ADDRESS};
+use crate::{ArbitrumContextTr, config::ArbitrumConfigTr, constants::ARBOS_STATE_ADDRESS};
 use tracing::trace;
 
 sol! {
@@ -31,10 +31,13 @@ pub enum ArbosStateError {
     DecompressError(String),
     ProgramNotActivated,
     ProgramNeedsUpgrade(u16, u16),
-    ProgramExpired(u32),
+    ProgramExpired(u64),
     RectifyMappingNotOwner,
     RectifyMappingNoChange,
     Context(String),
+    UnsupportedArbosVersion(u64),
+    ArbosVersionDowngrade { current: u64, requested: u64 },
+    UnexpectedStylusVersion { current: u16, requested: u16 },
 }
 
 impl Display for ArbosStateError {
@@ -71,6 +74,15 @@ impl Display for ArbosStateError {
             Self::Context(err) => {
                 write!(f, "Context error: {err}")
             }
+            Self::UnsupportedArbosVersion(version) => {
+                write!(f, "unsupported ArbOS version {version}")
+            }
+            Self::ArbosVersionDowngrade { current, requested } => {
+                write!(f, "cannot downgrade ArbOS from {current} to {requested}")
+            }
+            Self::UnexpectedStylusVersion { current, requested } => {
+                write!(f, "cannot upgrade Stylus from {current} to {requested}")
+            }
         }
     }
 }
@@ -91,11 +103,9 @@ impl From<ArbosStateError> for Bytes {
             }
             .abi_encode()
             .into(),
-            ArbosStateError::ProgramExpired(age) => ProgramExpired {
-                ageInSeconds: age as u64,
+            ArbosStateError::ProgramExpired(age) => {
+                ProgramExpired { ageInSeconds: age }.abi_encode().into()
             }
-            .abi_encode()
-            .into(),
             _ => Self::from(error.to_string().into_bytes()),
         }
     }
@@ -217,8 +227,10 @@ pub fn map_address(storage_key: &B256, key: &B256) -> B256 {
 pub type StorageBackedU256<'a, CTX> = StorageBacked<'a, CTX, U256>;
 pub type StorageBackedU32<'a, CTX> = StorageBacked<'a, CTX, u32>;
 pub type StorageBackedU64<'a, CTX> = StorageBacked<'a, CTX, u64>;
+pub type StorageBackedI64<'a, CTX> = StorageBacked<'a, CTX, i64>;
 pub type StorageBackedI256<'a, CTX> = StorageBacked<'a, CTX, I256>;
 pub type StorageBackedAddress<'a, CTX> = StorageBacked<'a, CTX, Address>;
+pub type StorageBackedAddressOrNil<'a, CTX> = StorageBacked<'a, CTX, Option<Address>>;
 pub type StorageBackedB256<'a, CTX> = StorageBacked<'a, CTX, B256>;
 
 /// Anything that can round-trip through a single storage word (U256).
@@ -244,6 +256,25 @@ where
 
     fn into_word(self) -> U256 {
         self.to::<U256>()
+    }
+}
+
+impl StorageWord for Option<Address> {
+    fn from_word(word: U256) -> Self {
+        // Nitro reserves 2^255 to distinguish a nil retry target (contract
+        // creation) from the real zero address.
+        if word == (U256::ONE << 255) {
+            None
+        } else {
+            Some(Address::from_word(word.into()))
+        }
+    }
+
+    fn into_word(self) -> U256 {
+        match self {
+            Some(address) => U256::from_be_slice(address.as_slice()),
+            None => U256::ONE << 255,
+        }
     }
 }
 
@@ -282,6 +313,29 @@ where
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod storage_word_tests {
+    use super::*;
+    use revm::primitives::address;
+
+    #[test]
+    fn optional_address_uses_nitro_nil_sentinel() {
+        assert_eq!(Option::<Address>::into_word(None), U256::ONE << 255);
+        assert_eq!(Option::<Address>::from_word(U256::ONE << 255), None);
+
+        let zero = Some(Address::ZERO);
+        assert_eq!(zero.into_word(), U256::ZERO);
+        assert_eq!(Option::<Address>::from_word(U256::ZERO), zero);
+
+        let address = address!("1234567890123456789012345678901234567890");
+        assert_eq!(
+            Option::<Address>::from_word(Some(address).into_word()),
+            Some(address)
+        );
+    }
+}
+
 impl StorageWord for Address {
     fn from_word(word: U256) -> Self {
         let b256: B256 = B256::from(FixedBytes(word.to_be_bytes()));
@@ -311,6 +365,18 @@ impl StorageWord for u64 {
 
     fn into_word(self) -> U256 {
         U256::from(self)
+    }
+}
+
+impl StorageWord for i64 {
+    fn from_word(word: U256) -> Self {
+        word.as_limbs()[0] as i64
+    }
+
+    fn into_word(self) -> U256 {
+        I256::try_from(self)
+            .expect("i64 always fits I256")
+            .into_raw()
     }
 }
 
@@ -366,7 +432,7 @@ where
 
         self.context
             .sstore(ARBOS_STATE_ADDRESS, self.slot.into(), value)
-            .unwrap();
+            .ok_or_else(|| ArbosStateError::Context("ArbOS state sstore failed".into()))?;
 
         // Mark ARBOS_STATE_ADDRESS as touched so CacheDB::commit persists its storage changes.
         // Without this, sstore modifies the journal but the account remains untouched,
@@ -441,6 +507,27 @@ where
         Ok(out)
     }
 
+    /// Clears the enumerable list while preserving the reverse mapping.
+    ///
+    /// Nitro used this at ArbOS 11 so owners could repair reverse indices that
+    /// older versions could leave stale.
+    pub fn clear_list(&mut self) -> Result<(), ArbosStateError> {
+        let size = self.size()?;
+        for index in 1..=size {
+            let slot = map_address(&self.slot, &B256::from(U256::from(index)));
+            StorageBackedAddress::new(self.context, self.gas.as_deref_mut(), self.is_static, slot)
+                .set(Address::ZERO)?;
+        }
+        let size_slot = self.size_slot();
+        StorageBackedU256::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            size_slot,
+        )
+        .set(U256::ZERO)
+    }
+
     pub fn contains(&mut self, address: Address) -> Result<bool, ArbosStateError> {
         let by_address = substorage(&self.slot, &[0]);
         let slot = map_address(&by_address, &B256::left_padding_from(address.as_slice()));
@@ -487,6 +574,7 @@ where
     }
 
     pub fn remove(&mut self, address: &Address) -> Result<(), ArbosStateError> {
+        let arbos_version = self.context.cfg().arbos_version();
         let by_address = substorage(&self.slot, &[0]);
         let slot = StorageBackedU256::new(
             self.context,
@@ -530,14 +618,17 @@ where
             )
             .set(at_size)?;
 
-            // update by-address index for moved address
-            StorageBackedU256::new(
-                self.context,
-                self.gas.as_deref_mut(),
-                self.is_static,
-                map_address(&by_address, &B256::left_padding_from(at_size.as_slice())),
-            )
-            .set(U256::from(slot as u64))?;
+            // ArbOS before version 11 historically failed to repair the
+            // reverse index of the member moved into the vacated slot.
+            if arbos_version >= 11 {
+                StorageBackedU256::new(
+                    self.context,
+                    self.gas.as_deref_mut(),
+                    self.is_static,
+                    map_address(&by_address, &B256::left_padding_from(at_size.as_slice())),
+                )
+                .set(U256::from(slot as u64))?;
+            }
         }
 
         // clear last slot
@@ -566,7 +657,7 @@ where
     }
 
     pub fn rectify(&mut self, address: Address) -> Result<(), ArbosStateError> {
-        if self.contains(address)? {
+        if !self.contains(address)? {
             return Err(ArbosStateError::RectifyMappingNotOwner);
         }
 
@@ -641,10 +732,11 @@ where
 
         let size = size.to::<usize>();
 
-        let mut out = Vec::with_capacity(size as usize);
-        let mut offset = 0;
-        while offset < size {
-            let chunk_slot = map_address(&self.slot, &B256::from(U256::from(offset + 1)));
+        let mut out = Vec::with_capacity(size);
+        let mut bytes_left = size;
+        let mut word_offset = 1usize;
+        while bytes_left >= 32 {
+            let chunk_slot = map_address(&self.slot, &B256::from(U256::from(word_offset)));
             let chunk = StorageBackedB256::new(
                 self.context,
                 self.gas.as_deref_mut(),
@@ -652,16 +744,40 @@ where
                 chunk_slot,
             )
             .get()?;
-
-            let chunk_bytes = chunk.to_vec();
-            let to_copy = std::cmp::min(size - offset, 32);
-            out.extend_from_slice(&chunk_bytes[..to_copy as usize]);
-            offset += to_copy;
+            out.extend_from_slice(chunk.as_slice());
+            bytes_left -= 32;
+            word_offset += 1;
         }
+
+        // Nitro always reads the trailing word. `common.BytesToHash` stores a
+        // partial word right-aligned, so only its final `bytes_left` bytes are
+        // part of the value.
+        let chunk_slot = map_address(&self.slot, &B256::from(U256::from(word_offset)));
+        let chunk = StorageBackedB256::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            chunk_slot,
+        )
+        .get()?;
+        out.extend_from_slice(&chunk.as_slice()[32 - bytes_left..]);
         Ok(out)
     }
 
+    pub fn size(&mut self) -> Result<u64, ArbosStateError> {
+        let size_slot = map_address(&self.slot, &B256::ZERO);
+        StorageBackedU64::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            size_slot,
+        )
+        .get()
+    }
+
     pub fn set(&mut self, value: &[u8]) -> Result<(), ArbosStateError> {
+        self.clear()?;
+
         let size_slot = map_address(&self.slot, &B256::from(U256::from(0u64)));
         StorageBackedU256::new(
             self.context,
@@ -671,24 +787,67 @@ where
         )
         .set(U256::from(value.len() as u64))?;
 
-        let mut offset = 0;
-        while offset < value.len() {
-            let chunk_slot = map_address(&self.slot, &B256::from(U256::from(offset + 1)));
-
-            let to_copy = std::cmp::min(value.len() - offset, 32);
-            let mut chunk_bytes = [0u8; 32];
-            chunk_bytes[..to_copy].copy_from_slice(&value[offset..(offset + to_copy)]);
-            let chunk = B256::from_slice(&chunk_bytes);
+        let mut remaining = value;
+        let mut word_offset = 1usize;
+        while remaining.len() >= 32 {
+            let chunk_slot = map_address(&self.slot, &B256::from(U256::from(word_offset)));
             StorageBackedB256::new(
                 self.context,
                 self.gas.as_deref_mut(),
                 self.is_static,
                 chunk_slot,
             )
-            .set(chunk)?;
-            offset += to_copy;
+            .set(B256::from_slice(&remaining[..32]))?;
+            remaining = &remaining[32..];
+            word_offset += 1;
         }
-        Ok(())
+
+        // Go's common.BytesToHash right-aligns short input. Nitro also writes
+        // this word when the value is empty or an exact multiple of 32.
+        let mut trailing = [0u8; 32];
+        trailing[32 - remaining.len()..].copy_from_slice(remaining);
+        let chunk_slot = map_address(&self.slot, &B256::from(U256::from(word_offset)));
+        StorageBackedB256::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            chunk_slot,
+        )
+        .set(B256::from(trailing))
+    }
+
+    pub fn clear(&mut self) -> Result<(), ArbosStateError> {
+        let size_slot = map_address(&self.slot, &B256::ZERO);
+        let mut bytes_left = StorageBackedU256::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            size_slot,
+        )
+        .get()?
+        .to::<usize>();
+
+        let mut word_offset = 1usize;
+        while bytes_left > 0 {
+            let chunk_slot = map_address(&self.slot, &B256::from(U256::from(word_offset)));
+            StorageBackedB256::new(
+                self.context,
+                self.gas.as_deref_mut(),
+                self.is_static,
+                chunk_slot,
+            )
+            .set(B256::ZERO)?;
+            word_offset += 1;
+            bytes_left = bytes_left.saturating_sub(32);
+        }
+
+        StorageBackedU256::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            size_slot,
+        )
+        .set(U256::ZERO)
     }
 }
 
@@ -720,17 +879,38 @@ where
         }
     }
 
-    fn head_slot(&self) -> B256 {
+    fn put_slot(&self) -> B256 {
         map_address(&self.slot, &B256::from(U256::from(0u64)))
     }
 
-    fn tail_slot(&self) -> B256 {
+    fn get_slot(&self) -> B256 {
         map_address(&self.slot, &B256::from(U256::from(1u64)))
     }
 
+    /// Nitro reserves offsets 0 and 1 for the put/get cursors, so the first
+    /// queue element is stored at offset 2.
+    pub fn initialize(&mut self) -> Result<(), ArbosStateError> {
+        let head_slot = self.put_slot();
+        StorageBackedU64::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            head_slot,
+        )
+        .set(2)?;
+        let tail_slot = self.get_slot();
+        StorageBackedU64::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            tail_slot,
+        )
+        .set(2)
+    }
+
     pub fn size(&mut self) -> Result<u64, ArbosStateError> {
-        let head_slot = self.head_slot();
-        let tail_slot = self.tail_slot();
+        let head_slot = self.get_slot();
+        let tail_slot = self.put_slot();
 
         let head = StorageBackedU64::new(
             self.context,
@@ -750,8 +930,8 @@ where
     }
 
     pub fn peek(&mut self) -> Result<Option<U256>, ArbosStateError> {
-        let head_slot = self.head_slot();
-        let tail_slot = self.tail_slot();
+        let head_slot = self.get_slot();
+        let tail_slot = self.put_slot();
 
         let head = StorageBackedU64::new(
             self.context,
@@ -784,8 +964,8 @@ where
     }
 
     pub fn pop(&mut self) -> Result<Option<U256>, ArbosStateError> {
-        let head_slot = self.head_slot();
-        let tail_slot = self.tail_slot();
+        let head_slot = self.get_slot();
+        let tail_slot = self.put_slot();
 
         let head = StorageBackedU64::new(
             self.context,
@@ -814,6 +994,14 @@ where
         )
         .get()?;
 
+        StorageBackedU256::new(
+            self.context,
+            self.gas.as_deref_mut(),
+            self.is_static,
+            elem_slot,
+        )
+        .set(U256::ZERO)?;
+
         // increment head
         let new_head = head.saturating_add(1);
         StorageBackedU64::new(
@@ -827,7 +1015,7 @@ where
     }
 
     pub fn push(&mut self, value: U256) -> Result<(), ArbosStateError> {
-        let tail_slot = self.tail_slot();
+        let tail_slot = self.put_slot();
 
         let tail = StorageBackedU64::new(
             self.context,

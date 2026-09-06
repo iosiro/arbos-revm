@@ -357,6 +357,31 @@ fn test_e2e_gas_limit_at_ink_overflow_boundary() {
     }
 }
 
+#[test]
+fn test_e2e_gas_used_not_inflated_with_u64_max_gas_limit() {
+    let mut context = setup_context_with_arbos_state();
+    let wat = include_bytes!("../test-data/add.wat");
+    let program_address = deploy_wat_program(&mut context, wat);
+    let caller = Address::repeat_byte(0x01);
+    fund_account(&mut context, caller, U256::MAX);
+    let mut evm = create_evm(context);
+
+    let baseline = execute_tx(
+        &mut evm,
+        create_call_tx(program_address, vec![], 10_000_000),
+    )
+    .gas_used();
+    let mut huge_tx = create_call_tx(program_address, vec![], u64::MAX);
+    huge_tx.nonce = 1;
+    let huge = execute_tx(&mut evm, huge_tx).gas_used();
+
+    assert!(huge < 1_000_000, "gas use was inflated to {huge}");
+    assert!(
+        huge <= baseline.saturating_mul(2),
+        "huge-limit gas {huge} exceeded twice baseline {baseline}"
+    );
+}
+
 /// Test that Stylus program properly runs out of ink during heavy computation.
 #[test]
 fn test_e2e_stylus_out_of_ink_during_execution() {

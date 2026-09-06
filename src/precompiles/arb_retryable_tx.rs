@@ -1,7 +1,7 @@
 use alloy_sol_types::{SolCall, SolError, sol};
 use revm::{
-    context::{Block, JournalTr},
-    interpreter::{Gas, InterpreterResult, gas::ISTANBUL_SLOAD_GAS},
+    context::{Block, Cfg, JournalTr},
+    interpreter::{Gas, InterpreterResult},
     precompile::PrecompileId,
     primitives::{
         Address, B256, Bytes, Log, U256, address, alloy_primitives::IntoLogData, keccak256,
@@ -11,6 +11,7 @@ use revm::{
 use crate::{
     ArbitrumContextTr,
     config::ArbitrumConfigTr,
+    constants::ARBOS_VERSION_STYLUS_CONTRACT_LIMIT,
     generate_state_mut_table,
     macros::{emit_event, interpreter_return, interpreter_revert},
     precompile_impl,
@@ -18,6 +19,7 @@ use crate::{
         ArbPrecompileLogic, ExtendedPrecompile, StateMutability, decode_call, selector_or_revert,
     },
     state::{ArbState, ArbStateGetter, try_state, types::StorageBackedTr},
+    transaction::arbitrum_retry_tx_hash,
     try_record_cost,
 };
 
@@ -169,6 +171,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
         let mut gas = Gas::new(gas_limit);
 
         let selector = selector_or_revert!(gas, input);
+        let arbos_version = context.cfg().arbos_version();
 
         match selector {
             ArbRetryableTx::cancelCall::SELECTOR => {
@@ -181,8 +184,17 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
                     let mut retryable = arb_state.retryable(call.ticketId);
                     let timeout = try_state!(gas, retryable.timeout().get());
 
-                    if timeout == 0 || timeout < current_time {
-                        if context.cfg().arbos_version() >= 3 {
+                    let windows_left = if timeout != 0
+                        && timeout < current_time
+                        && arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
+                    {
+                        try_state!(gas, retryable.timeout_windows_left().get())
+                    } else {
+                        0
+                    };
+
+                    if retryable_is_expired(timeout, windows_left, current_time, arbos_version) {
+                        if arbos_version >= 3 {
                             let output = ArbRetryableTx::NoTicketWithID {}.abi_encode();
 
                             interpreter_revert!(gas, Bytes::from(output));
@@ -207,22 +219,42 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
 
                 let escrow_balance = context.balance(escrow_address).unwrap_or_default().data;
 
-                if !escrow_balance.is_zero()
-                    && let Some(error) = context
-                        .journal_mut()
-                        .transfer(escrow_address, beneficiary, escrow_balance)
-                        .unwrap()
-                {
-                    return Some(InterpreterResult {
-                        result: error.into(),
-                        gas,
-                        output: Bytes::default(),
-                    });
+                if !escrow_balance.is_zero() {
+                    match context.journal_mut().transfer(
+                        escrow_address,
+                        beneficiary,
+                        escrow_balance,
+                    ) {
+                        Ok(Some(error)) => {
+                            return Some(InterpreterResult {
+                                result: error.into(),
+                                gas,
+                                output: Bytes::default(),
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            gas.spend_all();
+                            interpreter_revert!(gas, Bytes::new());
+                        }
+                    }
                 }
 
                 let mut arb_state = context.arb_state(Some(&mut gas), is_static);
                 let mut retryable = arb_state.retryable(call.ticketId);
                 try_state!(gas, retryable.clear());
+
+                emit_event!(
+                    context,
+                    Log {
+                        address: *target_address,
+                        data: ArbRetryableTx::Canceled {
+                            ticketId: call.ticketId,
+                        }
+                        .into_log_data(),
+                    },
+                    gas
+                );
 
                 let output = ArbRetryableTx::cancelCall::abi_encode_returns(
                     &ArbRetryableTx::cancelReturn {},
@@ -238,8 +270,17 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
                     let mut arb_state = context.arb_state(Some(&mut gas), is_static);
                     let mut retryable = arb_state.retryable(call.ticketId);
                     let timeout = try_state!(gas, retryable.timeout().get());
-                    if timeout == 0 || timeout < current_time {
-                        if context.cfg().arbos_version() >= 3 {
+                    let windows_left = if timeout != 0
+                        && timeout < current_time
+                        && arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
+                    {
+                        try_state!(gas, retryable.timeout_windows_left().get())
+                    } else {
+                        0
+                    };
+
+                    if retryable_is_expired(timeout, windows_left, current_time, arbos_version) {
+                        if arbos_version >= 3 {
                             let output = ArbRetryableTx::NoTicketWithID {}.abi_encode();
 
                             interpreter_revert!(gas, Bytes::from(output));
@@ -280,8 +321,9 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
                     (timeout, windows_left)
                 };
 
-                if timeout == 0 || timeout < current_time {
-                    if context.cfg().arbos_version() >= 3 {
+                let calculated_timeout = calculate_retryable_timeout(timeout, windows_left);
+                if retryable_is_expired(timeout, windows_left, current_time, arbos_version) {
+                    if arbos_version >= 3 {
                         let output = ArbRetryableTx::NoTicketWithID {}.abi_encode();
 
                         interpreter_revert!(gas, Bytes::from(output));
@@ -289,8 +331,6 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
 
                     interpreter_revert!(gas, Bytes::from("ticketId not found"));
                 }
-
-                let calculated_timeout = calculate_retryable_timeout(timeout, windows_left);
 
                 let output = ArbRetryableTx::getTimeoutCall::abi_encode_returns(&U256::from(
                     calculated_timeout,
@@ -312,8 +352,8 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
                     (timeout, windows_left)
                 };
 
-                if timeout == 0 || timeout < current_time {
-                    if context.cfg().arbos_version() >= 3 {
+                if retryable_is_expired(timeout, windows_left, current_time, arbos_version) {
+                    if arbos_version >= 3 {
                         let output = ArbRetryableTx::NoTicketWithID {}.abi_encode();
 
                         interpreter_revert!(gas, Bytes::from(output));
@@ -324,8 +364,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
 
                 let calldata_len = {
                     let mut arb_state = context.arb_state(Some(&mut gas), is_static);
-                    try_state!(gas, arb_state.retryable(call.ticketId).calldata().get()).len()
-                        as u64
+                    try_state!(gas, arb_state.retryable(call.ticketId).calldata().size())
                 };
 
                 let nbytes = retryable_size_bytes(calldata_len);
@@ -385,29 +424,60 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
 
                 let current_time = context.block().timestamp().saturating_to::<u64>();
 
-                let (timeout, calldata_len) = {
+                // RetryableSizeBytes first opens the ticket and reads only its
+                // calldata length. Keep this separate from the second open and
+                // MakeTx below because both the read ordering and gas donation
+                // are consensus-visible in Nitro.
+                let calldata_size = {
                     let mut arb_state = context.arb_state(Some(&mut gas), is_static);
                     let mut retryable = arb_state.retryable(call.ticketId);
                     let timeout = try_state!(gas, retryable.timeout().get());
-                    let calldata_len = try_state!(gas, retryable.calldata().get()).len() as u64;
-
-                    (timeout, calldata_len)
+                    let windows_left = if timeout != 0
+                        && timeout < current_time
+                        && arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
+                    {
+                        try_state!(gas, retryable.timeout_windows_left().get())
+                    } else {
+                        0
+                    };
+                    if retryable_is_expired(timeout, windows_left, current_time, arbos_version) {
+                        if arbos_version >= 3 {
+                            let output = ArbRetryableTx::NoTicketWithID {}.abi_encode();
+                            interpreter_revert!(gas, Bytes::from(output));
+                        }
+                        interpreter_revert!(gas, Bytes::from("ticketId not found"));
+                    }
+                    try_state!(gas, retryable.calldata().size())
                 };
 
-                if timeout == 0 || timeout < current_time {
-                    if context.cfg().arbos_version() >= 3 {
-                        let output = ArbRetryableTx::NoTicketWithID {}.abi_encode();
-
-                        interpreter_revert!(gas, Bytes::from(output));
-                    }
-
-                    interpreter_revert!(gas, Bytes::from("ticketId not found"));
-                }
-
                 // Charge for accessing retryable storage slots.
-                let byte_count = retryable_size_bytes(calldata_len);
+                let byte_count = retryable_size_bytes(calldata_size);
                 let write_words = byte_count.div_ceil(32);
-                try_record_cost!(gas, ISTANBUL_SLOAD_GAS.saturating_mul(write_words));
+                // Nitro deliberately uses the legacy Frontier SLOAD constant
+                // (50) to price the retryable storage words copied into the
+                // scheduled retry transaction.
+                try_record_cost!(gas, 50u64.saturating_mul(write_words));
+
+                {
+                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
+                    let mut retryable = arb_state.retryable(call.ticketId);
+                    let timeout = try_state!(gas, retryable.timeout().get());
+                    let windows_left = if timeout != 0
+                        && timeout < current_time
+                        && arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
+                    {
+                        try_state!(gas, retryable.timeout_windows_left().get())
+                    } else {
+                        0
+                    };
+                    if retryable_is_expired(timeout, windows_left, current_time, arbos_version) {
+                        if arbos_version >= 3 {
+                            let output = ArbRetryableTx::NoTicketWithID {}.abi_encode();
+                            interpreter_revert!(gas, Bytes::from(output));
+                        }
+                        interpreter_revert!(gas, Bytes::from("ticketId not found"));
+                    }
+                }
 
                 let nonce = {
                     let mut arb_state = context.arb_state(Some(&mut gas), is_static);
@@ -417,19 +487,55 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
                     num_tries
                 };
 
-                // Derive a deterministic hash for the scheduled retry attempt.
-                let retry_tx_hash = {
-                    let mut hash_input =
-                        Vec::with_capacity(call.ticketId.as_slice().len() + 8 + 20);
-                    hash_input.extend_from_slice(call.ticketId.as_slice());
-                    hash_input.extend_from_slice(&nonce.to_be_bytes());
-                    hash_input.extend_from_slice(caller_address.as_slice());
-                    keccak256(&hash_input)
+                let (from, to, callvalue, calldata) = {
+                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
+                    let mut retryable = arb_state.retryable(call.ticketId);
+                    let from = try_state!(gas, retryable.from().get());
+                    let to = try_state!(gas, retryable.to().get());
+                    let callvalue = try_state!(gas, retryable.callvalue().get());
+                    let calldata = Bytes::from(try_state!(gas, retryable.calldata().get()));
+                    (from, to, callvalue, calldata)
                 };
 
-                let gas_to_donate = gas.remaining();
                 let max_refund = U256::MAX;
                 let submission_fee_refund = U256::ZERO;
+                let backlog_update_cost = {
+                    let mut arb_state = context.arb_state(None, is_static);
+                    try_state!(
+                        gas,
+                        arb_state.l2_pricing().backlog_update_cost(arbos_version)
+                    )
+                };
+                let event_cost = revm::interpreter::gas::log_cost(4, 4 * 32)
+                    .expect("RedeemScheduled log dimensions are valid");
+                let future_cost = event_cost
+                    .saturating_add(revm::interpreter::gas::COPY)
+                    .saturating_add(backlog_update_cost);
+                if gas.remaining() < future_cost {
+                    gas.spend_all();
+                    return Some(crate::macros::interpreter_result_revert_out_of_gas(
+                        &mut gas,
+                    ));
+                }
+                let gas_to_donate = gas.remaining() - future_cost;
+                if gas_to_donate < 21_000 {
+                    interpreter_revert!(gas, Bytes::from("not enough gas to run redeem attempt"));
+                }
+
+                let retry_tx_hash = arbitrum_retry_tx_hash(
+                    U256::from(context.cfg().chain_id()),
+                    nonce,
+                    from,
+                    U256::from(context.block().basefee()),
+                    gas_to_donate,
+                    to,
+                    callvalue,
+                    &calldata,
+                    call.ticketId,
+                    caller_address,
+                    max_refund,
+                    submission_fee_refund,
+                );
 
                 emit_event!(
                     context,
@@ -448,6 +554,29 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbRetryableTxPrecompil
                     },
                     gas
                 );
+
+                // The outer redeem donates this gas to the scheduled retry.
+                // It is removed from the current pricing backlog because the
+                // retry execution will add back only what it actually uses.
+                try_record_cost!(gas, gas_to_donate);
+                if arbos_version >= 60 {
+                    try_record_cost!(gas, backlog_update_cost);
+                    let mut arb_state = context.arb_state(None, is_static);
+                    try_state!(
+                        gas,
+                        arb_state
+                            .l2_pricing()
+                            .shrink_backlog(gas_to_donate, arbos_version)
+                    );
+                } else {
+                    let mut arb_state = context.arb_state(Some(&mut gas), is_static);
+                    try_state!(
+                        gas,
+                        arb_state
+                            .l2_pricing()
+                            .shrink_backlog(gas_to_donate, arbos_version)
+                    );
+                }
 
                 let output = ArbRetryableTx::redeemCall::abi_encode_returns(&retry_tx_hash);
 
@@ -475,6 +604,21 @@ fn calculate_retryable_timeout(timeout: u64, windows_left: u64) -> u64 {
     timeout.saturating_add(windows_left.saturating_mul(ARBOS_STATE_RETRYABLE_LIFETIME_SECONDS))
 }
 
+/// Nitro only consults queued lifetime-extension windows after the raw timeout
+/// has elapsed, and only from ArbOS 60 onward. This preserves the historical
+/// pre-v60 behavior and its cheaper live-ticket read path.
+fn retryable_is_expired(
+    timeout: u64,
+    windows_left: u64,
+    current_time: u64,
+    arbos_version: u64,
+) -> bool {
+    timeout == 0
+        || (timeout < current_time
+            && (arbos_version < ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
+                || calculate_retryable_timeout(timeout, windows_left) < current_time))
+}
+
 fn retryable_escrow_address(ticket_id: B256) -> Address {
     let mut hasher_input = Vec::with_capacity(32 + "retryable escrow".len());
     hasher_input.extend_from_slice(b"retryable escrow");
@@ -482,4 +626,29 @@ fn retryable_escrow_address(ticket_id: B256) -> Address {
 
     let hash = keccak256(&hasher_input);
     Address::from_slice(&hash[12..32])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arbos_60_honors_unconsumed_keepalive_windows_after_raw_timeout() {
+        let raw_timeout = 1_000;
+        let now = raw_timeout + ARBOS_STATE_RETRYABLE_LIFETIME_SECONDS / 2;
+
+        assert!(retryable_is_expired(raw_timeout, 1, now, 59));
+        assert!(!retryable_is_expired(raw_timeout, 1, now, 60));
+        assert!(retryable_is_expired(
+            raw_timeout,
+            1,
+            raw_timeout + ARBOS_STATE_RETRYABLE_LIFETIME_SECONDS + 1,
+            60,
+        ));
+    }
+
+    #[test]
+    fn zero_timeout_never_identifies_a_ticket() {
+        assert!(retryable_is_expired(0, u64::MAX, 0, 60));
+    }
 }

@@ -14,6 +14,7 @@ pub mod inspector;
 pub mod l1_fee;
 pub mod local_context;
 pub mod macros;
+pub mod math;
 pub mod precompiles;
 pub mod result;
 pub mod state;

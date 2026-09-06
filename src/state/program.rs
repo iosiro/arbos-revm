@@ -10,18 +10,22 @@ use crate::{
     ArbitrumContextTr, buffer,
     config::ArbitrumConfigTr,
     constants::{
-        ARBOS_GENESIS_TIMESTAMP, ARBOS_PROGRAMS_STATE_CACHE_MANAGERS_KEY,
+        ARBOS_50_MAX_STACK_DEPTH, ARBOS_60_MAX_WASM_SIZE, ARBOS_GENESIS_TIMESTAMP,
+        ARBOS_PROGRAMS_STATE_ACTIVATION_GAS_KEY, ARBOS_PROGRAMS_STATE_CACHE_MANAGERS_KEY,
         ARBOS_PROGRAMS_STATE_DATA_PRICER_KEY, ARBOS_PROGRAMS_STATE_MODULE_HASHES_KEY,
-        ARBOS_PROGRAMS_STATE_PARAMS_KEY, ARBOS_PROGRAMS_STATE_PROGRAM_DATA_KEY,
-        INITIAL_CACHED_COST_SCALAR, INITIAL_DATA_PRICER_BYTES_PER_SECOND,
-        INITIAL_DATA_PRICER_DEMAND, INITIAL_DATA_PRICER_INERTIA,
-        INITIAL_DATA_PRICER_LAST_UPDATE_TIME, INITIAL_DATA_PRICER_MIN_PRICE, INITIAL_EXPIRY_DAYS,
-        INITIAL_FREE_PAGES, INITIAL_INIT_COST_SCALAR, INITIAL_INK_PRICE, INITIAL_KEEPALIVE_DAYS,
-        INITIAL_MAX_STACK_DEPTH, INITIAL_MAX_WASM_SIZE, INITIAL_MIN_CACHED_GAS,
-        INITIAL_MIN_INIT_GAS, INITIAL_PAGE_GAS, INITIAL_PAGE_LIMIT, INITIAL_PAGE_RAMP,
-        INITIAL_RECENT_CACHE_SIZE, INITIAL_STYLUS_VERSION,
+        ARBOS_PROGRAMS_STATE_PARAMS_KEY, ARBOS_PROGRAMS_STATE_PROGRAM_DATA_KEY, ARBOS_VERSION_DIA,
+        ARBOS_VERSION_MAX_WASM_SIZE, ARBOS_VERSION_STYLUS_ACTIVATION_GAS,
+        ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, ARBOS_VERSION_STYLUS_V3, INITIAL_CACHED_COST_SCALAR,
+        INITIAL_DATA_PRICER_BYTES_PER_SECOND, INITIAL_DATA_PRICER_DEMAND,
+        INITIAL_DATA_PRICER_INERTIA, INITIAL_DATA_PRICER_LAST_UPDATE_TIME,
+        INITIAL_DATA_PRICER_MIN_PRICE, INITIAL_EXPIRY_DAYS, INITIAL_FREE_PAGES,
+        INITIAL_INIT_COST_SCALAR, INITIAL_INK_PRICE, INITIAL_KEEPALIVE_DAYS,
+        INITIAL_MAX_FRAGMENT_COUNT, INITIAL_MAX_STACK_DEPTH, INITIAL_MAX_WASM_SIZE,
+        INITIAL_MIN_CACHED_GAS, INITIAL_MIN_INIT_GAS, INITIAL_PAGE_GAS, INITIAL_PAGE_LIMIT,
+        INITIAL_PAGE_RAMP, INITIAL_RECENT_CACHE_SIZE, STYLUS_V2_MIN_INIT_GAS,
     },
     local_context::ArbitrumLocalContextTr,
+    math::{ONE_IN_BIPS, approx_exp_basis_points},
     state::types::{
         ArbosStateError, StorageBackedAddressSet, StorageBackedB256, StorageBackedTr,
         StorageBackedU32, StorageBackedU64, map_address, substorage,
@@ -47,12 +51,19 @@ pub struct StylusParams {
     pub keepalive_days: u16,
     pub block_cache_size: u16,
     pub max_wasm_size: u32,
+    pub max_fragment_count: u8,
 }
 
 impl Default for StylusParams {
     fn default() -> Self {
+        Self::for_arbos_version(crate::constants::INITIAL_ARBOS_VERSION)
+    }
+}
+
+impl StylusParams {
+    fn initial() -> Self {
         Self {
-            version: INITIAL_STYLUS_VERSION,
+            version: 1,
             ink_price: INITIAL_INK_PRICE,
             max_stack_depth: INITIAL_MAX_STACK_DEPTH,
             free_pages: INITIAL_FREE_PAGES,
@@ -67,7 +78,35 @@ impl Default for StylusParams {
             keepalive_days: INITIAL_KEEPALIVE_DAYS,
             block_cache_size: INITIAL_RECENT_CACHE_SIZE,
             max_wasm_size: INITIAL_MAX_WASM_SIZE,
+            max_fragment_count: 0,
         }
+    }
+
+    /// Constructs the parameters Nitro initializes for a chain starting at the
+    /// supplied ArbOS version.
+    pub fn for_arbos_version(arbos_version: u64) -> Self {
+        let mut params = Self::initial();
+        if arbos_version < 31 {
+            params.version = 1;
+            params.min_init_gas = INITIAL_MIN_INIT_GAS;
+        } else {
+            params.version = if arbos_version >= ARBOS_VERSION_STYLUS_V3 {
+                3
+            } else {
+                2
+            };
+            params.min_init_gas = STYLUS_V2_MIN_INIT_GAS;
+        }
+        if arbos_version >= ARBOS_VERSION_DIA {
+            params.max_stack_depth = ARBOS_50_MAX_STACK_DEPTH;
+        }
+        if arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT {
+            params.max_wasm_size = ARBOS_60_MAX_WASM_SIZE;
+            params.max_fragment_count = INITIAL_MAX_FRAGMENT_COUNT;
+        } else if arbos_version < ARBOS_VERSION_MAX_WASM_SIZE {
+            params.max_wasm_size = INITIAL_MAX_WASM_SIZE;
+        }
+        params
     }
 }
 
@@ -116,7 +155,13 @@ where
         data[19..21].copy_from_slice(&params.expiry_days.to_be_bytes());
         data[21..23].copy_from_slice(&params.keepalive_days.to_be_bytes());
         data[23..25].copy_from_slice(&params.block_cache_size.to_be_bytes());
-        data[25..29].copy_from_slice(&params.max_wasm_size.to_be_bytes());
+        let arbos_version = self.context.cfg().arbos_version();
+        if arbos_version >= ARBOS_VERSION_MAX_WASM_SIZE {
+            data[25..29].copy_from_slice(&params.max_wasm_size.to_be_bytes());
+        }
+        if arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT {
+            data[29] = params.max_fragment_count;
+        }
 
         let value = U256::from_be_bytes(data);
         StorageBackedB256::new(self.context, self.gas.as_deref_mut(), self.is_static, slot)
@@ -151,7 +196,17 @@ where
             params.expiry_days = buffer::take_u16(&mut data);
             params.keepalive_days = buffer::take_u16(&mut data);
             params.block_cache_size = buffer::take_u16(&mut data);
-            params.max_wasm_size = buffer::take_u32(&mut data);
+            let arbos_version = self.context.cfg().arbos_version();
+            if arbos_version >= ARBOS_VERSION_MAX_WASM_SIZE {
+                params.max_wasm_size = buffer::take_u32(&mut data);
+            } else {
+                params.max_wasm_size = INITIAL_MAX_WASM_SIZE;
+            }
+            if arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT {
+                params.max_fragment_count = buffer::take_u8(&mut data);
+            } else {
+                params.max_fragment_count = 0;
+            }
 
             return Ok(params);
         }
@@ -273,9 +328,16 @@ where
         self.demand().set(demand)?;
         self.last_update_time().set(time)?;
 
-        let exponent = (demand as f64) / (inertia as f64);
-        let multiplier = f64::exp(exponent);
-        let cost_per_byte = (min_price as f64 * multiplier).floor() as u64;
+        let exponent_bips = ONE_IN_BIPS
+            .saturating_mul(demand as i64)
+            .checked_div(inertia as i64)
+            .unwrap_or(0);
+        let multiplier = approx_exp_basis_points(exponent_bips, 12);
+        let cost_per_byte = if multiplier <= 0 {
+            0
+        } else {
+            (min_price as u64).saturating_mul(multiplier as u64) / ONE_IN_BIPS as u64
+        };
         Ok(cost_per_byte.saturating_mul(temp_bytes as u64))
     }
 
@@ -307,7 +369,7 @@ pub struct ProgramInfo {
     pub cached_cost: u16,
     pub footprint: u16,
     pub asm_estimated_kb: u32,
-    pub age: u32, // age in seconds since activation
+    pub age: u64, // age in seconds since activation
     pub cached: bool,
 }
 
@@ -354,6 +416,9 @@ where
     fn cache_managers_subkey(&self) -> B256 {
         substorage(&self.subkey, ARBOS_PROGRAMS_STATE_CACHE_MANAGERS_KEY)
     }
+    fn activation_gas_subkey(&self) -> B256 {
+        substorage(&self.subkey, ARBOS_PROGRAMS_STATE_ACTIVATION_GAS_KEY)
+    }
 
     pub fn module_hash(&mut self, code_hash: &B256) -> StorageBackedB256<'_, CTX> {
         let slot = map_address(&self.module_hashes_subkey(), code_hash);
@@ -375,8 +440,8 @@ where
             let init_cost = u16::from_be_bytes([data[2], data[3]]);
             let cached_cost = u16::from_be_bytes([data[4], data[5]]);
             let footprint = u16::from_be_bytes([data[6], data[7]]);
-            let asm_estimated_kb = u32::from_be_bytes([0, data[8], data[9], data[10]]);
-            let activated_at = u32::from_be_bytes([0, data[11], data[12], data[13]]);
+            let activated_at = u32::from_be_bytes([0, data[8], data[9], data[10]]);
+            let asm_estimated_kb = u32::from_be_bytes([0, data[11], data[12], data[13]]);
             let cached = data[14] != 0;
 
             return Ok(Some(ProgramInfo {
@@ -388,8 +453,11 @@ where
                 age: self
                     .context
                     .timestamp()
-                    .to::<u32>()
-                    .saturating_sub(activated_at * 3600 + ARBOS_GENESIS_TIMESTAMP),
+                    .saturating_to::<u64>()
+                    .saturating_sub(
+                        ARBOS_GENESIS_TIMESTAMP
+                            .saturating_add(u64::from(activated_at).saturating_mul(3600)),
+                    ),
                 cached,
             }));
         }
@@ -408,14 +476,15 @@ where
         data[2..4].copy_from_slice(&info.init_cost.to_be_bytes());
         data[4..6].copy_from_slice(&info.cached_cost.to_be_bytes());
         data[6..8].copy_from_slice(&info.footprint.to_be_bytes());
-        data[8..11].copy_from_slice(&info.asm_estimated_kb.to_be_bytes()[1..4]);
         let activated_at = self
             .context
             .timestamp()
-            .to::<u32>()
+            .saturating_to::<u64>()
             .saturating_sub(ARBOS_GENESIS_TIMESTAMP)
             / 3600;
-        data[11..14].copy_from_slice(&activated_at.to_be_bytes()[1..4]);
+        let activated_at = activated_at.min(0x00ff_ffff) as u32;
+        data[8..11].copy_from_slice(&activated_at.to_be_bytes()[1..4]);
+        data[11..14].copy_from_slice(&info.asm_estimated_kb.min(0x00ff_ffff).to_be_bytes()[1..4]);
         data[14] = if info.cached { 1 } else { 0 };
 
         let value = U256::from_be_bytes(data);
@@ -445,7 +514,7 @@ where
             }
 
             // ensure the program hasn't expired
-            let max_age_seconds = (stylus_params.expiry_days as u32).saturating_mul(86400);
+            let max_age_seconds = u64::from(stylus_params.expiry_days).saturating_mul(86400);
             if program.age > max_age_seconds {
                 return Err(ArbosStateError::ProgramExpired(program.age));
             }
@@ -489,6 +558,22 @@ where
         )
     }
 
+    /// Returns Nitro's configurable up-front Stylus activation charge.
+    /// The field exists at Programs subspace key 5 and reads as zero before
+    /// ArbOS 59, regardless of any value present in that slot.
+    pub fn activation_gas(&mut self) -> Result<u64, ArbosStateError> {
+        if self.context.cfg().arbos_version() < ARBOS_VERSION_STYLUS_ACTIVATION_GAS {
+            return Ok(0);
+        }
+        let slot = map_address(&self.activation_gas_subkey(), &B256::ZERO);
+        StorageBackedU64::new(self.context, self.gas.as_deref_mut(), self.is_static, slot).get()
+    }
+
+    pub fn set_activation_gas(&mut self, gas: u64) -> Result<(), ArbosStateError> {
+        let slot = map_address(&self.activation_gas_subkey(), &B256::ZERO);
+        StorageBackedU64::new(self.context, self.gas.as_deref_mut(), self.is_static, slot).set(gas)
+    }
+
     pub fn initialize(
         &mut self,
         stylus_params: &StylusParams,
@@ -510,13 +595,24 @@ use super::{ArbState, ArbStateGetter};
 /// Compiles, activates, and stores a Stylus program. Returns activation metadata
 /// including the data fee so callers can optionally charge for it.
 ///
-/// This function does **not** meter gas — callers are responsible for charging
-/// any fixed activation costs before calling.
+/// Callers charge the fixed activation costs before entering this function;
+/// when `gas` is supplied, native instrumentation consumes its variable cost
+/// from the same meter.
 pub fn activate_program<CTX: ArbitrumContextTr>(
     context: &mut CTX,
     code_hash: B256,
     wasm_bytecode: &Bytes,
     cached: bool,
+) -> Result<ActivationInfo, String> {
+    activate_program_metered(context, code_hash, wasm_bytecode, cached, None)
+}
+
+pub fn activate_program_metered<CTX: ArbitrumContextTr>(
+    context: &mut CTX,
+    code_hash: B256,
+    wasm_bytecode: &Bytes,
+    cached: bool,
+    gas: Option<&mut Gas>,
 ) -> Result<ActivationInfo, String> {
     let params = context
         .arb_state(None, false)
@@ -526,6 +622,7 @@ pub fn activate_program<CTX: ArbitrumContextTr>(
         .map_err(|e| format!("failed to read stylus params: {e:?}"))?;
 
     let debug = context.cfg().debug_mode();
+    let arbos_version = context.cfg().arbos_version();
 
     let compile_config = CompileConfig::version(params.version, debug);
 
@@ -534,10 +631,10 @@ pub fn activate_program<CTX: ArbitrumContextTr>(
     let serialized = stylus_compile(wasm_bytecode, &compile_config)?;
 
     let (module, stylus_data) = stylus_activate(
-        None,
+        gas,
         wasm_bytecode,
         code_hash,
-        context.cfg().arbos_version(),
+        arbos_version,
         params.version,
         params.page_limit.saturating_sub(open_pages),
         debug,
@@ -578,7 +675,15 @@ pub fn activate_program<CTX: ArbitrumContextTr>(
         .map_err(|e| format!("failed to save program info: {e:?}"))?;
 
     if cached {
-        cache_program(code_hash, serialized, module, stylus_data);
+        cache_program(
+            code_hash,
+            params.version,
+            arbos_version,
+            debug,
+            serialized,
+            module,
+            stylus_data,
+        );
     }
 
     Ok(ActivationInfo {
