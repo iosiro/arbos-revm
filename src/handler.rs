@@ -942,14 +942,13 @@ where
             .arbos_version()
             .get()
             .map_err(|err| ERROR::from_string(format!("ArbOS version: {err}")))?;
-        let cap = if arbos_version >= 50 {
+        let configured_cap = if arbos_version >= 50 {
             evm.ctx()
                 .arb_state(None, false)
                 .l2_pricing()
                 .per_tx_gas_limit()
                 .get()
                 .map_err(|err| ERROR::from_string(format!("per-tx gas limit: {err}")))?
-                .saturating_sub(init_and_floor_gas.initial_gas)
         } else {
             evm.ctx()
                 .arb_state(None, false)
@@ -957,6 +956,13 @@ where
                 .per_block_gas_limit()
                 .get()
                 .map_err(|err| ERROR::from_string(format!("per-block gas limit: {err}")))?
+        };
+        // An absent ArbOS state reads as zero. Preserve the embedding's normal gas budget until
+        // the pricing constraints have been initialized.
+        let cap = match (configured_cap, arbos_version >= 50) {
+            (0, _) => requested,
+            (cap, true) => cap.saturating_sub(init_and_floor_gas.initial_gas),
+            (cap, false) => cap,
         };
         let frame_gas = requested.min(cap);
         evm.ctx()
@@ -1309,14 +1315,13 @@ where
             .arbos_version()
             .get()
             .map_err(|err| ERROR::from_string(format!("ArbOS version: {err}")))?;
-        let cap = if arbos_version >= 50 {
+        let configured_cap = if arbos_version >= 50 {
             evm.ctx()
                 .arb_state(None, false)
                 .l2_pricing()
                 .per_tx_gas_limit()
                 .get()
                 .map_err(|err| ERROR::from_string(format!("per-tx gas limit: {err}")))?
-                .saturating_sub(init_and_floor_gas.initial_gas)
         } else {
             evm.ctx()
                 .arb_state(None, false)
@@ -1324,6 +1329,13 @@ where
                 .per_block_gas_limit()
                 .get()
                 .map_err(|err| ERROR::from_string(format!("per-block gas limit: {err}")))?
+        };
+        // An absent ArbOS state reads as zero. Preserve the embedding's normal gas budget until
+        // the pricing constraints have been initialized.
+        let cap = match (configured_cap, arbos_version >= 50) {
+            (0, _) => requested,
+            (cap, true) => cap.saturating_sub(init_and_floor_gas.initial_gas),
+            (cap, false) => cap,
         };
         let frame_gas = requested.min(cap);
         evm.ctx()
