@@ -613,9 +613,7 @@ where
         };
 
         let gas_before_stylus = gas.remaining();
-        let ink_limit = stylus_config
-            .pricing
-            .gas_to_ink(arbutil::evm::api::Gas(gas_before_stylus));
+        let ink_limit = single_dimension_ink_budget(stylus_config.pricing, gas_before_stylus);
         gas.spend_all();
 
         let bytecode = match inputs.input() {
@@ -643,8 +641,8 @@ where
         };
 
         let ink_left: Ink = instance.ink_left().into();
-        let ink_used = ink_limit.0.saturating_sub(ink_left.0);
-        let gas_used_by_wasm = ink_to_gas_ceil(stylus_config.pricing, Ink(ink_used));
+        let gas_used_by_wasm =
+            single_dimension_gas_charge(stylus_config.pricing, ink_limit, ink_left);
         let mut gas_left = gas_before_stylus.saturating_sub(gas_used_by_wasm);
 
         let (kind, data) = outcome.into_data();
@@ -677,7 +675,7 @@ where
                 revm::interpreter::InstructionResult::OutOfGas,
                 Bytes::from(data),
             ),
-            UserOutcomeKind::OutOfStack => {
+            UserOutcomeKind::OutOfStack | UserOutcomeKind::NativeStackOverflow => {
                 gas_left = 0;
                 (
                     revm::interpreter::InstructionResult::StackOverflow,
@@ -966,7 +964,7 @@ pub fn stylus_compile(bytecode: &Bytes, compile_config: &CompileConfig) -> Resul
         bytecode,
         compile_config.version,
         compile_config.debug.debug_funcs,
-        wasmer_types::compilation::target::Target::default(),
+        wasmer::sys::Target::default(),
         false,
     )
     .map_err(|e| e.to_string())?;
@@ -1015,6 +1013,19 @@ pub fn ink_to_gas_ceil(pricing: PricingParams, ink: Ink) -> u64 {
     ink.0.div_ceil(pricing.ink_price as u64)
 }
 
+/// Converts REVM's single gas budget into the scalar ink budget expected by
+/// Nitro's Stylus runtime. Resource dimensions are intentionally collapsed at
+/// this boundary so execution remains equivalent to a single gas meter.
+pub fn single_dimension_ink_budget(pricing: PricingParams, gas: u64) -> Ink {
+    pricing.gas_to_ink(arbutil::evm::api::Gas(gas))
+}
+
+/// Charges scalar Stylus ink back to REVM's single gas meter. Rounding upward
+/// ensures partial units of gas are never free.
+pub fn single_dimension_gas_charge(pricing: PricingParams, ink_budget: Ink, ink_left: Ink) -> u64 {
+    ink_to_gas_ceil(pricing, Ink(ink_budget.0.saturating_sub(ink_left.0)))
+}
+
 pub fn cache_program(
     code_hash: B256,
     stylus_version: u16,
@@ -1052,6 +1063,22 @@ mod tests {
         assert_eq!(stylus_page_limit_penalty(59, 128, 128), 0);
         assert_eq!(stylus_page_limit_penalty(59, 128, 129), u64::MAX);
         assert_eq!(stylus_page_limit_penalty(61, 0, u16::MAX), 0);
+    }
+
+    #[test]
+    fn scalar_stylus_meter_is_equivalent_to_single_dimension_gas() {
+        let pricing = PricingParams::new(10_000);
+        let budget = single_dimension_ink_budget(pricing, 123_456);
+        assert_eq!(budget, Ink(1_234_560_000));
+        assert_eq!(
+            single_dimension_gas_charge(pricing, budget, Ink(0)),
+            123_456
+        );
+        assert_eq!(
+            single_dimension_gas_charge(pricing, budget, Ink(budget.0 - 1)),
+            1
+        );
+        assert_eq!(single_dimension_gas_charge(pricing, budget, budget), 0);
     }
 
     #[test]

@@ -8,6 +8,21 @@ use revm::{
 
 use crate::constants::INITIAL_ARBOS_VERSION;
 
+/// Returns the Ethereum execution specification activated by an ArbOS version.
+///
+/// These thresholds mirror Nitro's Arbitrum-specific fork selection in
+/// `params.ChainConfig`: Shanghai at ArbOS 11, Cancun at 20, Prague at 40, and
+/// Osaka at 50. Earlier supported versions use the Merge specification.
+pub const fn spec_id_for_arbos_version(arbos_version: u64) -> SpecId {
+    match arbos_version {
+        50.. => SpecId::OSAKA,
+        40..=49 => SpecId::PRAGUE,
+        20..=39 => SpecId::CANCUN,
+        11..=19 => SpecId::SHANGHAI,
+        _ => SpecId::MERGE,
+    }
+}
+
 #[auto_impl(&mut, Box)]
 pub trait ArbitrumConfigTr: Cfg {
     fn arbos_version(&self) -> u64;
@@ -208,5 +223,30 @@ where
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spec_id_for_arbos_version;
+    use revm::primitives::hardfork::SpecId;
+
+    #[test]
+    fn arbos_versions_select_nitro_execution_specs() {
+        let cases = [
+            (10, SpecId::MERGE),
+            (11, SpecId::SHANGHAI),
+            (19, SpecId::SHANGHAI),
+            (20, SpecId::CANCUN),
+            (39, SpecId::CANCUN),
+            (40, SpecId::PRAGUE),
+            (49, SpecId::PRAGUE),
+            (50, SpecId::OSAKA),
+            (61, SpecId::OSAKA),
+        ];
+
+        for (arbos_version, expected) in cases {
+            assert_eq!(spec_id_for_arbos_version(arbos_version), expected);
+        }
     }
 }

@@ -24,10 +24,9 @@ tracing = "0.1"
 thiserror = "2"
 
 # arbos
-arbutil = { git = "https://github.com/iosiro/arbos-foundry-stylus", rev = "71afaf4d3af0d8c92e7c51f449ac4452cf781416", default-features = false }
-stylus = { git = "https://github.com/iosiro/arbos-foundry-stylus", rev = "71afaf4d3af0d8c92e7c51f449ac4452cf781416", default-features = false, features = ["cc_brotli"] }
-wasmer-types = { git = "https://github.com/iosiro/arbos-foundry-stylus", rev = "71afaf4d3af0d8c92e7c51f449ac4452cf781416", default-features = false }
-wasmer = { git = "https://github.com/iosiro/arbos-foundry-stylus", rev = "71afaf4d3af0d8c92e7c51f449ac4452cf781416", default-features = false }
+arbutil = { git = "https://github.com/iosiro/arbos-foundry-stylus", rev = "26f83677472d198119bc26c8fddefab916357c73", default-features = false }
+stylus = { git = "https://github.com/iosiro/arbos-foundry-stylus", rev = "26f83677472d198119bc26c8fddefab916357c73", default-features = false, features = ["cc_brotli"] }
+wasmer = { git = "https://github.com/iosiro/arbos-foundry-stylus", rev = "26f83677472d198119bc26c8fddefab916357c73", default-features = false }
 
 # wasm processing
 wasm-encoder = "0.244.0"
