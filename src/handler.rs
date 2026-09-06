@@ -1261,6 +1261,9 @@ where
             .arbos_version()
             .get()
             .map_err(|err| ERROR::from_string(err.to_string()))?;
+        if persisted_version == 0 {
+            return InspectorHandler::inspect_run(&mut self.mainnet, evm);
+        }
         if persisted_version != 0 {
             evm.ctx().set_live_arbos_version(persisted_version);
         }
