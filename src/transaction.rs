@@ -57,6 +57,19 @@ pub struct ArbitrumTransaction {
     pub enveloped_tx: Option<Bytes>,
     /// The poster address that submitted this transaction to L1 (batch poster)
     pub poster: Option<Address>,
+    /// Canonical transaction hash used by ArbOS transaction filtering.
+    pub tx_hash: Option<B256>,
+    /// Scheduled-retry fields that are not representable by revm's `TxEnv`.
+    pub retry: Option<ArbitrumRetryTx>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ArbitrumRetryTx {
+    pub ticket_id: B256,
+    pub refund_to: Address,
+    pub max_refund: U256,
+    pub submission_fee_refund: U256,
 }
 
 impl ArbitrumTransaction {
@@ -65,6 +78,8 @@ impl ArbitrumTransaction {
             base,
             enveloped_tx: None,
             poster: None,
+            tx_hash: None,
+            retry: None,
         }
     }
 
@@ -74,6 +89,8 @@ impl ArbitrumTransaction {
             base,
             enveloped_tx: Some(enveloped_tx),
             poster: None,
+            tx_hash: None,
+            retry: None,
         }
     }
 
@@ -87,7 +104,19 @@ impl ArbitrumTransaction {
             base,
             enveloped_tx: Some(enveloped_tx),
             poster: Some(poster),
+            tx_hash: None,
+            retry: None,
         }
+    }
+
+    pub fn with_tx_hash(mut self, tx_hash: B256) -> Self {
+        self.tx_hash = Some(tx_hash);
+        self
+    }
+
+    pub fn with_retry(mut self, retry: ArbitrumRetryTx) -> Self {
+        self.retry = Some(retry);
+        self
     }
 }
 
@@ -293,6 +322,11 @@ pub trait ArbitrumTxTr: Transaction {
     /// Returns the poster address that submitted this transaction.
     fn poster(&self) -> Option<Address>;
 
+    /// Returns the canonical transaction hash when supplied by the backend.
+    fn tx_hash(&self) -> Option<B256>;
+
+    fn retry(&self) -> Option<&ArbitrumRetryTx>;
+
     /// Drops the transaction tip before validation and execution, matching
     /// Nitro's mutation of the execution message when tips are not collected.
     fn drop_tip(&mut self, base_fee: u128);
@@ -305,6 +339,14 @@ impl ArbitrumTxTr for ArbitrumTransaction {
 
     fn poster(&self) -> Option<Address> {
         self.poster
+    }
+
+    fn tx_hash(&self) -> Option<B256> {
+        self.tx_hash
+    }
+
+    fn retry(&self) -> Option<&ArbitrumRetryTx> {
+        self.retry.as_ref()
     }
 
     fn drop_tip(&mut self, base_fee: u128) {
@@ -336,6 +378,14 @@ impl ArbitrumTxTr for TxEnv {
     }
 
     fn poster(&self) -> Option<Address> {
+        None
+    }
+
+    fn tx_hash(&self) -> Option<B256> {
+        None
+    }
+
+    fn retry(&self) -> Option<&ArbitrumRetryTx> {
         None
     }
 
@@ -765,6 +815,21 @@ impl ArbitrumTxTr for ArbitrumTypedTransaction {
         match self {
             Self::Standard(tx) => tx.poster(),
             // System transactions don't have a poster
+            Self::Deposit(_) | Self::Internal(_) => None,
+        }
+    }
+
+    fn tx_hash(&self) -> Option<B256> {
+        match self {
+            Self::Standard(tx) => tx.tx_hash(),
+            Self::Deposit(tx) => Some(tx.hash()),
+            Self::Internal(tx) => Some(tx.hash()),
+        }
+    }
+
+    fn retry(&self) -> Option<&ArbitrumRetryTx> {
+        match self {
+            Self::Standard(tx) => tx.retry(),
             Self::Deposit(_) | Self::Internal(_) => None,
         }
     }

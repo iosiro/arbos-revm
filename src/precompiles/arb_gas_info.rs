@@ -463,9 +463,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
 
                 let l2_gas_price = { context.block().basefee() };
 
-                let wei_for_l1_calldata = l1_gas_price.saturating_mul(U256::from(
-                    revm::interpreter::gas::NON_ZERO_BYTE_MULTIPLIER_ISTANBUL,
-                ));
+                let wei_for_l1_calldata = l1_gas_price.saturating_mul(U256::from(16));
 
                 if context.cfg().arbos_version() < 4 {
                     let mut gas_for_l1_calldata = U256::ZERO;
@@ -515,9 +513,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
 
                 let l2_gas_price = { context.block().basefee() };
 
-                let wei_for_l1_calldata = l1_gas_price.saturating_mul(U256::from(
-                    revm::interpreter::gas::NON_ZERO_BYTE_MULTIPLIER_ISTANBUL,
-                ));
+                let wei_for_l1_calldata = l1_gas_price.saturating_mul(U256::from(16));
 
                 if context.cfg().arbos_version() < 4 {
                     let mut gas_for_l1_calldata = U256::ZERO;
@@ -573,9 +569,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
                     try_state!(gas, arb_state.l2_pricing().min_base_fee_wei().get())
                 };
 
-                let wei_for_l1_calldata = l1_gas_price.saturating_mul(U256::from(
-                    revm::interpreter::gas::NON_ZERO_BYTE_MULTIPLIER_ISTANBUL,
-                ));
+                let wei_for_l1_calldata = l1_gas_price.saturating_mul(U256::from(16));
 
                 let wei_per_l2_tx = wei_for_l1_calldata
                     .saturating_mul(U256::from(ARBOS_GAS_INFO_ASSUMED_SIMPLE_TX_SIZE));
@@ -619,9 +613,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbGasInfoPrecompile {
                     try_state!(gas, arb_state.l2_pricing().min_base_fee_wei().get())
                 };
 
-                let wei_for_l1_calldata = l1_gas_price.saturating_mul(U256::from(
-                    revm::interpreter::gas::NON_ZERO_BYTE_MULTIPLIER_ISTANBUL,
-                ));
+                let wei_for_l1_calldata = l1_gas_price.saturating_mul(U256::from(16));
 
                 let wei_per_l2_tx = wei_for_l1_calldata
                     .saturating_mul(U256::from(ARBOS_GAS_INFO_ASSUMED_SIMPLE_TX_SIZE));

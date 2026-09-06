@@ -96,7 +96,8 @@ pub const ARBOS_BATCH_POSTER_ADDRESS: Address =
 pub const ARBOS_L1_PRICER_FUNDS_ADDRESS: Address =
     address!("0xA4B00000000000000000000000000000000000f6");
 pub const HISTORY_STORAGE_ADDRESS: Address = address!("0x0000F90827F1C53a10cb7A02335B175320002935");
-pub const HISTORY_SERVE_WINDOW: u64 = 8_191;
+/// Arbitrum's extended EIP-2935 history window (`0x5ffd0`).
+pub const HISTORY_SERVE_WINDOW: u64 = 393_168;
 /// Nitro's Arbitrum-specific EIP-2935 history-storage runtime.
 pub const HISTORY_STORAGE_CODE_ARBITRUM: &[u8] = &[
     0x33, 0x73, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,

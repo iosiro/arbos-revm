@@ -10,11 +10,14 @@ use test_utils::{create_evm, execute_tx, fund_account, setup_context};
 use arbos_revm::state::{
     ArbState, ArbStateGetter, arbos_state::ArbosStateParams, types::StorageBackedTr,
 };
-use arbos_revm::{constants::ARBOS_L1_PRICER_FUNDS_ADDRESS, transaction::ArbitrumTransaction};
+use arbos_revm::{
+    constants::{ARBITRUM_RETRY_TX_TYPE, ARBOS_L1_PRICER_FUNDS_ADDRESS},
+    transaction::{ArbitrumRetryTx, ArbitrumTransaction},
+};
 use revm::{
     ExecuteEvm,
     context::{ContextTr, JournalTr, TxEnv, result::ExecutionResult},
-    primitives::{Address, Bytes, TxKind, U256},
+    primitives::{Address, B256, Bytes, TxKind, U256, keccak256},
     state::Bytecode,
 };
 
@@ -149,20 +152,22 @@ fn zero_basefee_and_retry_transactions_do_not_accrue_poster_units() {
             .unwrap();
         fund_account(&mut context, caller, U256::from(100_000_000_u64));
         let mut evm = create_evm(context);
-        let result = evm
-            .transact_one(ArbitrumTransaction::new_with_enveloped(
-                TxEnv {
-                    tx_type,
-                    caller,
-                    gas_limit: 30_000,
-                    gas_price: basefee as u128,
-                    kind: TxKind::Call(Address::repeat_byte(0x22)),
-                    ..Default::default()
-                },
-                Bytes::from_static(&[1, 2, 3, 4]),
-            ))
-            .unwrap();
-        assert!(matches!(result, ExecutionResult::Success { .. }));
+        let result = evm.transact_one(ArbitrumTransaction::new_with_enveloped(
+            TxEnv {
+                tx_type,
+                caller,
+                gas_limit: 30_000,
+                gas_price: basefee as u128,
+                kind: TxKind::Call(Address::repeat_byte(0x22)),
+                ..Default::default()
+            },
+            Bytes::from_static(&[1, 2, 3, 4]),
+        ));
+        if tx_type == arbos_revm::constants::ARBITRUM_RETRY_TX_TYPE {
+            assert!(result.is_err(), "retry metadata must not be optional");
+        } else {
+            assert!(matches!(result.unwrap(), ExecutionResult::Success { .. }));
+        }
         assert_eq!(
             evm.0
                 .ctx
@@ -175,6 +180,73 @@ fn zero_basefee_and_retry_transactions_do_not_accrue_poster_units() {
         );
         assert_eq!(balance(&mut evm, ARBOS_L1_PRICER_FUNDS_ADDRESS), U256::ZERO);
     }
+}
+
+#[test]
+fn scheduled_retry_releases_escrow_and_deletes_ticket_on_success() {
+    let caller = Address::repeat_byte(0x31);
+    let target = Address::repeat_byte(0x32);
+    let refund_to = Address::repeat_byte(0x33);
+    let ticket_id = B256::repeat_byte(0x44);
+    let value = U256::from(7);
+    let mut context = setup_context();
+    context.cfg.arbos_version = 60;
+    context.block.basefee = 1;
+    context
+        .arb_state(None, false)
+        .initialize(&ArbosStateParams::for_arbos_version(60))
+        .unwrap();
+    context
+        .arb_state(None, false)
+        .retryable_state()
+        .create_retryable(
+            ticket_id,
+            1_000_000,
+            caller,
+            Some(target),
+            value,
+            refund_to,
+            &Bytes::new(),
+        )
+        .unwrap();
+    let mut escrow_input = b"retryable escrow".to_vec();
+    escrow_input.extend_from_slice(ticket_id.as_slice());
+    let escrow = Address::from_slice(&keccak256(escrow_input)[12..]);
+    fund_account(&mut context, escrow, value);
+    context.journal_mut().commit_tx();
+
+    let mut evm = create_evm(context);
+    let result = evm
+        .transact_one(
+            ArbitrumTransaction::from(TxEnv {
+                tx_type: ARBITRUM_RETRY_TX_TYPE,
+                caller,
+                gas_limit: 30_000,
+                gas_price: 1,
+                kind: TxKind::Call(target),
+                value,
+                ..Default::default()
+            })
+            .with_retry(ArbitrumRetryTx {
+                ticket_id,
+                refund_to,
+                max_refund: U256::from(30_000),
+                submission_fee_refund: U256::ZERO,
+            }),
+        )
+        .unwrap();
+    assert!(matches!(result, ExecutionResult::Success { .. }));
+    assert_eq!(balance(&mut evm, escrow), U256::ZERO);
+    assert_eq!(
+        evm.0
+            .ctx
+            .arb_state(None, true)
+            .retryable(ticket_id)
+            .timeout()
+            .get()
+            .unwrap(),
+        0
+    );
 }
 
 fn run_fee_routing(version: u64, collect_tips: bool) -> (u64, U256, U256, U256, U256) {
@@ -259,8 +331,8 @@ fn arbos_60_drops_tips_and_refunds_caller_when_disabled() {
 #[test]
 fn arbos_9_collects_tips_regardless_of_storage_flag() {
     let (gas_used, network, infra, coinbase, charged) = run_fee_routing(9, false);
-    assert_eq!(infra, U256::ZERO);
-    assert_eq!(network, U256::from(120 * gas_used));
+    assert_eq!(infra, U256::from(40 * gas_used));
+    assert_eq!(network, U256::from(80 * gas_used));
     assert_eq!(coinbase, U256::ZERO);
     assert_eq!(charged, U256::from(120 * gas_used));
 }

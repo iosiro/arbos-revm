@@ -313,6 +313,8 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
                             | ARBITRUM_RETRY_TX_TYPE
                     );
                 let mut address = if depth > 1 {
+                    // Exact for EOA -> contract -> ArbSys. Deeper calls need a
+                    // contract-frame caller stack, which the context lacks.
                     context.tx().caller()
                 } else {
                     Address::ZERO

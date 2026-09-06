@@ -166,6 +166,10 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbAggregatorPrecompile
                 let mut l1_pricing = arb_state.l1_pricing();
                 let mut batch_poster_table = l1_pricing.batch_poster_table();
 
+                if !try_state!(gas, batch_poster_table.contains(call.batchPoster)) {
+                    interpreter_revert!(gas, Bytes::from("batch poster not found"));
+                }
+
                 let fee_collector =
                     try_state!(gas, batch_poster_table.fee_collector(call.batchPoster));
 
@@ -192,6 +196,10 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbAggregatorPrecompile
 
                 let mut l1_pricing = arb_state.l1_pricing();
                 let mut batch_poster_table = l1_pricing.batch_poster_table();
+
+                if !try_state!(gas, batch_poster_table.contains(call.batchPoster)) {
+                    interpreter_revert!(gas, Bytes::from("batch poster not found"));
+                }
 
                 let current_fee_collector =
                     { try_state!(gas, batch_poster_table.fee_collector(call.batchPoster)) };

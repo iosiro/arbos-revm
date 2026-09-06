@@ -36,6 +36,7 @@ pub(crate) fn validate_arbos_create_output(
     arbos_version: u64,
     spec: SpecId,
     eip3541_disabled: bool,
+    stylus_deployment_disabled: bool,
 ) {
     if !is_create || eip3541_disabled || !spec.is_enabled_in(LONDON) {
         return;
@@ -48,10 +49,12 @@ pub(crate) fn validate_arbos_create_output(
     }
 
     let code = result.output.as_ref();
-    let classic = arbos_version >= 30
+    let classic = !stylus_deployment_disabled
+        && arbos_version >= 30
         && code.len() > STYLUS_DISCRIMINANT.len()
         && code.starts_with(STYLUS_DISCRIMINANT);
-    let component = arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
+    let component = !stylus_deployment_disabled
+        && arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
         && code.len() > STYLUS_ROOT_DISCRIMINANT.len()
         && (code.starts_with(STYLUS_ROOT_DISCRIMINANT)
             || code.starts_with(STYLUS_FRAGMENT_DISCRIMINANT));
@@ -177,6 +180,7 @@ where
             context.cfg().arbos_version(),
             context.cfg().spec().into(),
             context.cfg().is_eip3541_explicitly_disabled(),
+            context.cfg().disable_stylus_deployment(),
         );
         frame.process_next_action(context, action).inspect(|item| {
             if item.is_result() {

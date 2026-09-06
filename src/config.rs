@@ -16,9 +16,12 @@ pub trait ArbitrumConfigTr: Cfg {
     fn debug_mode(&self) -> bool;
     fn disable_auto_cache(&self) -> bool;
     fn disable_auto_activate(&self) -> bool;
+    fn disable_stylus_deployment(&self) -> bool {
+        false
+    }
     /// Whether the embedding explicitly disabled EIP-3541 validation.
     fn is_eip3541_explicitly_disabled(&self) -> bool {
-        Cfg::is_eip3541_disabled(self)
+        false
     }
 }
 
@@ -32,6 +35,7 @@ pub struct ArbitrumConfig<SPEC = SpecId> {
     pub debug_mode: bool,
     pub disable_auto_cache: bool,
     pub disable_auto_activate: bool,
+    pub disable_stylus_deployment: bool,
 }
 
 impl<SPEC> ArbitrumConfig<SPEC> {
@@ -45,6 +49,7 @@ impl<SPEC> ArbitrumConfig<SPEC> {
             debug_mode: false,
             disable_auto_cache: false,
             disable_auto_activate: false,
+            disable_stylus_deployment: false,
         }
     }
 }
@@ -60,6 +65,7 @@ where
             debug_mode: false,
             disable_auto_cache: false,
             disable_auto_activate: false,
+            disable_stylus_deployment: false,
         }
     }
 }
@@ -163,6 +169,10 @@ where
         self.disable_auto_activate
     }
 
+    fn disable_stylus_deployment(&self) -> bool {
+        self.disable_stylus_deployment
+    }
+
     fn is_eip3541_explicitly_disabled(&self) -> bool {
         self.inner.is_eip3541_disabled()
     }
@@ -176,6 +186,7 @@ impl<SPEC: Into<SpecId> + Copy> ArbitrumConfig<SPEC> {
             debug_mode: false,
             disable_auto_cache: false,
             disable_auto_activate: false,
+            disable_stylus_deployment: false,
         }
     }
 }

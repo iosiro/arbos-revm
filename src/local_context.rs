@@ -77,6 +77,7 @@ impl LocalContextTr for ArbitrumLocalContext {
         // Sets len to 0 but it will not shrink to drop the capacity.
         unsafe { self.shared_memory_buffer.borrow_mut().set_len(0) };
 
+        self.precompile_error_message = None;
         // Clear L1 fee related fields
         self.tx_l1_cost = None;
         self.poster_gas = None;

@@ -14,8 +14,10 @@ use arbos_revm::{
         ARBOS_L1_PRICER_FUNDS_ADDRESS, HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE_ARBITRUM,
     },
     state::{ArbState, ArbStateGetter, arbos_state::ArbosStateParams, types::StorageBackedTr},
+    transaction::ArbitrumTransaction,
 };
 use revm::{
+    ExecuteEvm,
     context::{ContextTr, Host, JournalTr, TxEnv, result::ExecutionResult},
     primitives::{Address, B256, Bytes, TxKind, U256},
 };
@@ -403,16 +405,18 @@ fn malformed_internal_failure_is_receipt_level_and_does_not_dirty_next_tx() {
     ));
 
     let recipient = Address::repeat_byte(0x88);
-    let result = execute_tx(
-        &mut evm,
-        TxEnv {
-            tx_type: arbos_revm::constants::ARBITRUM_DEPOSIT_TX_TYPE,
-            caller: caller_address(),
-            kind: TxKind::Call(recipient),
-            value: U256::from(7),
-            ..Default::default()
-        },
-    );
+    let result = evm
+        .transact_one(
+            ArbitrumTransaction::from(TxEnv {
+                tx_type: arbos_revm::constants::ARBITRUM_DEPOSIT_TX_TYPE,
+                caller: caller_address(),
+                kind: TxKind::Call(recipient),
+                value: U256::from(7),
+                ..Default::default()
+            })
+            .with_tx_hash(B256::repeat_byte(0x77)),
+        )
+        .expect("deposit execution failed");
     assert!(matches!(result, ExecutionResult::Success { .. }));
     assert_eq!(balance(&mut evm, recipient), U256::from(7));
 }

@@ -657,7 +657,7 @@ where
     }
 
     pub fn rectify(&mut self, address: Address) -> Result<(), ArbosStateError> {
-        if self.contains(address)? {
+        if !self.contains(address)? {
             return Err(ArbosStateError::RectifyMappingNotOwner);
         }
 

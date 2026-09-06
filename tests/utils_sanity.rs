@@ -1561,17 +1561,10 @@ fn test_filtered_submit_retryable_redirects_refunds_and_skips_redeem() {
             ..Default::default()
         },
     );
-    let revm::context::result::ExecutionResult::Success {
-        output,
-        logs,
-        gas_used,
-        ..
-    } = result
-    else {
-        panic!("filtered submit retryable did not succeed: {result:?}");
+    let revm::context::result::ExecutionResult::Revert { gas_used, output } = result else {
+        panic!("filtered submit retryable did not return a failed receipt: {result:?}");
     };
-    assert_eq!(B256::from_slice(output.data()), ticket_id);
-    assert_eq!(logs.len(), 1);
+    assert_eq!(B256::from_slice(&output), ticket_id);
     assert_eq!(gas_used, call.gasLimit);
     {
         let mut state = evm.0.ctx.arb_state(None, true);

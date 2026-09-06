@@ -131,6 +131,7 @@ where
             context.cfg().arbos_version(),
             context.cfg().spec().into(),
             context.cfg().is_eip3541_explicitly_disabled(),
+            context.cfg().disable_stylus_deployment(),
         );
         let mut result = frame.process_next_action(context, action);
         if let Ok(ItemOrResult::Result(frame_result)) = &mut result {

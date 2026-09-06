@@ -12,9 +12,7 @@ use revm::{
     },
     interpreter::{
         CallInput, CallInputs, CreateInputs, FrameInput, Gas, InputsImpl, InstructionResult,
-        InterpreterAction, InterpreterResult,
-        gas::{initcode_cost, warm_cold_cost},
-        interpreter::EthInterpreter,
+        InterpreterAction, InterpreterResult, gas::warm_cold_cost, interpreter::EthInterpreter,
         interpreter_action::FrameInit,
     },
     primitives::{Address, Log, U256, hardfork::SpecId},
@@ -58,12 +56,15 @@ impl RequestHandler<VecReader> for StylusHandler {
     }
 }
 
-pub fn wasm_account_touch<CTX>(context: CTX, is_cold: bool, with_code: bool) -> u64
+pub fn wasm_account_touch<CTX>(_context: CTX, is_cold: bool, with_code: bool) -> u64
 where
     CTX: ArbitrumContextTr,
 {
     let code_cost = if with_code {
-        context.cfg().max_code_size() as u64 / 24576 * 700
+        // Foundry may lift REVM's deployment-size override to `usize::MAX` for
+        // test contracts. ArbOS still prices this host operation against the
+        // consensus default code-size limit.
+        700
     } else {
         0
     };
@@ -361,7 +362,6 @@ where
             return error_response;
         }
 
-        let mut gas_cost = 0;
         let len = init_code.len();
 
         if len != 0 && spec.is_enabled_in(SpecId::SHANGHAI) {
@@ -376,23 +376,21 @@ where
                 );
                 return error_response;
             }
-            gas_cost = initcode_cost(len);
         }
 
-        let scheme = if is_create_2 {
-            if let Some(check_cost) = revm::interpreter::gas::create2_cost(len)
-                .and_then(|cost| gas_cost.checked_add(cost))
-            {
-                gas_cost = check_cost;
+        let (scheme, gas_cost) = if is_create_2 {
+            if let Some(cost) = revm::interpreter::gas::create2_cost(len) {
+                (
+                    CreateScheme::Create2 {
+                        salt: salt.unwrap(),
+                    },
+                    cost,
+                )
             } else {
                 return error_response;
-            };
-            CreateScheme::Create2 {
-                salt: salt.unwrap(),
             }
         } else {
-            gas_cost += revm::interpreter::gas::CREATE;
-            CreateScheme::Create
+            (CreateScheme::Create, revm::interpreter::gas::CREATE)
         };
 
         if gas_remaining < gas_cost {
@@ -406,19 +404,19 @@ where
             return (
                 [vec![0x00], "out of gas".as_bytes().to_vec()].concat(),
                 VecReader::new(vec![]),
-                ArbGas(0),
+                ArbGas(gas_remaining),
             );
         }
 
-        let gas_limit = gas_remaining - gas_cost;
-
+        let gas_after_base = gas_remaining - gas_cost;
         let gas_stipend = if spec.is_enabled_in(SpecId::TANGERINE) {
-            gas_limit / 64
+            gas_after_base / 64
         } else {
             0
         };
 
-        let mut gas = Gas::new(gas_limit);
+        let mut gas = Gas::new(gas_remaining);
+        _ = gas.record_cost(gas_cost);
         _ = gas.record_cost(gas_stipend);
 
         let first_frame_input = FrameInput::Create(Box::new(CreateInputs {
@@ -472,9 +470,10 @@ where
                     );
                 }
 
-                if let Some(address) = create_outcome.address {
-                    gas.erase_cost(create_outcome.gas().remaining() + gas_stipend);
-
+                gas.erase_cost(create_outcome.gas().remaining().saturating_add(gas_stipend));
+                if create_outcome.instruction_result().is_ok()
+                    && let Some(address) = create_outcome.address
+                {
                     debug!(
                         target: "arbos-revm::stylus-api",
                         target_address = %input.target_address,
@@ -490,6 +489,12 @@ where
                         ArbGas(gas.spent()),
                     );
                 }
+
+                return (
+                    [vec![0x01], Address::ZERO.to_vec()].concat(),
+                    VecReader::new(vec![]),
+                    ArbGas(gas.spent()),
+                );
             }
         }
 

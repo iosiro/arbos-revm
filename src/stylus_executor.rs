@@ -26,7 +26,7 @@ use revm::{
         InterpreterResult, gas::memory_gas, interpreter::EthInterpreter,
         interpreter_types::InputsTr,
     },
-    primitives::{Address, B256, Bytes, FixedBytes, Log, U256, alloy_primitives::U64},
+    primitives::{Address, B256, Bytes, FixedBytes, Log, U256, alloy_primitives::U64, keccak256},
 };
 use stylus::{
     brotli::{self, Dictionary},
@@ -313,7 +313,33 @@ where
         };
         let arbos_version = self.ctx().cfg().arbos_version();
         let debug = self.ctx().cfg().debug_mode();
-        let cache_key = (code_hash, stylus_params.version, arbos_version, debug);
+        // Resolve root fragments on every invocation. Their contents are not
+        // covered by the root account's code hash and therefore must be part
+        // of the process-global compilation cache key.
+        let context = self.ctx();
+        let bytecode = context
+            .journal_mut()
+            .code(stylus_ctx.bytecode_address)
+            .ok()?
+            .data;
+        let bytecode =
+            match stylus_code_with_fragments(context, &bytecode, &stylus_params, false, None) {
+                Ok(Some(code)) => code,
+                Ok(None) => return None,
+                Err(e) => {
+                    return Some(InterpreterAction::Return(InterpreterResult {
+                        result: InstructionResult::Revert,
+                        output: e.into(),
+                        gas,
+                    }));
+                }
+            };
+        let cache_key = (
+            keccak256(&bytecode),
+            stylus_params.version,
+            arbos_version,
+            debug,
+        );
 
         let (serialized, _module, stylus_data, stylus_params) = {
             // Use read lock to get cached program if available
@@ -335,38 +361,6 @@ where
             if let Some((serialized, module, stylus_data)) = maybe_cached {
                 (serialized, module, stylus_data, stylus_params)
             } else {
-                let context = self.ctx();
-
-                let bytecode = context
-                    .journal_mut()
-                    .code(stylus_ctx.bytecode_address)
-                    .ok()?
-                    .data;
-
-                let bytecode = match stylus_code_with_fragments(
-                    context,
-                    &bytecode,
-                    &stylus_params,
-                    false,
-                    None,
-                ) {
-                    Ok(Some(code)) => code,
-                    Ok(None) => return None,
-                    Err(e) => {
-                        debug!(
-                            target: "arbos-revm::stylus",
-                            bytecode_address = %stylus_ctx.bytecode_address,
-                            error = %String::from_utf8_or_hex(e.clone()),
-                            "Stylus bytecode decode failed"
-                        );
-                        return Some(InterpreterAction::Return(InterpreterResult {
-                            result: InstructionResult::Revert,
-                            output: e.into(),
-                            gas,
-                        }));
-                    }
-                };
-
                 let compile_config = CompileConfig::version(stylus_params.version, debug);
 
                 let mut cache = PROGRAM_CACHE.lock().unwrap();
@@ -897,27 +891,47 @@ pub fn stylus_code_with_fragments<CTX: ArbitrumContextTr>(
     let mut compressed = Vec::new();
     for raw in addresses.as_chunks::<20>().0 {
         let address = Address::from_slice(raw);
+        let checkpoint = context.journal_mut().checkpoint();
         // JournalTr has no read-only access-list query. Loading only the account
         // metadata reports its pre-access warmth; reserve a maximum-sized copy
         // before asking the database to materialize the fragment code.
-        let account = context
-            .journal_mut()
-            .load_account(address)
-            .map_err(|_| b"failed to read stylus fragment account".to_vec())?;
+        let account = match context.journal_mut().load_account(address) {
+            Ok(account) => account,
+            Err(_) => {
+                context.journal_mut().checkpoint_revert(checkpoint);
+                return Err(b"failed to read stylus fragment account".to_vec());
+            }
+        };
         let was_cold = account.is_cold;
         if let Some(gas) = gas.as_deref_mut() {
-            let reserve = fragment_read_gas_cost(was_cold, context.cfg().max_code_size() as u64)
-                .ok_or_else(|| b"fragment copy gas overflow".to_vec())?;
+            // This is a consensus gas upper bound, not Foundry's optional
+            // deployment-size override (which forge sets to usize::MAX).
+            let Some(reserve) = fragment_read_gas_cost(was_cold, 24_576) else {
+                context.journal_mut().checkpoint_revert(checkpoint);
+                return Err(b"fragment copy gas overflow".to_vec());
+            };
             if gas.remaining() < reserve {
                 gas.spend_all();
+                context.journal_mut().checkpoint_revert(checkpoint);
                 return Err(b"out of gas".to_vec());
             }
         }
-        let loaded = context
-            .journal_mut()
-            .code(address)
-            .map_err(|_| b"failed to read stylus fragment".to_vec())?;
+        let loaded = match context.journal_mut().code(address) {
+            Ok(loaded) => loaded,
+            Err(_) => {
+                context.journal_mut().checkpoint_revert(checkpoint);
+                return Err(b"failed to read stylus fragment".to_vec());
+            }
+        };
         let fragment = loaded.data.clone();
+        // StateDB.GetCode in Nitro does not modify EIP-2929 warmth. Reverting
+        // the read-only checkpoint removes revm's account-warming journal entry
+        // while retaining the copied fragment bytes.
+        if gas.is_some() {
+            context.journal_mut().checkpoint_commit();
+        } else {
+            context.journal_mut().checkpoint_revert(checkpoint);
+        }
         if let Some(gas) = gas.as_deref_mut() {
             let cost = fragment_read_gas_cost(was_cold, fragment.len() as u64)
                 .ok_or_else(|| b"fragment copy gas overflow".to_vec())?;
@@ -933,11 +947,13 @@ pub fn stylus_code_with_fragments<CTX: ArbitrumContextTr>(
     let mut classic = STYLUS_DISCRIMINANT.to_vec();
     classic.push(dictionary);
     classic.extend_from_slice(&compressed);
-    let wasm = stylus_code(&classic, params.max_wasm_size)?;
-    if activating
-        && wasm
-            .as_ref()
-            .is_some_and(|wasm| wasm.len() != decompressed_len as usize)
+    // Nitro uses the immutable length committed by the root as the
+    // decompression bound. Owner-configurable activation limits are checked
+    // above, but must not affect already-active programs at call time.
+    let wasm = stylus_code(&classic, decompressed_len)?;
+    if wasm
+        .as_ref()
+        .is_some_and(|wasm| wasm.len() != decompressed_len as usize)
     {
         return Err(b"invalid wasm: decompressed length mismatch".to_vec());
     }
