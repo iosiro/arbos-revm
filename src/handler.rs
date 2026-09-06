@@ -762,7 +762,7 @@ where
                 Err(_) => Ok(self.commit_system_failure(evm)),
             },
             _ => {
-                let collect_tips = {
+                let preserve_tip = persisted_version == 0 || {
                     let version = evm.ctx().cfg().arbos_version();
                     let sequencer_message = evm.ctx().tx().poster().is_none_or(|poster| {
                         poster == crate::constants::ARBOS_BATCH_POSTER_ADDRESS
@@ -774,7 +774,7 @@ where
                                     |err| ERROR::from_string(format!("collect tips: {err}")),
                                 )?))
                 };
-                if !collect_tips {
+                if !preserve_tip {
                     let base_fee = evm.ctx().block().basefee() as u128;
                     evm.ctx().drop_transaction_tip(base_fee);
                 }
@@ -1028,6 +1028,16 @@ where
         evm: &mut Self::Evm,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
+        let persisted_version = evm
+            .ctx()
+            .arb_state(None, false)
+            .arbos_version()
+            .get()
+            .map_err(|err| ERROR::from_string(format!("ArbOS version: {err}")))?;
+        if persisted_version == 0 {
+            return self.mainnet.reward_beneficiary(evm, frame_result);
+        }
+
         let ctx = evm.ctx();
         let gas_used = frame_result.gas().used();
         let poster_gas = ctx.local().poster_gas().unwrap_or(0);
@@ -1269,7 +1279,7 @@ where
                 Err(_) => Ok(self.commit_system_failure(evm)),
             },
             _ => {
-                let collect_tips = {
+                let preserve_tip = persisted_version == 0 || {
                     let version = evm.ctx().cfg().arbos_version();
                     let sequencer_message = evm.ctx().tx().poster().is_none_or(|poster| {
                         poster == crate::constants::ARBOS_BATCH_POSTER_ADDRESS
@@ -1281,7 +1291,7 @@ where
                                     |err| ERROR::from_string(format!("collect tips: {err}")),
                                 )?))
                 };
-                if !collect_tips {
+                if !preserve_tip {
                     let base_fee = evm.ctx().block().basefee() as u128;
                     evm.ctx().drop_transaction_tip(base_fee);
                 }
