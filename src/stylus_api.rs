@@ -12,7 +12,7 @@ use revm::{
     },
     interpreter::{
         CallInput, CallInputs, CreateInputs, FrameInput, Gas, InputsImpl, InstructionResult,
-        InterpreterAction, InterpreterResult, gas::warm_cold_cost, interpreter::EthInterpreter,
+        InterpreterAction, InterpreterResult, interpreter::EthInterpreter,
         interpreter_action::FrameInit,
     },
     primitives::{Address, Log, U256, hardfork::SpecId},
@@ -68,7 +68,7 @@ where
     } else {
         0
     };
-    code_cost + warm_cold_cost(is_cold)
+    code_cost + if is_cold { 2_600 } else { 100 }
 }
 
 const CALL_VALUE_TRANSFER_GAS: u64 = 9_000;
@@ -76,7 +76,7 @@ const CALL_NEW_ACCOUNT_GAS: u64 = 25_000;
 const CALL_STIPEND: u64 = 2_300;
 
 fn stylus_call_base_cost(is_cold: bool, is_empty: bool, transfers_value: bool) -> u64 {
-    let mut cost = warm_cold_cost(is_cold);
+    let mut cost: u64 = if is_cold { 2_600 } else { 100 };
     if transfers_value {
         cost = cost.saturating_add(CALL_VALUE_TRANSFER_GAS);
         if is_empty {
@@ -195,7 +195,7 @@ where
         let account = self
             .ctx()
             .journal_mut()
-            .load_account(bytecode_address)
+            .load_account_with_code(bytecode_address)
             .unwrap();
         let transfers_value = matches!(req_type, EvmApiMethod::ContractCall) && !value.is_zero();
         let base_cost =
@@ -223,7 +223,12 @@ where
             value: call_value,
             scheme,
             is_static,
-            known_bytecode: None,
+            known_bytecode: (
+                account.data.info.code_hash,
+                account.data.info.code.clone().unwrap_or_default(),
+            ),
+            reservoir: 0,
+            charged_new_account_state_gas: false,
         }));
 
         let next_action = InterpreterAction::NewFrame(first_frame_input);
@@ -270,7 +275,7 @@ where
                     status = status_label,
                     output_len = output.len(),
                     output = %String::from_utf8_or_hex(output.clone()),
-                    gas_spent = gas.spent(),
+                    gas_spent = gas.total_gas_spent(),
                     gas_remaining = call_outcome.gas().remaining(),
                     "Stylus host call finished"
                 );
@@ -278,7 +283,7 @@ where
                 return (
                     status.into(),
                     VecReader::new(output),
-                    ArbGas(base_cost.saturating_add(gas.spent())),
+                    ArbGas(base_cost.saturating_add(gas.total_gas_spent())),
                 );
             }
         }
@@ -287,13 +292,13 @@ where
             target: "arbos-revm::stylus-api",
             target_address = %target_address,
             bytecode_address = %bytecode_address,
-            gas_spent = gas.spent(),
+            gas_spent = gas.total_gas_spent(),
             "Stylus host call returning failure response without call outcome"
         );
         (
             Status::Failure.into(),
             VecReader::new(vec![]),
-            ArbGas(base_cost.saturating_add(gas.spent())),
+            ArbGas(base_cost.saturating_add(gas.total_gas_spent())),
         )
     }
 
@@ -379,18 +384,18 @@ where
         }
 
         let (scheme, gas_cost) = if is_create_2 {
-            if let Some(cost) = revm::interpreter::gas::create2_cost(len) {
-                (
-                    CreateScheme::Create2 {
-                        salt: salt.unwrap(),
-                    },
-                    cost,
-                )
-            } else {
-                return error_response;
-            }
+            let cost = self.ctx().cfg().gas_params().create2_cost(len);
+            (
+                CreateScheme::Create2 {
+                    salt: salt.unwrap(),
+                },
+                cost,
+            )
         } else {
-            (CreateScheme::Create, revm::interpreter::gas::CREATE)
+            (
+                CreateScheme::Create,
+                self.ctx().cfg().gas_params().create_cost(),
+            )
         };
 
         if gas_remaining < gas_cost {
@@ -416,16 +421,17 @@ where
         };
 
         let mut gas = Gas::new(gas_remaining);
-        _ = gas.record_cost(gas_cost);
-        _ = gas.record_cost(gas_stipend);
+        _ = gas.record_regular_cost(gas_cost);
+        _ = gas.record_regular_cost(gas_stipend);
 
-        let first_frame_input = FrameInput::Create(Box::new(CreateInputs {
-            caller: input.target_address,
+        let first_frame_input = FrameInput::Create(Box::new(CreateInputs::new(
+            input.target_address,
             scheme,
             value,
             init_code,
-            gas_limit: gas.remaining(),
-        }));
+            gas.remaining(),
+            0,
+        )));
 
         gas.spend_all();
 
@@ -459,14 +465,14 @@ where
                         target_address = %input.target_address,
                         output_len = output.len(),
                         output = %String::from_utf8_or_hex(output.clone()),
-                        gas_spent = gas.spent(),
+                        gas_spent = gas.total_gas_spent(),
                         gas_remaining = create_outcome.gas().remaining(),
                         "Stylus create reverted"
                     );
                     return (
                         [vec![0x01], Address::ZERO.to_vec()].concat(),
                         VecReader::new(output),
-                        ArbGas(gas.spent()),
+                        ArbGas(gas.total_gas_spent()),
                     );
                 }
 
@@ -478,7 +484,7 @@ where
                         target: "arbos-revm::stylus-api",
                         target_address = %input.target_address,
                         new_address = %address,
-                        gas_spent = gas.spent(),
+                        gas_spent = gas.total_gas_spent(),
                         gas_remaining = create_outcome.gas().remaining(),
                         "Stylus create succeeded"
                     );
@@ -486,14 +492,14 @@ where
                     return (
                         [vec![0x01], address.to_vec()].concat(),
                         VecReader::new(vec![]),
-                        ArbGas(gas.spent()),
+                        ArbGas(gas.total_gas_spent()),
                     );
                 }
 
                 return (
                     [vec![0x01], Address::ZERO.to_vec()].concat(),
                     VecReader::new(vec![]),
-                    ArbGas(gas.spent()),
+                    ArbGas(gas.total_gas_spent()),
                 );
             }
         }
@@ -510,12 +516,20 @@ where
     pub(crate) fn handle_emit_log<F>(
         &mut self,
         input: InputsImpl,
+        is_static: bool,
         data: Vec<u8>,
         log_handler: F,
     ) -> (Vec<u8>, VecReader, ArbGas)
     where
         F: FnOnce((&mut Self, Log)),
     {
+        if is_static {
+            return (
+                Status::WriteProtection.into(),
+                VecReader::new(vec![]),
+                ArbGas(0),
+            );
+        }
         let mut data = data;
         let topic_count = buffer::take_u32(&mut data);
         let mut topics = Vec::with_capacity(topic_count as usize);
@@ -564,15 +578,7 @@ where
             ),
 
             EvmApiMethod::EmitLog => {
-                // LOG opcodes are not allowed in static context (write protection)
-                if is_static {
-                    return (
-                        Status::WriteProtection.into(),
-                        VecReader::new(vec![]),
-                        ArbGas(0),
-                    );
-                }
-                self.handle_emit_log(input, data, |(evm, log): (&mut Self, Log)| {
+                self.handle_emit_log(input, is_static, data, |(evm, log): (&mut Self, Log)| {
                     let context = evm.ctx();
                     context.log(log);
                 })
@@ -598,7 +604,18 @@ where
             EvmApiMethod::GetBytes32 => {
                 let slot = buffer::take_u256(&mut data);
                 if let Some(result) = context.sload(input.target_address, slot) {
-                    let gas = revm::interpreter::gas::sload_cost(spec.into(), result.is_cold);
+                    let gas_params = context.cfg().gas_params();
+                    let gas = if spec.clone().into().is_enabled_in(SpecId::BERLIN) {
+                        if result.is_cold {
+                            gas_params.cold_storage_cost()
+                        } else {
+                            gas_params.warm_storage_read_cost()
+                        }
+                    } else if spec.clone().into().is_enabled_in(SpecId::ISTANBUL) {
+                        800
+                    } else {
+                        200
+                    };
                     (
                         result.to_be_bytes_vec(),
                         VecReader::new(vec![]),
@@ -631,8 +648,12 @@ where
 
                     match context.sstore(input.target_address, key, value) {
                         Some(result) => {
-                            total_cost += revm::interpreter::gas::sstore_cost(
-                                spec.clone().into(),
+                            // Host requests bypass the interpreter, so charge both parts
+                            // of REVM's split SSTORE schedule for every written slot.
+                            let gas_params = context.cfg().gas_params();
+                            total_cost += gas_params.sstore_static_gas();
+                            total_cost += gas_params.sstore_dynamic_gas(
+                                spec.clone().into().is_enabled_in(SpecId::ISTANBUL),
                                 &result.data,
                                 result.is_cold,
                             );
@@ -802,6 +823,65 @@ impl From<Status> for Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ArbitrumContext, precompiles::ArbitrumPrecompileProvider};
+    use revm::{
+        Journal, context::Host, database::EmptyDB, handler::instructions::EthInstructions,
+        inspector::NoOpInspector,
+    };
+
+    #[test]
+    fn stylus_storage_writes_charge_static_and_dynamic_gas() {
+        let mut context = ArbitrumContext {
+            journaled_state: Journal::new(EmptyDB::default()),
+            block: Default::default(),
+            cfg: Default::default(),
+            tx: Default::default(),
+            chain: Default::default(),
+            local: Default::default(),
+            error: Ok(()),
+        };
+        context
+            .cfg
+            .inner
+            .set_spec_and_mainnet_gas_params(SpecId::OSAKA);
+        context.journaled_state.set_spec_id(SpecId::OSAKA);
+        let address = Address::repeat_byte(0x11);
+        context.journaled_state.load_account(address).unwrap();
+        let mut evm = ArbitrumEvm::new_with_inspector(
+            context,
+            NoOpInspector,
+            EthInstructions::new_mainnet_with_spec(SpecId::OSAKA),
+            ArbitrumPrecompileProvider::new(SpecId::OSAKA),
+        );
+
+        // Cold no-op, warm no-op, warm set, dirty update, and a fresh cold set.
+        for (slot, value, expected_gas) in [
+            (0_u64, 0_u64, 2_200),
+            (0, 0, 100),
+            (0, 1, 20_000),
+            (0, 2, 100),
+            (1, 1, 22_100),
+        ] {
+            let mut data = 100_000_u64.to_be_bytes().to_vec();
+            data.extend_from_slice(&U256::from(slot).to_be_bytes::<32>());
+            data.extend_from_slice(&U256::from(value).to_be_bytes::<32>());
+            let (status, _, gas) = evm.request_inner(
+                InputsImpl {
+                    target_address: address,
+                    ..Default::default()
+                },
+                false,
+                EvmApiMethod::SetTrieSlots,
+                data,
+            );
+            assert_eq!(status, Vec::<u8>::from(Status::Success));
+            assert_eq!(gas.0, expected_gas, "slot {slot}, value {value}");
+            assert_eq!(
+                evm.ctx().sload(address, U256::from(slot)).unwrap().data,
+                U256::from(value)
+            );
+        }
+    }
 
     #[test]
     fn stylus_call_cost_matches_nitro_vectors() {

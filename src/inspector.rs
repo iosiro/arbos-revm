@@ -23,6 +23,7 @@ use revm::{
 
 use crate::{
     ArbitrumContextTr, ArbitrumEvm,
+    chain::ArbitrumChainTr,
     config::ArbitrumConfigTr,
     constants::{
         ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, STYLUS_DISCRIMINANT, STYLUS_ROOT_DISCRIMINANT,
@@ -119,11 +120,13 @@ where
         let context = &mut self.0.ctx;
         let instructions = &mut self.0.instruction;
         let inspector = &mut self.0.inspector;
+        let gas_table = instructions.gas_table();
         let mut action = inspect_instructions(
             context,
             &mut frame.interpreter,
             &mut *inspector,
             instructions.instruction_table(),
+            gas_table,
         );
         crate::evm::validate_arbos_create_output(
             &mut action,
@@ -243,6 +246,7 @@ where
     }
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
+        self.0.ctx.chain_mut().set_committed_failure(None);
         self.set_tx(tx);
         ArbitrumHandler::default().inspect_run(self)
     }

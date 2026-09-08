@@ -172,7 +172,7 @@ where
         let slot = map_address(&self.subkey, &B256::ZERO);
 
         if let Some(gas) = self.gas.as_deref_mut()
-            && !gas.record_cost(WARM_SLOAD_GAS.0)
+            && !gas.record_regular_cost(WARM_SLOAD_GAS.0)
         {
             return Err(ArbosStateError::OutOfGas);
         }

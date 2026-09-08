@@ -4,12 +4,13 @@ use revm::{
 };
 
 use crate::{
+    chain::{ArbitrumChain, ArbitrumChainTr},
     config::{ArbitrumConfig, ArbitrumConfigTr},
     local_context::{ArbitrumLocalContext, ArbitrumLocalContextTr},
     transaction::{ArbitrumTransaction, ArbitrumTxTr},
 };
 
-pub type ArbitrumChainInfo = ();
+pub type ArbitrumChainInfo = ArbitrumChain;
 
 /// Type alias for the default context type of the ArbitrumEvm.
 pub type ArbitrumContext<DB> = Context<
@@ -24,12 +25,22 @@ pub type ArbitrumContext<DB> = Context<
 
 /// Type alias for Arbitrum context
 pub trait ArbitrumContextTr:
-    ContextTr<Cfg: ArbitrumConfigTr, Tx: ArbitrumTxTr, Local: ArbitrumLocalContextTr>
+    ContextTr<
+        Cfg: ArbitrumConfigTr,
+        Tx: ArbitrumTxTr,
+        Chain: ArbitrumChainTr,
+        Local: ArbitrumLocalContextTr,
+    >
 {
 }
 
 impl<T> ArbitrumContextTr for T where
-    T: ContextTr<Cfg: ArbitrumConfigTr, Tx: ArbitrumTxTr, Local: ArbitrumLocalContextTr>
+    T: ContextTr<
+            Cfg: ArbitrumConfigTr,
+            Tx: ArbitrumTxTr,
+            Chain: ArbitrumChainTr,
+            Local: ArbitrumLocalContextTr,
+        >
 {
 }
 
@@ -48,6 +59,7 @@ where
     CFG: ArbitrumConfigTr,
     DB: Database,
     JOURNAL: JournalTr<Database = DB>,
+    CHAIN: ArbitrumChainTr,
     LOCAL: ArbitrumLocalContextTr,
 {
     fn set_live_arbos_version(&mut self, version: u64) {

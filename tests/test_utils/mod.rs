@@ -14,7 +14,7 @@ use arbos_revm::{
     state::{ArbState, arbos_state::ArbosStateParams},
 };
 use revm::{
-    ExecuteEvm, Journal,
+    ExecuteEvm, InspectEvm, Journal,
     context::{BlockEnv, ContextTr, JournalTr, TxEnv, result::ExecutionResult},
     database::EmptyDBTyped,
     handler::instructions::EthInstructions,
@@ -48,7 +48,7 @@ pub fn setup_context() -> TestContext {
         block: BlockEnv::default(),
         cfg: ArbitrumConfig::default(),
         tx: ArbitrumTransaction::default(),
-        chain: (),
+        chain: Default::default(),
         local: ArbitrumLocalContext::default(),
         error: Ok(()),
     }
@@ -74,7 +74,7 @@ pub fn create_evm(context: TestContext) -> TestEvm {
     ArbitrumEvm::new_with_inspector(
         context,
         NoOpInspector {},
-        EthInstructions::default(),
+        EthInstructions::new_mainnet_with_spec(revm::primitives::hardfork::SpecId::default()),
         ArbitrumPrecompileProvider::new(revm::primitives::hardfork::SpecId::default()),
     )
 }
@@ -166,8 +166,27 @@ pub fn create_call_tx_with_value(
 /// Execute a transaction and return the result
 #[allow(dead_code)]
 pub fn execute_tx(evm: &mut TestEvm, tx: TxEnv) -> ExecutionResult {
-    evm.transact_one(tx.into())
-        .expect("transaction execution failed")
+    let mut inspected = create_evm(evm.0.ctx.clone());
+    let inspected_result = inspected
+        .inspect_one_tx(tx.clone().into())
+        .expect("inspected transaction execution failed");
+    let result = evm
+        .transact_one(tx.into())
+        .expect("transaction execution failed");
+    assert_eq!(
+        result, inspected_result,
+        "inspection changed the transaction result"
+    );
+    assert_eq!(
+        evm.0.ctx.chain, inspected.0.ctx.chain,
+        "inspection changed backend metadata"
+    );
+    assert_eq!(
+        evm.0.ctx.journaled_state.clone().finalize(),
+        inspected.0.ctx.journaled_state.finalize(),
+        "inspection changed the transaction state"
+    );
+    result
 }
 
 /// Compile a WAT file to WASM bytes

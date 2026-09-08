@@ -2,6 +2,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::{
     ArbitrumContextTr,
+    chain::ArbitrumChainTr,
     config::ArbitrumConfigTr,
     constants::{
         ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, STYLUS_DISCRIMINANT, STYLUS_FRAGMENT_DISCRIMINANT,
@@ -9,7 +10,9 @@ use crate::{
     },
     context::ArbitrumContextMutTr,
     handler::ArbitrumHandler,
-    transaction::ArbitrumTransactionError,
+    local_context::ArbitrumLocalContextTr,
+    result::ArbitrumExecutionOutcome,
+    transaction::{ArbitrumTransaction, ArbitrumTransactionError},
 };
 use revm::{
     Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, Inspector,
@@ -23,8 +26,8 @@ use revm::{
         instructions::{EthInstructions, InstructionProvider},
     },
     interpreter::{
-        InstructionResult, InterpreterAction, InterpreterResult, interpreter::EthInterpreter,
-        interpreter_action::FrameInit,
+        FrameInput, InstructionResult, InterpreterAction, InterpreterResult,
+        interpreter::EthInterpreter, interpreter_action::FrameInit,
     },
     primitives::hardfork::{LONDON, SpecId},
     state::EvmState,
@@ -66,6 +69,10 @@ pub(crate) fn validate_arbos_create_output(
 pub struct ArbitrumEvm<CTX, INSP, P, I = EthInstructions<EthInterpreter, CTX>, F = EthFrame>(
     pub Evm<CTX, INSP, I, P, F>,
 );
+
+type ArbitrumEvmError<CTX> =
+    EVMError<<<CTX as ContextTr>::Db as Database>::Error, ArbitrumTransactionError>;
+type ScheduledRetryResult<CTX> = Result<Option<ExecutionResult<HaltReason>>, ArbitrumEvmError<CTX>>;
 
 impl<CTX, I, INSP, P, F> ArbitrumEvm<CTX, INSP, P, I, F> {
     /// Create a new EVM instance with a given context, inspector, instruction set, and precompile
@@ -145,7 +152,24 @@ where
         ItemOrResult<&mut Self::Frame, <Self::Frame as FrameTr>::FrameResult>,
         ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
     > {
-        self.0.frame_init(frame_input)
+        let caller = match &frame_input.frame_input {
+            FrameInput::Call(inputs) => Some(inputs.caller),
+            FrameInput::Create(inputs) => Some(inputs.caller()),
+            FrameInput::Empty => None,
+        };
+        if let Some(caller) = caller {
+            self.0.ctx.local_mut().enter_frame(caller);
+        }
+        if let ItemOrResult::Result(result) = self.0.frame_init(frame_input)? {
+            if caller.is_some() {
+                self.0
+                    .ctx
+                    .local_mut()
+                    .exit_frame(result.instruction_result().is_ok());
+            }
+            return Ok(ItemOrResult::Result(result));
+        }
+        Ok(ItemOrResult::Item(self.0.frame_stack.get()))
     }
 
     fn frame_run(
@@ -171,9 +195,11 @@ where
         let frame = self.0.frame_stack.get();
         let context = &mut self.0.ctx;
         let instructions = &mut self.0.instruction;
-        let mut action = frame
-            .interpreter
-            .run_plain(instructions.instruction_table(), context);
+        let gas_table = instructions.gas_table();
+        let mut action =
+            frame
+                .interpreter
+                .run_plain(instructions.instruction_table(), gas_table, context);
         validate_arbos_create_output(
             &mut action,
             matches!(frame.data, FrameData::Create(_)),
@@ -196,6 +222,14 @@ where
         Option<<Self::Frame as FrameTr>::FrameResult>,
         ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
     > {
+        // Immediate precompile/empty-account results have no live child frame;
+        // inspector overrides may return without calling frame_init at all.
+        if self.0.frame_stack.get().is_finished() {
+            self.0
+                .ctx
+                .local_mut()
+                .exit_frame(result.instruction_result().is_ok());
+        }
         self.0.frame_return_result(result)
     }
 
@@ -247,6 +281,7 @@ where
 
     #[inline]
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
+        self.0.ctx.chain_mut().set_committed_failure(None);
         self.0.ctx.set_tx(tx);
         ArbitrumHandler::default().run(self)
     }
@@ -281,6 +316,48 @@ where
     #[inline]
     fn commit(&mut self, state: Self::State) {
         self.0.db_mut().commit(state);
+    }
+}
+
+impl<CTX, INSP, INST, PRECOMPILES>
+    ArbitrumEvm<CTX, INSP, PRECOMPILES, INST, EthFrame<EthInterpreter>>
+where
+    CTX: ArbitrumContextMutTr<Tx = ArbitrumTransaction, Journal: JournalTr<State = EvmState>>
+        + ContextSetters,
+    INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
+{
+    /// Executes one transaction while preserving ArbOS's typed distinction
+    /// between committed receipt failures and execution errors.
+    pub fn transact_one_arbitrum(
+        &mut self,
+        tx: ArbitrumTransaction,
+    ) -> Result<
+        ArbitrumExecutionOutcome,
+        EVMError<<CTX::Db as Database>::Error, ArbitrumTransactionError>,
+    > {
+        self.0.ctx.chain_mut().set_committed_failure(None);
+        self.0.ctx.set_tx(tx);
+        let result = ArbitrumHandler::<
+            Self,
+            EVMError<<CTX::Db as Database>::Error, ArbitrumTransactionError>,
+            EthFrame<EthInterpreter>,
+        >::default()
+        .run(self)?;
+        let committed_failure = self.0.ctx.chain_mut().take_committed_failure();
+        Ok(ArbitrumExecutionOutcome {
+            result,
+            committed_failure,
+        })
+    }
+
+    /// Pops and executes the next retry scheduled by a committed transaction.
+    /// Returns `Ok(None)` when the backend queue is empty.
+    pub fn transact_next_scheduled_retry(&mut self) -> ScheduledRetryResult<CTX> {
+        let Some(retry) = self.0.ctx.chain_mut().next_scheduled_retry() else {
+            return Ok(None);
+        };
+        self.transact_one(retry.into_transaction()).map(Some)
     }
 }
 

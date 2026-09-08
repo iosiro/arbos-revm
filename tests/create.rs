@@ -178,7 +178,7 @@ fn reverting_host_create_refunds_child_gas_and_preserves_returndata() {
         );
         assert_eq!(result.output().unwrap().as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
         assert!(
-            result.gas_used() < 1_000_000,
+            result.tx_gas_used() < 1_000_000,
             "child gas was not refunded: {result:?}"
         );
     }
