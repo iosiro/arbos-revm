@@ -9,7 +9,7 @@ use crate::{
         ARBOS_ADDRESS, ARBOS_L1_PRICER_FUNDS_ADDRESS, HISTORY_SERVE_WINDOW,
         HISTORY_STORAGE_ADDRESS,
     },
-    context::ArbitrumContextMutTr,
+    context::{ArbitrumContextMutTr, ArbitrumContextTr},
     l1_fee,
     local_context::ArbitrumLocalContextTr,
     result::ArbitrumCommittedFailure,
@@ -239,7 +239,7 @@ where
         if selector == ArbitrumInternalTx::START_BLOCK_METHOD {
             let call = startBlockCall::abi_decode(&input)
                 .map_err(|err| ERROR::from_string(format!("invalid startBlock calldata: {err}")))?;
-            let block_number = ctx.block().number().saturating_to::<u64>();
+            let block_number = ctx.arb_block_number().saturating_to::<u64>();
             let previous_hash = if block_number == 0 {
                 Default::default()
             } else {
@@ -774,7 +774,7 @@ where
         if persisted_version != 0 {
             evm.ctx().set_live_arbos_version(persisted_version);
         }
-        let block_number = evm.ctx().block().number().saturating_to::<u64>();
+        let block_number = evm.ctx().arb_block_number().saturating_to::<u64>();
         evm.ctx().chain_mut().begin_block(block_number);
         let tx_type = evm.ctx().tx().tx_type();
 
@@ -1361,7 +1361,7 @@ where
         if persisted_version != 0 {
             evm.ctx().set_live_arbos_version(persisted_version);
         }
-        let block_number = evm.ctx().block().number().saturating_to::<u64>();
+        let block_number = evm.ctx().arb_block_number().saturating_to::<u64>();
         evm.ctx().chain_mut().begin_block(block_number);
 
         match evm.ctx().tx().tx_type() {

@@ -59,6 +59,54 @@ fn install(context: &mut test_utils::TestContext, address: Address, code: Byteco
 }
 
 #[test]
+fn arb_sys_uses_l2_height_without_changing_evm_number() {
+    let caller = Address::repeat_byte(0x11);
+    let number_contract = Address::repeat_byte(0x22);
+    let arb_sys = address!("0000000000000000000000000000000000000064");
+    for rpc_number in [None, Some(102)] {
+        let mut context = setup_context();
+        context.block.number = U256::from(10);
+        context.chain.set_rpc_block_number(rpc_number);
+        fund_account(&mut context, caller, U256::from(100_000_000_u64));
+        install(
+            &mut context,
+            number_contract,
+            Bytecode::new_raw(Bytes::from_static(&[
+                0x43, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
+            ])),
+        );
+        let mut evm = create_evm(context);
+        for (nonce, (target, data, expected)) in [
+            (
+                arb_sys,
+                Bytes::copy_from_slice(&keccak256("arbBlockNumber()")[..4]),
+                rpc_number.unwrap_or(10),
+            ),
+            (number_contract, Bytes::new(), 10),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = execute_tx(
+                &mut evm,
+                TxEnv {
+                    caller,
+                    gas_limit: 1_000_000,
+                    nonce: nonce as u64,
+                    kind: TxKind::Call(target),
+                    data,
+                    ..Default::default()
+                },
+            );
+            let ExecutionResult::Success { output, .. } = result else {
+                panic!("block height call failed: {result:?}");
+            };
+            assert_eq!(U256::from_be_slice(output.data()), U256::from(expected));
+        }
+    }
+}
+
+#[test]
 fn arb_sys_observes_actual_parent_caller_at_depth_three() {
     let origin = Address::repeat_byte(0x11);
     let outer = Address::repeat_byte(0x22);

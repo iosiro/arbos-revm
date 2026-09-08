@@ -74,7 +74,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbStatisticsPrecompile
             ArbStatistics::getStatsCall::SELECTOR => {
                 let output = ArbStatistics::getStatsCall::abi_encode_returns(
                     &ArbStatistics::getStatsReturn::from((
-                        context.block_number(),
+                        context.arb_block_number(),
                         U256::ZERO,
                         U256::ZERO,
                         U256::ZERO,

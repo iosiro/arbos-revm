@@ -13,13 +13,13 @@ pub struct ArbitrumChain {
     committed_failure: Option<ArbitrumCommittedFailure>,
     block_number: Option<u64>,
     block_gas_used: u64,
-    debug_mode: bool,
-    disable_auto_cache: bool,
-    disable_auto_activate: bool,
-    disable_stylus_deployment: bool,
+    /// RPC L2 height when the execution block environment exposes an L1 height.
+    #[cfg_attr(feature = "serde", serde(default))]
+    rpc_block_number: Option<u64>,
 }
 
 pub trait ArbitrumChainTr {
+    fn rpc_block_number(&self) -> Option<u64>;
     fn schedule_retry(&mut self, retry: ArbitrumRetryTx);
     fn next_scheduled_retry(&mut self) -> Option<ArbitrumRetryTx>;
     fn scheduled_retries(&self) -> &VecDeque<ArbitrumRetryTx>;
@@ -31,6 +31,10 @@ pub trait ArbitrumChainTr {
 }
 
 impl ArbitrumChainTr for ArbitrumChain {
+    fn rpc_block_number(&self) -> Option<u64> {
+        self.rpc_block_number
+    }
+
     fn schedule_retry(&mut self, retry: ArbitrumRetryTx) {
         self.scheduled_retries.push_back(retry);
     }
@@ -68,34 +72,7 @@ impl ArbitrumChainTr for ArbitrumChain {
 }
 
 impl ArbitrumChain {
-    pub fn configure_execution(
-        &mut self,
-        debug_mode: bool,
-        disable_auto_cache: bool,
-        disable_auto_activate: bool,
-    ) {
-        self.debug_mode = debug_mode;
-        self.disable_auto_cache = disable_auto_cache;
-        self.disable_auto_activate = disable_auto_activate;
-    }
-
-    pub const fn debug_mode(&self) -> bool {
-        self.debug_mode
-    }
-
-    pub const fn disable_auto_cache(&self) -> bool {
-        self.disable_auto_cache
-    }
-
-    pub const fn disable_auto_activate(&self) -> bool {
-        self.disable_auto_activate
-    }
-
-    pub fn set_disable_stylus_deployment(&mut self, disabled: bool) {
-        self.disable_stylus_deployment = disabled;
-    }
-
-    pub const fn disable_stylus_deployment(&self) -> bool {
-        self.disable_stylus_deployment
+    pub fn set_rpc_block_number(&mut self, number: Option<u64>) {
+        self.rpc_block_number = number;
     }
 }
