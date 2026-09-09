@@ -136,3 +136,41 @@ fn unknown_persisted_arbos_version_is_rejected_before_execution() {
         "unsupported ArbOS version 62",
     );
 }
+
+#[test]
+fn blob_basefee_halts_even_when_the_ethereum_spec_supports_it() {
+    let caller = Address::repeat_byte(0x11);
+    let contract = Address::repeat_byte(0x22);
+    for version in [19, 20, 40, 50, 61] {
+        let mut context = setup_context();
+        context
+            .arb_state(None, false)
+            .initialize(&ArbosStateParams::for_arbos_version(version))
+            .unwrap();
+        fund_account(&mut context, caller, U256::from(100_000_000u64));
+        context.journal_mut().load_account(contract).unwrap();
+        // Return BLOBBASEFEE. Nitro rejects this opcode even after Cancun activation.
+        context.journal_mut().set_code(
+            contract,
+            Bytecode::new_raw(Bytes::from_static(&[
+                0x4a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+            ])),
+        );
+        let result = execute_tx(
+            &mut create_evm(context),
+            TxEnv {
+                caller,
+                kind: TxKind::Call(contract),
+                gas_limit: 100_000,
+                gas_price: 1,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_halt(), "ArbOS {version}: {result:?}");
+        assert_eq!(
+            result.tx_gas_used(),
+            100_000,
+            "the exceptional halt burns all gas"
+        );
+    }
+}

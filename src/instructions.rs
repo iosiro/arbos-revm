@@ -17,7 +17,7 @@ use revm::{
     primitives::{U256, hardfork::SpecId},
 };
 
-/// Ethereum instructions with ArbOS's L1 BLOCKHASH source.
+/// Ethereum instructions with ArbOS's L1 BLOCKHASH source and unsupported BLOBBASEFEE.
 ///
 /// The database must supply L2 block hashes for ArbSys and native block processing.
 #[derive(Debug)]
@@ -49,6 +49,9 @@ impl<CTX: ArbitrumContextTr> ArbitrumInstructions<CTX> {
         // Retain the upstream static gas charge; reading ArbOS history adds no SLOAD charge.
         instructions.instruction_table_mut()[opcode::BLOCKHASH as usize] =
             Instruction::new(blockhash::<CTX>);
+        // Nitro rejects BLOBBASEFEE independently of its selected Ethereum hardfork.
+        instructions.instruction_table_mut()[opcode::BLOBBASEFEE as usize] =
+            Instruction::new(|_| Err(InstructionResult::NotActivated));
         Self(instructions)
     }
 }
