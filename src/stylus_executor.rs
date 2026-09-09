@@ -15,16 +15,16 @@ use arbutil::{
     },
 };
 
+use crate::instructions::ArbitrumInstructionProvider;
 use lru::LruCache;
 use revm::{
     Inspector,
     context::{Block, Cfg, ContextSetters, ContextTr, JournalTr, LocalContextTr, Transaction},
-    handler::{EvmTr, PrecompileProvider, instructions::InstructionProvider},
+    handler::{EvmTr, PrecompileProvider},
     inspector::{InspectorEvmTr, JournalExt},
     interpreter::{
         CallInput, FrameInput, Gas, InputsImpl, InstructionResult, InterpreterAction,
-        InterpreterResult, gas::memory_gas, interpreter::EthInterpreter,
-        interpreter_types::InputsTr,
+        InterpreterResult, interpreter::EthInterpreter, interpreter_types::InputsTr,
     },
     primitives::{Address, B256, Bytes, FixedBytes, Log, U256, alloy_primitives::U64, keccak256},
 };
@@ -46,6 +46,7 @@ use tracing::{debug, trace, warn};
 
 use crate::{
     ArbitrumEvm, Utf8OrHex,
+    chain::ArbitrumChainTr,
     config::ArbitrumConfigTr,
     constants::{
         ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, ARBOS_VERSION_STYLUS_FIXES, COST_SCALAR_PERCENT,
@@ -196,7 +197,7 @@ fn restore_open_pages_on_error<T, E>(
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
     CTX: ArbitrumContextTr,
-    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    I: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     /// Common method to build API requestor for both inspected and non-inspected modes
@@ -507,8 +508,8 @@ where
 
         let recent_cache_hit =
             if self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT {
-                let block_number = self.ctx().block().number().saturating_to();
-                self.ctx().local_mut().insert_recent_wasm(
+                let block_number = self.ctx().arb_block_number().saturating_to();
+                self.ctx().chain_mut().insert_recent_wasm(
                     code_hash,
                     stylus_params.block_cache_size,
                     block_number,
@@ -566,7 +567,7 @@ where
             (cost, wasm_open_pages)
         };
 
-        if !gas.record_cost(call_cost) {
+        if !gas.record_regular_cost(call_cost) {
             debug!(
                 target: "arbos-revm::stylus",
                 bytecode_address = %stylus_ctx.bytecode_address,
@@ -628,6 +629,9 @@ where
 
         let outcome = match instance.run_main(&bytecode, stylus_config, ink_limit) {
             Err(e) | Ok(UserOutcome::Failure(e)) => {
+                if format!("{e:?}").contains("memory.fill value exceeds 8 bits") {
+                    self.ctx().local_mut().filter_current_transaction();
+                }
                 debug!(
                     target: "arbos-revm::stylus",
                     bytecode_address = %stylus_ctx.bytecode_address,
@@ -691,7 +695,11 @@ where
             .set_stylus_pages_open(stylus_open_pages);
 
         if !output.is_empty() && self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_FIXES {
-            let evm_cost = memory_gas(output.len().div_ceil(32));
+            let evm_cost = self
+                .ctx()
+                .cfg()
+                .gas_params()
+                .memory_cost(output.len().div_ceil(32));
 
             if gas.limit() < evm_cost {
                 debug!(
@@ -744,7 +752,7 @@ impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
     CTX: ArbitrumContextTr,
     CTX::Journal: JournalExt,
-    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    I: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
     CTX: ContextSetters,
     INSP: Inspector<CTX>,
@@ -788,7 +796,7 @@ where
             ),
 
             EvmApiMethod::EmitLog => {
-                self.handle_emit_log(input, data, |(evm, log): (&mut Self, Log)| {
+                self.handle_emit_log(input, is_static, data, |(evm, log): (&mut Self, Log)| {
                     let (context, inspector) = evm.ctx_inspector();
                     context.log(log.clone());
                     inspector.log(context, log);
@@ -933,7 +941,7 @@ pub fn stylus_code_with_fragments<CTX: ArbitrumContextTr>(
         if let Some(gas) = gas.as_deref_mut() {
             let cost = fragment_read_gas_cost(was_cold, fragment.len() as u64)
                 .ok_or_else(|| b"fragment copy gas overflow".to_vec())?;
-            if !gas.record_cost(cost) {
+            if !gas.record_regular_cost(cost) {
                 return Err(b"out of gas".to_vec());
             }
         }

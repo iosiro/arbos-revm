@@ -1,5 +1,5 @@
 use revm::{
-    context::JournalTr,
+    context::{JournalTr, journaled_state::account::JournaledAccountTr},
     interpreter::{
         Gas,
         gas::{ISTANBUL_SLOAD_GAS, SSTORE_RESET, SSTORE_SET},
@@ -34,7 +34,7 @@ impl<'a, CTX: ArbitrumContextTr> FilteredTransactions<'a, CTX> {
     pub fn is_filtered(&mut self, tx_hash: B256) -> Result<bool, ArbosStateError> {
         self.load_account()?;
         if let Some(gas) = &mut self.gas
-            && !gas.record_cost(ISTANBUL_SLOAD_GAS)
+            && !gas.record_regular_cost(ISTANBUL_SLOAD_GAS)
         {
             return Err(ArbosStateError::OutOfGas);
         }
@@ -67,7 +67,7 @@ impl<'a, CTX: ArbitrumContextTr> FilteredTransactions<'a, CTX> {
             } else {
                 SSTORE_SET
             };
-            if !gas.record_cost(cost) {
+            if !gas.record_regular_cost(cost) {
                 return Err(ArbosStateError::OutOfGas);
             }
         }

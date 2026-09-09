@@ -4,12 +4,13 @@ use revm::{
 };
 
 use crate::{
+    chain::{ArbitrumChain, ArbitrumChainTr},
     config::{ArbitrumConfig, ArbitrumConfigTr},
     local_context::{ArbitrumLocalContext, ArbitrumLocalContextTr},
     transaction::{ArbitrumTransaction, ArbitrumTxTr},
 };
 
-pub type ArbitrumChainInfo = ();
+pub type ArbitrumChainInfo = ArbitrumChain;
 
 /// Type alias for the default context type of the ArbitrumEvm.
 pub type ArbitrumContext<DB> = Context<
@@ -24,12 +25,29 @@ pub type ArbitrumContext<DB> = Context<
 
 /// Type alias for Arbitrum context
 pub trait ArbitrumContextTr:
-    ContextTr<Cfg: ArbitrumConfigTr, Tx: ArbitrumTxTr, Local: ArbitrumLocalContextTr>
+    ContextTr<
+        Cfg: ArbitrumConfigTr,
+        Tx: ArbitrumTxTr,
+        Chain: ArbitrumChainTr,
+        Local: ArbitrumLocalContextTr,
+    >
 {
+    /// Returns the L2 block height independently of the EVM's L1 NUMBER value.
+    fn arb_block_number(&self) -> revm::primitives::U256 {
+        self.chain()
+            .rpc_block_number()
+            .map(revm::primitives::U256::from)
+            .unwrap_or_else(|| self.block_number())
+    }
 }
 
 impl<T> ArbitrumContextTr for T where
-    T: ContextTr<Cfg: ArbitrumConfigTr, Tx: ArbitrumTxTr, Local: ArbitrumLocalContextTr>
+    T: ContextTr<
+            Cfg: ArbitrumConfigTr,
+            Tx: ArbitrumTxTr,
+            Chain: ArbitrumChainTr,
+            Local: ArbitrumLocalContextTr,
+        >
 {
 }
 
@@ -48,10 +66,12 @@ where
     CFG: ArbitrumConfigTr,
     DB: Database,
     JOURNAL: JournalTr<Database = DB>,
+    CHAIN: ArbitrumChainTr,
     LOCAL: ArbitrumLocalContextTr,
 {
     fn set_live_arbos_version(&mut self, version: u64) {
         self.cfg.set_arbos_version(version);
+        self.journaled_state.set_spec_id(self.cfg.spec().into());
     }
 
     fn drop_transaction_tip(&mut self, base_fee: u128) {

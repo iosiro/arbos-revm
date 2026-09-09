@@ -1,3 +1,4 @@
+use crate::instructions::ArbitrumInstructionProvider;
 use revm::{
     DatabaseCommit, InspectCommitEvm, InspectEvm,
     context::{Cfg, ContextError, ContextSetters, ContextTr, JournalTr},
@@ -7,7 +8,7 @@ use revm::{
     Database,
     handler::{
         EthFrame, EvmTr, FrameInitOrResult, FrameResult, ItemOrResult, PrecompileProvider,
-        evm::ContextDbError, instructions::InstructionProvider,
+        evm::ContextDbError,
     },
     inspector::{
         InspectorEvmTr, InspectorHandler, JournalExt, handler::frame_end, inspect_instructions,
@@ -23,6 +24,7 @@ use revm::{
 
 use crate::{
     ArbitrumContextTr, ArbitrumEvm,
+    chain::ArbitrumChainTr,
     config::ArbitrumConfigTr,
     constants::{
         ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, STYLUS_DISCRIMINANT, STYLUS_ROOT_DISCRIMINANT,
@@ -51,7 +53,7 @@ impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I> {
 impl<CTX, INSP, P, I> InspectorEvmTr for ArbitrumEvm<CTX, INSP, P, I>
 where
     CTX: ArbitrumContextTr<Journal: JournalExt> + ContextSetters,
-    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    I: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
     INSP: Inspector<CTX, I::InterpreterTypes>,
 {
@@ -98,6 +100,7 @@ where
     fn inspect_frame_run(
         &mut self,
     ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
+        self.sync_execution_spec();
         let code = self.frame_stack.get().interpreter.bytecode.bytes();
         let is_stylus = code.starts_with(STYLUS_DISCRIMINANT)
             || (self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
@@ -119,11 +122,13 @@ where
         let context = &mut self.0.ctx;
         let instructions = &mut self.0.instruction;
         let inspector = &mut self.0.inspector;
+        let gas_table = instructions.gas_table();
         let mut action = inspect_instructions(
             context,
             &mut frame.interpreter,
             &mut *inspector,
             instructions.instruction_table(),
+            gas_table,
         );
         crate::evm::validate_arbos_create_output(
             &mut action,
@@ -182,7 +187,7 @@ impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
     CTX: ArbitrumContextTr,
     CTX::Journal: JournalExt,
-    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    I: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
     CTX: ContextSetters,
     INSP: Inspector<CTX>,
@@ -233,7 +238,7 @@ impl<CTX, INSP, INST, PRECOMPILES> InspectEvm
 where
     CTX: ContextSetters + ArbitrumContextMutTr<Journal: JournalTr<State = EvmState> + JournalExt>,
     INSP: Inspector<CTX, EthInterpreter>,
-    INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    INST: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     type Inspector = INSP;
@@ -243,6 +248,7 @@ where
     }
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
+        self.0.ctx.chain_mut().set_committed_failure(None);
         self.set_tx(tx);
         ArbitrumHandler::default().inspect_run(self)
     }
@@ -254,7 +260,7 @@ where
     CTX: ContextSetters
         + ArbitrumContextMutTr<Journal: JournalTr<State = EvmState> + JournalExt, Db: DatabaseCommit>,
     INSP: Inspector<CTX, EthInterpreter>,
-    INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    INST: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
 }

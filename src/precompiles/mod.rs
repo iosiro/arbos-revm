@@ -5,17 +5,19 @@ use std::{
 
 use revm::{
     context::{Cfg, ContextTr, LocalContextTr},
-    handler::PrecompileProvider,
+    handler::{PrecompileProvider, precompile_output_to_interpreter_result},
     interpreter::{
         CallInput, CallInputs, Gas, InstructionResult, InterpreterResult, gas::ISTANBUL_SLOAD_GAS,
     },
-    precompile::{PrecompileError, PrecompileId, PrecompileSpecId, Precompiles},
+    precompile::{PrecompileId, PrecompileSpecId, Precompiles},
     primitives::{
-        Address, Bytes, HashMap, HashSet, SHORT_ADDRESS_CAP, U256, hardfork::SpecId, short_address,
+        Address, AddressSet, Bytes, HashMap, SHORT_ADDRESS_CAP, U256, hardfork::SpecId,
+        short_address,
     },
 };
 
-use crate::state::{ArbState, ArbStateGetter};
+use crate::local_context::ArbitrumLocalContextTr;
+use crate::state::{ArbState, ArbStateGetter, types::StorageBackedTr};
 
 mod arb_address_table;
 mod arb_aggregator;
@@ -179,11 +181,12 @@ impl<CTX: ArbitrumContextTr> PrecompileProvider<CTX> for ArbitrumPrecompileProvi
             return Ok(Some(InterpreterResult {
                 result: InstructionResult::Revert,
                 output: Bytes::default(),
-                gas: Gas::new_spent(inputs.gas_limit),
+                gas: Gas::new_spent_with_reservoir(inputs.gas_limit, inputs.reservoir),
             }));
         }
 
-        precompile.call(
+        ctx.local_mut().enter_precompile_call(inputs.scheme);
+        let result = precompile.call(
             ctx,
             &input_bytes,
             &inputs.target_address,
@@ -191,11 +194,13 @@ impl<CTX: ArbitrumContextTr> PrecompileProvider<CTX> for ArbitrumPrecompileProvi
             inputs.call_value(),
             inputs.is_static,
             inputs.gas_limit,
-        )
+        );
+        ctx.local_mut().exit_precompile_call();
+        result
     }
 
-    fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
-        self.warm_addresses()
+    fn warm_addresses(&self) -> &AddressSet {
+        &self.registry.address_set
     }
 
     fn contains(&self, address: &Address) -> bool {
@@ -206,7 +211,7 @@ impl<CTX: ArbitrumContextTr> PrecompileProvider<CTX> for ArbitrumPrecompileProvi
 #[derive(Clone, Debug)]
 pub struct PrecompileRegistry<CTX: ContextTr> {
     map: HashMap<Address, Precompile<CTX>>,
-    address_set: HashSet<Address>,
+    address_set: AddressSet,
     fast_lookup: Vec<Option<Precompile<CTX>>>,
     all_short: bool,
 }
@@ -215,7 +220,7 @@ impl<CTX: ContextTr> Default for PrecompileRegistry<CTX> {
     fn default() -> Self {
         Self {
             map: HashMap::default(),
-            address_set: HashSet::default(),
+            address_set: AddressSet::default(),
             fast_lookup: vec![None; SHORT_ADDRESS_CAP],
             all_short: true,
         }
@@ -471,35 +476,12 @@ impl<CTX: ContextTr> Precompile<CTX> {
     ) -> Result<Option<InterpreterResult>, String> {
         match self {
             Self::Simple(p) => {
-                let raw = p.execute(input, gas_limit);
-
-                let mut result = InterpreterResult {
-                    result: InstructionResult::Return,
-                    gas: Gas::new(gas_limit),
-                    output: Bytes::new(),
-                };
-
-                match raw {
-                    Ok(output) => {
-                        _ = result.gas.record_cost(output.gas_used);
-                        result.result = if output.reverted {
-                            InstructionResult::Revert
-                        } else {
-                            InstructionResult::Return
-                        };
-                        result.output = output.bytes;
-                    }
-                    Err(PrecompileError::Fatal(e)) => return Err(e),
-                    Err(e) => {
-                        result.result = if e.is_oog() {
-                            InstructionResult::PrecompileOOG
-                        } else {
-                            InstructionResult::PrecompileError
-                        };
-                    }
-                }
-
-                Ok(Some(result))
+                let output = p
+                    .execute(input, gas_limit, 0)
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(precompile_output_to_interpreter_result(
+                    output, gas_limit,
+                )))
             }
             Self::Extended(ext) => {
                 ext.execute(ctx, input, target, caller, value, is_static, gas_limit)
@@ -610,10 +592,34 @@ pub(crate) trait ArbPrecompileLogic<CTX: ArbitrumContextTr> {
             try_record_cost!(gas, ISTANBUL_SLOAD_GAS);
         }
 
-        if purity >= StateMutability::NonPayable && is_static {
+        let direct_static = matches!(
+            context.local().direct_call_scheme(),
+            Some(revm::interpreter::CallScheme::StaticCall)
+        );
+        if purity >= StateMutability::NonPayable && direct_static {
             gas.spend_all();
             interpreter_revert!(gas, Bytes::new());
         }
+
+        // Nitro allows a CALL to a write precompile from beneath a static
+        // ancestor, but burns the ArbOS per-transaction allowance first. The
+        // direct STATICCALL case above remains an immediate rejection.
+        if purity >= StateMutability::NonPayable && is_static && !direct_static {
+            let per_tx_gas = match context
+                .arb_state(Some(&mut gas), true)
+                .l2_pricing()
+                .per_tx_gas_limit()
+                .get()
+            {
+                Ok(limit) => limit,
+                Err(_) => interpreter_revert!(gas, Bytes::new()),
+            };
+            if !gas.record_regular_cost(per_tx_gas) {
+                gas.spend_all();
+            }
+        }
+
+        let execution_is_static = is_static && direct_static;
 
         if call_value > U256::ZERO && purity < StateMutability::Payable {
             gas.spend_all();
@@ -627,7 +633,7 @@ pub(crate) trait ArbPrecompileLogic<CTX: ArbitrumContextTr> {
             target_address,
             caller_address,
             call_value,
-            is_static,
+            execution_is_static,
             gas.remaining(),
         ) {
             outcome

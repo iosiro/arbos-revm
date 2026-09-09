@@ -5,12 +5,14 @@
 mod buffer;
 
 // pub mod api;
+pub mod chain;
 pub mod config;
 pub mod constants;
 pub mod context;
 pub mod evm;
 pub mod handler;
 pub mod inspector;
+pub mod instructions;
 pub mod l1_fee;
 pub mod local_context;
 pub mod macros;
@@ -24,15 +26,17 @@ pub mod transaction;
 pub mod utils;
 
 pub use evm::ArbitrumEvm;
-pub use result::ArbitrumHaltReason;
+pub use instructions::ArbitrumInstructions;
+pub use result::{ArbitrumCommittedFailure, ArbitrumExecutionOutcome, ArbitrumHaltReason};
 
 //pub use precompiles::ArbitrumPrecompiles;
 //pub use spec::*;
+pub use chain::{ArbitrumChain, ArbitrumChainTr};
 pub use context::{ArbitrumContext, ArbitrumContextTr};
 use revm::primitives::hex;
 pub use transaction::{
-    ArbitrumDepositTx, ArbitrumInternalTx, ArbitrumTransaction, ArbitrumTransactionError,
-    ArbitrumTxTr, ArbitrumTypedTransaction,
+    ArbitrumDepositTx, ArbitrumInternalTx, ArbitrumRetryTx, ArbitrumTransaction,
+    ArbitrumTransactionError, ArbitrumTxProvenance, ArbitrumTxTr, ArbitrumTypedTransaction,
 };
 
 pub trait Utf8OrHex {
