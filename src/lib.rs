@@ -12,6 +12,7 @@ pub mod context;
 pub mod evm;
 pub mod handler;
 pub mod inspector;
+pub mod instructions;
 pub mod l1_fee;
 pub mod local_context;
 pub mod macros;
@@ -25,6 +26,7 @@ pub mod transaction;
 pub mod utils;
 
 pub use evm::ArbitrumEvm;
+pub use instructions::ArbitrumInstructions;
 pub use result::{ArbitrumCommittedFailure, ArbitrumExecutionOutcome, ArbitrumHaltReason};
 
 //pub use precompiles::ArbitrumPrecompiles;

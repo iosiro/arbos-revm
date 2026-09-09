@@ -1,7 +1,8 @@
+use crate::instructions::ArbitrumInstructionProvider;
 use std::ops::{Deref, DerefMut};
 
 use crate::{
-    ArbitrumContextTr,
+    ArbitrumContextTr, ArbitrumInstructions,
     chain::ArbitrumChainTr,
     config::ArbitrumConfigTr,
     constants::{
@@ -23,7 +24,6 @@ use revm::{
     handler::{
         EthFrame, EvmTr, FrameData, FrameInitOrResult, FrameResult, FrameTr, Handler, ItemOrResult,
         PrecompileProvider,
-        instructions::{EthInstructions, InstructionProvider},
     },
     interpreter::{
         FrameInput, InstructionResult, InterpreterAction, InterpreterResult,
@@ -66,7 +66,7 @@ pub(crate) fn validate_arbos_create_output(
     }
 }
 
-pub struct ArbitrumEvm<CTX, INSP, P, I = EthInstructions<EthInterpreter, CTX>, F = EthFrame>(
+pub struct ArbitrumEvm<CTX, INSP, P, I = ArbitrumInstructions<CTX>, F = EthFrame>(
     pub Evm<CTX, INSP, I, P, F>,
 );
 
@@ -88,11 +88,30 @@ impl<CTX, I, INSP, P, F> ArbitrumEvm<CTX, INSP, P, I, F> {
     }
 }
 
+impl<CTX, INSP, P, I, F> ArbitrumEvm<CTX, INSP, P, I, F>
+where
+    CTX: ArbitrumContextTr,
+    I: ArbitrumInstructionProvider<Context = CTX>,
+    P: PrecompileProvider<CTX>,
+{
+    /// Refreshes execution tables after an embedding changes context between frames.
+    pub(crate) fn sync_execution_spec(&mut self) {
+        let spec = self.0.ctx.cfg().spec();
+        self.0.instruction.set_spec(spec.clone().into());
+        if self.0.precompiles.set_spec(spec) {
+            self.0
+                .ctx
+                .journal_mut()
+                .warm_precompiles(self.0.precompiles.warm_addresses());
+        }
+    }
+}
+
 impl<CTX, INSP, P, I, F> Deref for ArbitrumEvm<CTX, INSP, P, I, F>
 where
     CTX: ArbitrumContextTr + ContextSetters,
     INSP: Inspector<CTX, I::InterpreterTypes>,
-    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    I: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     type Target = Evm<CTX, INSP, I, P, F>;
@@ -106,7 +125,7 @@ impl<CTX, INSP, P, I, F> DerefMut for ArbitrumEvm<CTX, INSP, P, I, F>
 where
     CTX: ArbitrumContextTr + ContextSetters,
     INSP: Inspector<CTX, I::InterpreterTypes>,
-    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    I: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -117,7 +136,7 @@ where
 impl<CTX, INSP, P, I> EvmTr for ArbitrumEvm<CTX, INSP, P, I, EthFrame<EthInterpreter>>
 where
     CTX: ArbitrumContextTr,
-    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    I: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     type Context = CTX;
@@ -152,6 +171,7 @@ where
         ItemOrResult<&mut Self::Frame, <Self::Frame as FrameTr>::FrameResult>,
         ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
     > {
+        self.sync_execution_spec();
         let caller = match &frame_input.frame_input {
             FrameInput::Call(inputs) => Some(inputs.caller),
             FrameInput::Create(inputs) => Some(inputs.caller()),
@@ -178,6 +198,7 @@ where
         FrameInitOrResult<Self::Frame>,
         ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
     > {
+        self.sync_execution_spec();
         let code = self.frame_stack().get().interpreter.bytecode.bytes();
         let is_stylus = code.starts_with(STYLUS_DISCRIMINANT)
             || (self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
@@ -270,7 +291,7 @@ impl<CTX, INSP, INST, PRECOMPILES> ExecuteEvm
     for ArbitrumEvm<CTX, INSP, PRECOMPILES, INST, EthFrame<EthInterpreter>>
 where
     CTX: ArbitrumContextMutTr<Journal: JournalTr<State = EvmState>> + ContextSetters,
-    INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    INST: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     type ExecutionResult = ExecutionResult<HaltReason>;
@@ -310,7 +331,7 @@ impl<CTX, INSP, INST, PRECOMPILES> ExecuteCommitEvm
 where
     CTX: ArbitrumContextMutTr<Journal: JournalTr<State = EvmState>, Db: DatabaseCommit>
         + ContextSetters,
-    INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    INST: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     #[inline]
@@ -324,7 +345,7 @@ impl<CTX, INSP, INST, PRECOMPILES>
 where
     CTX: ArbitrumContextMutTr<Tx = ArbitrumTransaction, Journal: JournalTr<State = EvmState>>
         + ContextSetters,
-    INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    INST: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     /// Executes one transaction while preserving ArbOS's typed distinction
@@ -364,7 +385,7 @@ where
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
     CTX: ArbitrumContextTr,
-    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    I: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     /// Executes the main frame processing loop.

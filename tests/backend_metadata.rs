@@ -142,10 +142,9 @@ fn arb_sys_observes_actual_parent_caller_at_depth_three() {
 
 #[test]
 fn immediate_and_inspector_overridden_calls_preserve_parent_metadata() {
-    use arbos_revm::{ArbitrumEvm, precompiles::ArbitrumPrecompileProvider};
+    use arbos_revm::{ArbitrumEvm, ArbitrumInstructions, precompiles::ArbitrumPrecompileProvider};
     use revm::{
         InspectEvm, Inspector,
-        handler::instructions::EthInstructions,
         interpreter::{CallInputs, CallOutcome, Gas, InstructionResult, InterpreterResult},
         primitives::hardfork::SpecId,
     };
@@ -200,7 +199,7 @@ fn immediate_and_inspector_overridden_calls_preserve_parent_metadata() {
                 intercept,
                 intercepted: false,
             },
-            EthInstructions::new_mainnet_with_spec(SpecId::default()),
+            ArbitrumInstructions::new(SpecId::default()),
             ArbitrumPrecompileProvider::new(SpecId::default()),
         );
         let result = evm

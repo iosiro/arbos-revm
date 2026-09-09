@@ -18,6 +18,9 @@ pub struct ArbitrumChain {
     /// RPC L2 height when the execution block environment exposes an L1 height.
     #[cfg_attr(feature = "serde", serde(default))]
     rpc_block_number: Option<u64>,
+    /// Verified RPC parent hash, distinct from the L1 hashes exposed by BLOCKHASH backends.
+    #[cfg_attr(feature = "serde", serde(default))]
+    rpc_parent_block_hash: Option<B256>,
     /// Consensus-priced recent program accesses, shared by transactions in a block.
     #[cfg_attr(feature = "serde", serde(default))]
     recent_wasms: VecDeque<B256>,
@@ -28,6 +31,7 @@ pub struct ArbitrumChain {
 
 pub trait ArbitrumChainTr {
     fn rpc_block_number(&self) -> Option<u64>;
+    fn rpc_parent_block_hash(&self) -> Option<B256>;
     fn schedule_retry(&mut self, retry: ArbitrumRetryTx);
     fn next_scheduled_retry(&mut self) -> Option<ArbitrumRetryTx>;
     fn scheduled_retries(&self) -> &VecDeque<ArbitrumRetryTx>;
@@ -44,6 +48,10 @@ pub trait ArbitrumChainTr {
 impl ArbitrumChainTr for ArbitrumChain {
     fn rpc_block_number(&self) -> Option<u64> {
         self.rpc_block_number
+    }
+
+    fn rpc_parent_block_hash(&self) -> Option<B256> {
+        self.rpc_parent_block_hash
     }
 
     fn schedule_retry(&mut self, retry: ArbitrumRetryTx) {
@@ -102,13 +110,38 @@ impl ArbitrumChainTr for ArbitrumChain {
 
 impl ArbitrumChain {
     pub fn set_rpc_block_number(&mut self, number: Option<u64>) {
+        if self.rpc_block_number != number {
+            self.rpc_parent_block_hash = None;
+        }
         self.rpc_block_number = number;
+    }
+
+    pub fn set_rpc_block(&mut self, number: u64, parent_hash: B256) {
+        self.set_rpc_block_number(Some(number));
+        self.rpc_parent_block_hash = Some(parent_hash);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_parent_hash_follows_the_exact_block_context() {
+        let mut chain = ArbitrumChain::default();
+        let parent = B256::repeat_byte(0x42);
+        chain.set_rpc_block(7, parent);
+        chain.set_rpc_block_number(Some(7));
+        assert_eq!(chain.rpc_parent_block_hash(), Some(parent));
+        let snapshot = chain.clone();
+        chain.set_rpc_block_number(Some(8));
+        assert_eq!(chain.rpc_parent_block_hash(), None);
+        assert_eq!(snapshot.rpc_parent_block_hash(), Some(parent));
+        chain.set_rpc_block(7, B256::repeat_byte(0x99));
+        assert_eq!(chain.rpc_parent_block_hash(), Some(B256::repeat_byte(0x99)));
+        chain.set_rpc_block_number(None);
+        assert_eq!(chain.rpc_parent_block_hash(), None);
+    }
 
     #[test]
     fn recent_wasm_zero_capacity_matches_nitro() {

@@ -185,7 +185,7 @@ impl<SPEC: Into<SpecId> + Clone> Cfg for ArbitrumConfig<SPEC> {
 
 impl<SPEC> ArbitrumConfigTr for ArbitrumConfig<SPEC>
 where
-    SPEC: Into<SpecId> + Clone,
+    SPEC: Into<SpecId> + From<SpecId> + Clone,
 {
     fn arbos_version(&self) -> u64 {
         self.arbos_version
@@ -193,6 +193,11 @@ where
 
     fn set_arbos_version(&mut self, version: u64) {
         self.arbos_version = version;
+        self.inner
+            .set_spec_and_mainnet_gas_params(spec_id_for_arbos_version(version).into());
+        // ArbOS does not activate Amsterdam's Ethereum gas model.
+        self.inner.enable_amsterdam_eip8037 = false;
+        self.inner.enable_amsterdam_eip2780 = false;
     }
 
     fn debug_mode(&self) -> bool {

@@ -71,6 +71,7 @@ where
 {
     fn set_live_arbos_version(&mut self, version: u64) {
         self.cfg.set_arbos_version(version);
+        self.journaled_state.set_spec_id(self.cfg.spec().into());
     }
 
     fn drop_transaction_tip(&mut self, base_fee: u128) {

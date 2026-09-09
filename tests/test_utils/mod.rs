@@ -6,7 +6,7 @@
 use std::convert::Infallible;
 
 use arbos_revm::{
-    ArbitrumContext, ArbitrumEvm, ArbitrumTransaction,
+    ArbitrumContext, ArbitrumEvm, ArbitrumInstructions, ArbitrumTransaction,
     config::ArbitrumConfig,
     constants::STYLUS_DISCRIMINANT,
     local_context::ArbitrumLocalContext,
@@ -17,7 +17,6 @@ use revm::{
     ExecuteEvm, InspectEvm, Journal,
     context::{BlockEnv, ContextTr, JournalTr, TxEnv, result::ExecutionResult},
     database::EmptyDBTyped,
-    handler::instructions::EthInstructions,
     inspector::NoOpInspector,
     primitives::{Address, Bytes, TxKind, U256, keccak256},
     state::Bytecode,
@@ -36,7 +35,7 @@ pub type TestEvm = ArbitrumEvm<
     TestContext,
     NoOpInspector,
     ArbitrumPrecompileProvider<TestContext>,
-    EthInstructions<revm::interpreter::interpreter::EthInterpreter, TestContext>,
+    ArbitrumInstructions<TestContext>,
 >;
 
 /// Setup a test context with an empty database
@@ -74,7 +73,7 @@ pub fn create_evm(context: TestContext) -> TestEvm {
     ArbitrumEvm::new_with_inspector(
         context,
         NoOpInspector {},
-        EthInstructions::new_mainnet_with_spec(revm::primitives::hardfork::SpecId::default()),
+        ArbitrumInstructions::new(revm::primitives::hardfork::SpecId::default()),
         ArbitrumPrecompileProvider::new(revm::primitives::hardfork::SpecId::default()),
     )
 }

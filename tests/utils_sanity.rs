@@ -1736,6 +1736,17 @@ fn test_start_block_internal_tx_applies_scheduled_upgrade() {
         state.upgrade_timestamp().set(1_000).unwrap();
     }
 
+    let caller = Address::repeat_byte(0x55);
+    let target = Address::repeat_byte(0x66);
+    fund_account(&mut context, caller, U256::from(100_000_000u64));
+    context.journal_mut().load_account(target).unwrap();
+    context.journal_mut().set_code(
+        target,
+        Bytecode::new_raw(Bytes::from_static(&[
+            0x60, 0x00, 0x1e, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ])),
+    );
+
     let data = startBlockCall {
         l1BaseFee: U256::ZERO,
         l1BlockNumber: 100,
@@ -1752,6 +1763,17 @@ fn test_start_block_internal_tx_applies_scheduled_upgrade() {
         ..Default::default()
     };
     let mut evm = create_evm(context);
+    let mut probe = revm::context::TxEnv {
+        caller,
+        kind: revm::primitives::TxKind::Call(target),
+        gas_limit: 1_000_000,
+        gas_price: 1,
+        ..Default::default()
+    };
+    assert!(
+        execute_tx(&mut evm, probe.clone()).is_halt(),
+        "CLZ is not active at ArbOS 42"
+    );
     assert!(matches!(
         execute_tx(&mut evm, tx),
         revm::context::result::ExecutionResult::Success { .. }
@@ -1763,6 +1785,16 @@ fn test_start_block_internal_tx_applies_scheduled_upgrade() {
         assert_eq!(state.blockhashes().l1_block_number().get().unwrap(), 100);
     }
     assert_eq!(evm.0.ctx.cfg.arbos_version, 50);
+    probe.nonce = 1;
+    let result = execute_tx(&mut evm, probe);
+    assert!(
+        result.is_success(),
+        "CLZ must activate after the scheduled upgrade: {result:?}"
+    );
+    assert_eq!(
+        result.output().unwrap().as_ref(),
+        &U256::from(256).to_be_bytes::<32>()
+    );
 }
 
 fn execute_internal_call(context: test_utils::TestContext, data: Vec<u8>) -> test_utils::TestEvm {

@@ -1,3 +1,4 @@
+use crate::instructions::ArbitrumInstructionProvider;
 use std::{cmp::min, mem, sync::Arc};
 
 use arbutil::evm::{
@@ -7,9 +8,7 @@ use arbutil::evm::{
 use revm::{
     Database,
     context::{Cfg, ContextError, ContextTr, CreateScheme, FrameStack, JournalTr},
-    handler::{
-        EvmTr, FrameResult, ItemOrResult, PrecompileProvider, instructions::InstructionProvider,
-    },
+    handler::{EvmTr, FrameResult, ItemOrResult, PrecompileProvider},
     interpreter::{
         CallInput, CallInputs, CreateInputs, FrameInput, Gas, InputsImpl, InstructionResult,
         InterpreterAction, InterpreterResult, interpreter::EthInterpreter,
@@ -129,7 +128,7 @@ fn stylus_call_scheme(
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
     CTX: ArbitrumContextTr,
-    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    I: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     /// Handle contract calls (ContractCall, DelegateCall, StaticCall)
@@ -823,11 +822,8 @@ impl From<Status> for Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ArbitrumContext, precompiles::ArbitrumPrecompileProvider};
-    use revm::{
-        Journal, context::Host, database::EmptyDB, handler::instructions::EthInstructions,
-        inspector::NoOpInspector,
-    };
+    use crate::{ArbitrumContext, ArbitrumInstructions, precompiles::ArbitrumPrecompileProvider};
+    use revm::{Journal, context::Host, database::EmptyDB, inspector::NoOpInspector};
 
     #[test]
     fn stylus_storage_writes_charge_static_and_dynamic_gas() {
@@ -850,7 +846,7 @@ mod tests {
         let mut evm = ArbitrumEvm::new_with_inspector(
             context,
             NoOpInspector,
-            EthInstructions::new_mainnet_with_spec(SpecId::OSAKA),
+            ArbitrumInstructions::new(SpecId::OSAKA),
             ArbitrumPrecompileProvider::new(SpecId::OSAKA),
         );
 

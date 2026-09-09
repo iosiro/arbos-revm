@@ -7,9 +7,10 @@ use crate::{
         ARBITRUM_CONTRACT_TX_TYPE, ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE,
         ARBITRUM_RETRY_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBITRUM_UNSIGNED_TX_TYPE,
         ARBOS_ADDRESS, ARBOS_L1_PRICER_FUNDS_ADDRESS, HISTORY_SERVE_WINDOW,
-        HISTORY_STORAGE_ADDRESS,
+        HISTORY_STORAGE_ADDRESS, MAX_ARBOS_VERSION_SUPPORTED,
     },
     context::{ArbitrumContextMutTr, ArbitrumContextTr},
+    instructions::ArbitrumInstructionProvider,
     l1_fee,
     local_context::ArbitrumLocalContextTr,
     result::ArbitrumCommittedFailure,
@@ -82,7 +83,7 @@ use revm::{
     },
     context_interface::journaled_state::{JournalCheckpoint, account::JournaledAccountTr},
     handler::{
-        EthFrame, EvmTr, FrameResult, FrameTr, Handler, MainnetHandler,
+        EthFrame, EvmTr, FrameResult, FrameTr, Handler, MainnetHandler, PrecompileProvider,
         handler::EvmTrError,
         pre_execution::{calculate_caller_fee, validate_account_nonce_and_code_with_components},
     },
@@ -121,10 +122,39 @@ impl<EVM, ERROR> ArbitrumHandler<EVM, ERROR, EthFrame<EthInterpreter>>
 where
     EVM: EvmTr<
             Context: ArbitrumContextMutTr<Journal: JournalTr<State = EvmState>>,
+            Instructions: ArbitrumInstructionProvider,
             Frame = EthFrame<EthInterpreter>,
         >,
     ERROR: EvmTrError<EVM> + FromStringError,
 {
+    /// Refresh all execution-time fork rules before transaction validation.
+    fn sync_arbos_version(&mut self, evm: &mut EVM) -> Result<u64, ERROR> {
+        let version = evm
+            .ctx()
+            .arb_state(None, false)
+            .arbos_version()
+            .get()
+            .map_err(|err| ERROR::from_string(err.to_string()))?;
+        if version > MAX_ARBOS_VERSION_SUPPORTED {
+            return Err(ERROR::from_string(format!(
+                "unsupported ArbOS version {version}"
+            )));
+        }
+        if version != 0 {
+            evm.ctx().set_live_arbos_version(version);
+            let spec = evm.ctx().cfg().spec().into();
+            evm.ctx_instructions().1.set_spec(spec);
+            let spec = evm.ctx().cfg().spec();
+            let (context, precompiles) = evm.ctx_precompiles();
+            if precompiles.set_spec(spec) {
+                context
+                    .journal_mut()
+                    .warm_precompiles(precompiles.warm_addresses());
+            }
+        }
+        Ok(version)
+    }
+
     /// Executes an Arbitrum deposit transaction.
     ///
     /// Deposit transactions mint ETH from L1 to L2:
@@ -242,6 +272,8 @@ where
             let block_number = ctx.arb_block_number().saturating_to::<u64>();
             let previous_hash = if block_number == 0 {
                 Default::default()
+            } else if let Some(hash) = ctx.chain().rpc_parent_block_hash() {
+                hash
             } else {
                 ctx.block_hash(block_number - 1).unwrap_or_default()
             };
@@ -747,6 +779,7 @@ impl<EVM, ERROR> Handler for ArbitrumHandler<EVM, ERROR, EthFrame<EthInterpreter
 where
     EVM: EvmTr<
             Context: ArbitrumContextMutTr<Journal: JournalTr<State = EvmState>>,
+            Instructions: ArbitrumInstructionProvider,
             Frame = EthFrame<EthInterpreter>,
         >,
     ERROR: EvmTrError<EVM> + FromStringError,
@@ -765,15 +798,7 @@ where
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
         // Persisted ArbOS state is authoritative. Foundry may reuse an EVM
         // context across transactions, including across a scheduled upgrade.
-        let persisted_version = evm
-            .ctx()
-            .arb_state(None, false)
-            .arbos_version()
-            .get()
-            .map_err(|err| ERROR::from_string(err.to_string()))?;
-        if persisted_version != 0 {
-            evm.ctx().set_live_arbos_version(persisted_version);
-        }
+        let persisted_version = self.sync_arbos_version(evm)?;
         let block_number = evm.ctx().arb_block_number().saturating_to::<u64>();
         evm.ctx().chain_mut().begin_block(block_number);
         let tx_type = evm.ctx().tx().tx_type();
@@ -1341,6 +1366,7 @@ impl<EVM, ERROR> InspectorHandler for ArbitrumHandler<EVM, ERROR, EthFrame<EthIn
 where
     EVM: InspectorEvmTr<
             Context: ArbitrumContextMutTr<Journal: JournalTr<State = EvmState>>,
+            Instructions: ArbitrumInstructionProvider,
             Frame = EthFrame<EthInterpreter>,
             Inspector: Inspector<<<Self as Handler>::Evm as EvmTr>::Context, EthInterpreter>,
         >,
@@ -1352,15 +1378,7 @@ where
         &mut self,
         evm: &mut Self::Evm,
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
-        let persisted_version = evm
-            .ctx()
-            .arb_state(None, false)
-            .arbos_version()
-            .get()
-            .map_err(|err| ERROR::from_string(err.to_string()))?;
-        if persisted_version != 0 {
-            evm.ctx().set_live_arbos_version(persisted_version);
-        }
+        let persisted_version = self.sync_arbos_version(evm)?;
         let block_number = evm.ctx().arb_block_number().saturating_to::<u64>();
         evm.ctx().chain_mut().begin_block(block_number);
 

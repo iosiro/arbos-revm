@@ -15,11 +15,12 @@ use arbutil::{
     },
 };
 
+use crate::instructions::ArbitrumInstructionProvider;
 use lru::LruCache;
 use revm::{
     Inspector,
     context::{Block, Cfg, ContextSetters, ContextTr, JournalTr, LocalContextTr, Transaction},
-    handler::{EvmTr, PrecompileProvider, instructions::InstructionProvider},
+    handler::{EvmTr, PrecompileProvider},
     inspector::{InspectorEvmTr, JournalExt},
     interpreter::{
         CallInput, FrameInput, Gas, InputsImpl, InstructionResult, InterpreterAction,
@@ -196,7 +197,7 @@ fn restore_open_pages_on_error<T, E>(
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
     CTX: ArbitrumContextTr,
-    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    I: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     /// Common method to build API requestor for both inspected and non-inspected modes
@@ -751,7 +752,7 @@ impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
     CTX: ArbitrumContextTr,
     CTX::Journal: JournalExt,
-    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    I: ArbitrumInstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
     CTX: ContextSetters,
     INSP: Inspector<CTX>,
