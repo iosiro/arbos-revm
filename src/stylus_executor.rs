@@ -45,6 +45,7 @@ use tracing::{debug, trace, warn};
 
 use crate::{
     ArbitrumEvm, Utf8OrHex,
+    chain::ArbitrumChainTr,
     config::ArbitrumConfigTr,
     constants::{
         ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, ARBOS_VERSION_STYLUS_FIXES, COST_SCALAR_PERCENT,
@@ -507,7 +508,7 @@ where
         let recent_cache_hit =
             if self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT {
                 let block_number = self.ctx().arb_block_number().saturating_to();
-                self.ctx().local_mut().insert_recent_wasm(
+                self.ctx().chain_mut().insert_recent_wasm(
                     code_hash,
                     stylus_params.block_cache_size,
                     block_number,

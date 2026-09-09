@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use revm::primitives::B256;
+
 use crate::{result::ArbitrumCommittedFailure, transaction::ArbitrumRetryTx};
 
 /// Block/backend-owned Arbitrum state that survives transaction-local cleanup.
@@ -16,6 +18,12 @@ pub struct ArbitrumChain {
     /// RPC L2 height when the execution block environment exposes an L1 height.
     #[cfg_attr(feature = "serde", serde(default))]
     rpc_block_number: Option<u64>,
+    /// Consensus-priced recent program accesses, shared by transactions in a block.
+    #[cfg_attr(feature = "serde", serde(default))]
+    recent_wasms: VecDeque<B256>,
+    /// Nitro fixes the capacity on the first program access in each block.
+    #[cfg_attr(feature = "serde", serde(default))]
+    recent_wasms_capacity: Option<u16>,
 }
 
 pub trait ArbitrumChainTr {
@@ -28,6 +36,9 @@ pub trait ArbitrumChainTr {
     fn begin_block(&mut self, number: u64);
     fn block_gas_used(&self) -> u64;
     fn record_block_gas(&mut self, gas: u64);
+    /// Records a program access, returning whether it was already in the block's LRU.
+    /// Accesses survive transaction cleanup and frame reverts, but not block changes.
+    fn insert_recent_wasm(&mut self, code_hash: B256, retain: u16, block_number: u64) -> bool;
 }
 
 impl ArbitrumChainTr for ArbitrumChain {
@@ -59,6 +70,8 @@ impl ArbitrumChainTr for ArbitrumChain {
         if self.block_number != Some(number) {
             self.block_number = Some(number);
             self.block_gas_used = 0;
+            self.recent_wasms.clear();
+            self.recent_wasms_capacity = None;
         }
     }
 
@@ -69,10 +82,68 @@ impl ArbitrumChainTr for ArbitrumChain {
     fn record_block_gas(&mut self, gas: u64) {
         self.block_gas_used = self.block_gas_used.saturating_add(gas);
     }
+
+    fn insert_recent_wasm(&mut self, code_hash: B256, retain: u16, block_number: u64) -> bool {
+        self.begin_block(block_number);
+        // Nitro's BasicLRU clamps zero capacity to one and never resizes an existing cache.
+        let capacity = *self.recent_wasms_capacity.get_or_insert(retain.max(1));
+        if let Some(pos) = self.recent_wasms.iter().position(|hash| *hash == code_hash) {
+            self.recent_wasms.remove(pos);
+            self.recent_wasms.push_back(code_hash);
+            return true;
+        }
+        if self.recent_wasms.len() == usize::from(capacity) {
+            self.recent_wasms.pop_front();
+        }
+        self.recent_wasms.push_back(code_hash);
+        false
+    }
 }
 
 impl ArbitrumChain {
     pub fn set_rpc_block_number(&mut self, number: Option<u64>) {
         self.rpc_block_number = number;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_wasm_zero_capacity_matches_nitro() {
+        let mut chain = ArbitrumChain::default();
+        let a = B256::repeat_byte(1);
+        let b = B256::repeat_byte(2);
+        assert!(!chain.insert_recent_wasm(a, 0, 7));
+        assert!(chain.insert_recent_wasm(a, 0, 7));
+        assert!(!chain.insert_recent_wasm(b, 0, 7));
+        assert!(!chain.insert_recent_wasm(a, 0, 7));
+    }
+
+    #[test]
+    fn recent_wasm_capacity_and_recency_are_block_scoped() {
+        let mut chain = ArbitrumChain::default();
+        let a = B256::repeat_byte(1);
+        let b = B256::repeat_byte(2);
+        let c = B256::repeat_byte(3);
+        assert!(!chain.insert_recent_wasm(a, 2, 7));
+        assert!(!chain.insert_recent_wasm(b, 1, 7));
+        assert!(chain.insert_recent_wasm(a, 1, 7));
+        assert!(!chain.insert_recent_wasm(c, 1, 7));
+        assert!(chain.insert_recent_wasm(a, 1, 7));
+        assert!(!chain.insert_recent_wasm(b, 1, 7));
+
+        let mut nested = chain.clone();
+        assert!(nested.insert_recent_wasm(b, 1, 7));
+        assert!(!nested.insert_recent_wasm(c, 1, 7));
+        assert!(
+            chain.insert_recent_wasm(a, 1, 7),
+            "clones must be independent"
+        );
+
+        assert!(!chain.insert_recent_wasm(a, 1, 8));
+        assert!(!chain.insert_recent_wasm(b, 2, 8));
+        assert!(!chain.insert_recent_wasm(a, 2, 8));
     }
 }
