@@ -17,7 +17,6 @@ use revm::{
     ExecuteEvm, Journal,
     context::{BlockEnv, ContextTr, JournalTr, TxEnv, result::ExecutionResult},
     database::EmptyDBTyped,
-    handler::instructions::EthInstructions,
     inspector::NoOpInspector,
     primitives::{Address, Bytes, TxKind, U256, keccak256},
     state::Bytecode,
@@ -36,7 +35,7 @@ pub type TestEvm = ArbitrumEvm<
     TestContext,
     NoOpInspector,
     ArbitrumPrecompileProvider<TestContext>,
-    EthInstructions<revm::interpreter::interpreter::EthInterpreter, TestContext>,
+    arbos_revm::ArbitrumInstructions<TestContext>,
 >;
 
 /// Setup a test context with an empty database
@@ -48,7 +47,7 @@ pub fn setup_context() -> TestContext {
         block: BlockEnv::default(),
         cfg: ArbitrumConfig::default(),
         tx: ArbitrumTransaction::default(),
-        chain: (),
+        chain: Default::default(),
         local: ArbitrumLocalContext::default(),
         error: Ok(()),
     }
@@ -74,7 +73,7 @@ pub fn create_evm(context: TestContext) -> TestEvm {
     ArbitrumEvm::new_with_inspector(
         context,
         NoOpInspector {},
-        EthInstructions::default(),
+        arbos_revm::ArbitrumInstructions::default(),
         ArbitrumPrecompileProvider::new(revm::primitives::hardfork::SpecId::default()),
     )
 }

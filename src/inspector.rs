@@ -22,7 +22,7 @@ use revm::{
 };
 
 use crate::{
-    ArbitrumContextTr, ArbitrumEvm,
+    ArbitrumEvm,
     config::ArbitrumConfigTr,
     constants::{
         ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, STYLUS_DISCRIMINANT, STYLUS_ROOT_DISCRIMINANT,
@@ -50,7 +50,7 @@ impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I> {
 
 impl<CTX, INSP, P, I> InspectorEvmTr for ArbitrumEvm<CTX, INSP, P, I>
 where
-    CTX: ArbitrumContextTr<Journal: JournalExt> + ContextSetters,
+    CTX: crate::context::ArbitrumContextMutTr<Journal: JournalExt> + ContextSetters,
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
     INSP: Inspector<CTX, I::InterpreterTypes>,
@@ -98,6 +98,7 @@ where
     fn inspect_frame_run(
         &mut self,
     ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
+        self.sync_execution_spec()?;
         let code = self.frame_stack.get().interpreter.bytecode.bytes();
         let is_stylus = code.starts_with(STYLUS_DISCRIMINANT)
             || (self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
@@ -180,7 +181,7 @@ where
 
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
-    CTX: ArbitrumContextTr,
+    CTX: crate::context::ArbitrumContextMutTr,
     CTX::Journal: JournalExt,
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
