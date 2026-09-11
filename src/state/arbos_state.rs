@@ -341,6 +341,7 @@ where
         self.programs()
             .initialize(&params.stylus_params, &params.data_pricer_params)?;
 
+        self.context.chain_mut().arbos_initialized = params.arbos_version != 0;
         Ok(())
     }
 

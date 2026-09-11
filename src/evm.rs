@@ -91,6 +91,11 @@ where
     pub fn sync_execution_spec(
         &mut self,
     ) -> Result<(), ContextError<<CTX::Db as Database>::Error>> {
+        // Ordinary Ethereum execution must not load synthetic ArbOS accounts or change
+        // the active frame's rules when a cheatcode selects a spec for subsequent calls.
+        if !self.0.ctx.chain().arbos_initialized {
+            return Ok(());
+        }
         let version = self
             .0
             .ctx

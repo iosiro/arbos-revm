@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 pub struct ArbitrumChain {
     /// RPC/L2 height, independent of EVM's L1 NUMBER value on forks.
     pub rpc_block_number: Option<u64>,
-    /// Whether execution is backed by initialized ArbOS state.
+    /// Whether ArbOS state is initialized locally or expected from the selected fork.
     pub arbos_initialized: bool,
     /// Optional embedding overrides for L1 BLOCKHASH, never written to L2 history.
     pub block_hash_overrides: BTreeMap<u64, B256>,

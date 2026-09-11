@@ -13,6 +13,15 @@ use revm::{
 use test_utils::{create_evm, execute_tx, fund_account, setup_context};
 
 #[test]
+fn ethereum_frame_sync_does_not_load_arbos_state() {
+    let mut evm = create_evm(setup_context());
+    assert!(evm.0.ctx.journal_mut().state().is_empty());
+    evm.sync_execution_spec().unwrap();
+    assert!(evm.0.ctx.journal_mut().state().is_empty());
+    assert!(!evm.0.ctx.chain().arbos_initialized);
+}
+
+#[test]
 fn persisted_arbos_version_selects_calldata_floor_and_osaka_instructions() {
     let caller = Address::repeat_byte(0x11);
     let stop_contract = Address::repeat_byte(0x22);
