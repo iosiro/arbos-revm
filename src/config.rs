@@ -162,7 +162,7 @@ impl<SPEC: Into<SpecId> + Copy> Cfg for ArbitrumConfig<SPEC> {
 
 impl<SPEC> ArbitrumConfigTr for ArbitrumConfig<SPEC>
 where
-    SPEC: Into<SpecId> + Copy + Copy,
+    SPEC: Into<SpecId> + From<SpecId> + Copy,
 {
     fn arbos_version(&self) -> u64 {
         self.arbos_version
@@ -170,6 +170,9 @@ where
 
     fn set_arbos_version(&mut self, version: u64) {
         self.arbos_version = version;
+        self.inner.spec = spec_id_for_arbos_version(version).into();
+        // Nitro excludes Arbitrum from EIP-7825; ArbOS caps compute gas separately.
+        self.inner.tx_gas_limit_cap.get_or_insert(u64::MAX);
     }
 
     fn debug_mode(&self) -> bool {

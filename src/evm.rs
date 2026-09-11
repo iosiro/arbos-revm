@@ -1,7 +1,7 @@
 use std::ops::{Deref, DerefMut};
 
 use crate::{
-    ArbitrumContextTr,
+    ArbitrumInstructions,
     config::ArbitrumConfigTr,
     constants::{
         ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, STYLUS_DISCRIMINANT, STYLUS_FRAGMENT_DISCRIMINANT,
@@ -9,6 +9,7 @@ use crate::{
     },
     context::ArbitrumContextMutTr,
     handler::ArbitrumHandler,
+    state::{ArbState, ArbStateGetter, types::StorageBackedTr},
     transaction::ArbitrumTransactionError,
 };
 use revm::{
@@ -19,8 +20,7 @@ use revm::{
     },
     handler::{
         EthFrame, EvmTr, FrameData, FrameInitOrResult, FrameResult, FrameTr, Handler, ItemOrResult,
-        PrecompileProvider,
-        instructions::{EthInstructions, InstructionProvider},
+        PrecompileProvider, instructions::InstructionProvider,
     },
     interpreter::{
         InstructionResult, InterpreterAction, InterpreterResult, interpreter::EthInterpreter,
@@ -63,7 +63,7 @@ pub(crate) fn validate_arbos_create_output(
     }
 }
 
-pub struct ArbitrumEvm<CTX, INSP, P, I = EthInstructions<EthInterpreter, CTX>, F = EthFrame>(
+pub struct ArbitrumEvm<CTX, INSP, P, I = ArbitrumInstructions<CTX>, F = EthFrame>(
     pub Evm<CTX, INSP, I, P, F>,
 );
 
@@ -81,9 +81,63 @@ impl<CTX, I, INSP, P, F> ArbitrumEvm<CTX, INSP, P, I, F> {
     }
 }
 
+impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
+where
+    CTX: ArbitrumContextMutTr,
+    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    P: PrecompileProvider<CTX>,
+{
+    /// Refreshes execution rules after an embedding replaces context between frames.
+    pub fn sync_execution_spec(
+        &mut self,
+    ) -> Result<(), ContextError<<CTX::Db as Database>::Error>> {
+        // Ordinary Ethereum execution must not load synthetic ArbOS accounts or change
+        // the active frame's rules when a cheatcode selects a spec for subsequent calls.
+        if !self.0.ctx.chain().arbos_initialized {
+            return Ok(());
+        }
+        let version = self
+            .0
+            .ctx
+            .arb_state(None, false)
+            .arbos_version()
+            .get()
+            .map_err(|error| ContextError::Custom(error.to_string()))?;
+        if version > crate::constants::MAX_ARBOS_VERSION_SUPPORTED {
+            return Err(ContextError::Custom(format!(
+                "unsupported ArbOS version {version}"
+            )));
+        }
+        self.0.ctx.chain_mut().arbos_initialized = version != 0;
+        if version != 0 {
+            self.0.ctx.set_live_arbos_version(version);
+        }
+        let spec = self.0.ctx.cfg().spec();
+        let changed = self.0.precompiles.set_spec(spec.clone());
+        let warm = self.0.ctx.journal().precompile_addresses();
+        if changed
+            || warm.len() != self.0.precompiles.warm_addresses().count()
+            || self
+                .0
+                .precompiles
+                .warm_addresses()
+                .any(|address| !warm.contains(&address))
+        {
+            self.0
+                .ctx
+                .journal_mut()
+                .warm_precompiles(self.0.precompiles.warm_addresses().collect());
+        }
+        if self.0.frame_stack.index().is_some() {
+            self.0.frame_stack.get().interpreter.runtime_flag.spec_id = spec.into();
+        }
+        Ok(())
+    }
+}
+
 impl<CTX, INSP, P, I, F> Deref for ArbitrumEvm<CTX, INSP, P, I, F>
 where
-    CTX: ArbitrumContextTr + ContextSetters,
+    CTX: ArbitrumContextMutTr + ContextSetters,
     INSP: Inspector<CTX, I::InterpreterTypes>,
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
@@ -97,7 +151,7 @@ where
 
 impl<CTX, INSP, P, I, F> DerefMut for ArbitrumEvm<CTX, INSP, P, I, F>
 where
-    CTX: ArbitrumContextTr + ContextSetters,
+    CTX: ArbitrumContextMutTr + ContextSetters,
     INSP: Inspector<CTX, I::InterpreterTypes>,
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
@@ -109,7 +163,7 @@ where
 
 impl<CTX, INSP, P, I> EvmTr for ArbitrumEvm<CTX, INSP, P, I, EthFrame<EthInterpreter>>
 where
-    CTX: ArbitrumContextTr,
+    CTX: ArbitrumContextMutTr,
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
@@ -145,6 +199,7 @@ where
         ItemOrResult<&mut Self::Frame, <Self::Frame as FrameTr>::FrameResult>,
         ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
     > {
+        self.sync_execution_spec()?;
         self.0.frame_init(frame_input)
     }
 
@@ -154,6 +209,7 @@ where
         FrameInitOrResult<Self::Frame>,
         ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
     > {
+        self.sync_execution_spec()?;
         let code = self.frame_stack().get().interpreter.bytecode.bytes();
         let is_stylus = code.starts_with(STYLUS_DISCRIMINANT)
             || (self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
@@ -286,7 +342,7 @@ where
 
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
-    CTX: ArbitrumContextTr,
+    CTX: ArbitrumContextMutTr,
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {

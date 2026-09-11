@@ -128,7 +128,7 @@ fn stylus_call_scheme(
 
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
-    CTX: ArbitrumContextTr,
+    CTX: crate::context::ArbitrumContextMutTr,
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {

@@ -925,7 +925,7 @@ mod tests {
             block: BlockEnv::default(),
             cfg: ArbitrumConfig::default(),
             tx: ArbitrumTransaction::default(),
-            chain: (),
+            chain: Default::default(),
             local: ArbitrumLocalContext::default(),
             error: Ok(()),
         }
@@ -939,7 +939,7 @@ mod tests {
             block: BlockEnv::default(),
             cfg: ArbitrumConfig::default(),
             tx: ArbitrumTransaction::default(),
-            chain: (),
+            chain: Default::default(),
             local: ArbitrumLocalContext::default(),
             error: Ok(()),
         }
