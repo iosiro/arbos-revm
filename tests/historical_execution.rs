@@ -13,15 +13,6 @@ use revm::{
 use test_utils::{create_evm, execute_tx, fund_account, setup_context};
 
 #[test]
-fn ethereum_frame_sync_does_not_load_arbos_state() {
-    let mut evm = create_evm(setup_context());
-    assert!(evm.0.ctx.journal_mut().state().is_empty());
-    evm.sync_execution_spec().unwrap();
-    assert!(evm.0.ctx.journal_mut().state().is_empty());
-    assert!(!evm.0.ctx.chain().arbos_initialized);
-}
-
-#[test]
 fn persisted_arbos_version_selects_calldata_floor_and_osaka_instructions() {
     let caller = Address::repeat_byte(0x11);
     let stop_contract = Address::repeat_byte(0x22);
@@ -37,8 +28,11 @@ fn persisted_arbos_version_selects_calldata_floor_and_osaka_instructions() {
         (20, 21_000 + 16 * 1024, false),
     ] {
         let mut context = setup_context();
-        // A stale newer spec must not enable opcode or gas rules before their ArbOS version.
-        context.cfg.inner.spec = SpecId::OSAKA;
+        // A stale future spec must not enable Ethereum's Amsterdam gas model in ArbOS.
+        context
+            .cfg
+            .inner
+            .set_spec_and_mainnet_gas_params(SpecId::AMSTERDAM);
         context
             .arb_state(None, false)
             .initialize(&ArbosStateParams::for_arbos_version(version))
@@ -60,7 +54,7 @@ fn persisted_arbos_version_selects_calldata_floor_and_osaka_instructions() {
         // Retain the instruction/precompile providers across state replacement, as in a reused EVM.
         context
             .journal_mut()
-            .warm_precompiles(evm.0.ctx.journal().precompile_addresses().clone());
+            .warm_precompiles(evm.0.ctx.journal().precompile_addresses());
         evm.0.ctx = context;
         let result = execute_tx(
             &mut evm,
@@ -75,7 +69,7 @@ fn persisted_arbos_version_selects_calldata_floor_and_osaka_instructions() {
         );
         assert!(result.is_success(), "ArbOS {version}: {result:?}");
         assert_eq!(
-            result.gas_used(),
+            result.tx_gas_used(),
             expected_gas,
             "ArbOS {version} calldata pricing"
         );
@@ -174,7 +168,7 @@ fn blob_basefee_halts_even_when_the_ethereum_spec_supports_it() {
         );
         assert!(result.is_halt(), "ArbOS {version}: {result:?}");
         assert_eq!(
-            result.gas_used(),
+            result.tx_gas_used(),
             100_000,
             "the exceptional halt burns all gas"
         );

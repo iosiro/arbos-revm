@@ -26,7 +26,7 @@ fn blockhash_reads_l1_ring_while_arb_sys_reads_l2_database() {
     let l2_hash = B256::repeat_byte(0x77);
     let mut context = test_utils::setup_context().with_db(InMemoryDB::default());
     context.block.number = U256::from(300);
-    context.chain.rpc_block_number = Some(102);
+    context.chain.set_rpc_block_number(Some(102));
     context
         .arb_state(None, false)
         .initialize(&ArbosStateParams::default())
@@ -62,7 +62,7 @@ fn blockhash_reads_l1_ring_while_arb_sys_reads_l2_database() {
         .block_hashes
         .insert(U256::from(101), l2_hash);
     let spec = context.cfg.inner.spec;
-    let instructions = ArbitrumInstructions::default();
+    let instructions = ArbitrumInstructions::new(spec);
     let mut evm = ArbitrumEvm::new_with_inspector(
         context,
         NoOpInspector,
@@ -107,32 +107,27 @@ fn blockhash_reads_l1_ring_while_arb_sys_reads_l2_database() {
         let mut inspected = ArbitrumEvm::new_with_inspector(
             evm.0.ctx.clone(),
             NoOpInspector,
-            ArbitrumInstructions::default(),
+            ArbitrumInstructions::new(spec),
             ArbitrumPrecompileProvider::new(spec),
         );
         let mut ethereum_instructions = ArbitrumEvm::new_with_inspector(
             evm.0.ctx.clone(),
             NoOpInspector,
-            EthInstructions::default(),
+            EthInstructions::new_mainnet_with_spec(spec),
             ArbitrumPrecompileProvider::new(spec),
         );
-        for (arbitrum, ethereum) in evm.0.instruction.instruction_table().iter().zip(
-            ethereum_instructions
-                .0
-                .instruction
-                .instruction_table()
-                .iter(),
-        ) {
-            assert_eq!(arbitrum.static_gas(), ethereum.static_gas());
-        }
+        assert_eq!(
+            evm.0.instruction.gas_table(),
+            ethereum_instructions.0.instruction.gas_table()
+        );
         let original_gas = ethereum_instructions
             .transact_one(tx.clone().into())
             .unwrap()
-            .gas_used();
+            .tx_gas_used();
         let traced = inspected.inspect_one_tx(tx.clone().into()).unwrap();
         let result = evm.transact_one(tx.into()).unwrap();
         assert_eq!(
-            result.gas_used(),
+            result.tx_gas_used(),
             original_gas,
             "ArbOS history must not add storage gas"
         );

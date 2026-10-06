@@ -1,4 +1,4 @@
-//! Arbitrum opcode semantics over REVM's Ethereum instruction table.
+//! Arbitrum opcode semantics over the ordinary Ethereum instruction and gas tables.
 
 use crate::{
     ArbitrumContextTr,
@@ -9,28 +9,49 @@ use revm::{
     context::ContextError,
     handler::instructions::{EthInstructions, InstructionProvider},
     interpreter::{
-        Instruction, InstructionContext, InstructionResult,
-        instructions::{InstructionTable, block_info, host},
+        Host, Instruction, InstructionContext, InstructionExecResult, InstructionResult,
+        InterpreterTypes,
+        instructions::{GasTable, InstructionTable, gas_table_spec},
         interpreter::EthInterpreter,
     },
-    primitives::U256,
+    primitives::{U256, hardfork::SpecId},
 };
 
 /// Ethereum instructions with ArbOS's L1 BLOCKHASH source and unsupported BLOBBASEFEE.
-/// Uninitialized contexts retain Ethereum behavior for ordinary Foundry execution.
+///
+/// The database must supply L2 block hashes for ArbSys and native block processing.
 #[derive(Debug)]
 pub struct ArbitrumInstructions<CTX>(EthInstructions<EthInterpreter, CTX>);
 
-impl<CTX: ArbitrumContextTr> Default for ArbitrumInstructions<CTX> {
-    fn default() -> Self {
-        let mut instructions = EthInstructions::default();
-        let gas = instructions.instruction_table[opcode::BLOCKHASH as usize].static_gas();
-        instructions.insert_instruction(opcode::BLOCKHASH, Instruction::new(blockhash::<CTX>, gas));
-        let gas = instructions.instruction_table[opcode::BLOBBASEFEE as usize].static_gas();
-        instructions.insert_instruction(
-            opcode::BLOBBASEFEE,
-            Instruction::new(blob_basefee::<CTX>, gas),
-        );
+/// Instruction tables whose gas schedule can follow a persisted ArbOS upgrade.
+pub trait ArbitrumInstructionProvider: InstructionProvider {
+    fn set_spec(&mut self, spec: SpecId);
+}
+
+impl<IT: InterpreterTypes, CTX: Host> ArbitrumInstructionProvider for EthInstructions<IT, CTX> {
+    fn set_spec(&mut self, spec: SpecId) {
+        if self.spec != spec {
+            self.spec = spec;
+            *self.gas_table_mut() = gas_table_spec(spec);
+        }
+    }
+}
+
+impl<CTX: ArbitrumContextTr> ArbitrumInstructionProvider for ArbitrumInstructions<CTX> {
+    fn set_spec(&mut self, spec: SpecId) {
+        self.0.set_spec(spec);
+    }
+}
+
+impl<CTX: ArbitrumContextTr> ArbitrumInstructions<CTX> {
+    pub fn new(spec: SpecId) -> Self {
+        let mut instructions = EthInstructions::new_mainnet_with_spec(spec);
+        // Retain the upstream static gas charge; reading ArbOS history adds no SLOAD charge.
+        instructions.instruction_table_mut()[opcode::BLOCKHASH as usize] =
+            Instruction::new(blockhash::<CTX>);
+        // Nitro rejects BLOBBASEFEE independently of its selected Ethereum hardfork.
+        instructions.instruction_table_mut()[opcode::BLOBBASEFEE as usize] =
+            Instruction::new(|_| Err(InstructionResult::NotActivated));
         Self(instructions)
     }
 }
@@ -48,33 +69,24 @@ impl<CTX: ArbitrumContextTr> InstructionProvider for ArbitrumInstructions<CTX> {
     fn instruction_table(&self) -> &InstructionTable<EthInterpreter, CTX> {
         self.0.instruction_table()
     }
+
+    fn gas_table(&self) -> &GasTable {
+        self.0.gas_table()
+    }
 }
 
-fn blockhash<CTX: ArbitrumContextTr>(context: InstructionContext<'_, CTX, EthInterpreter>) {
-    if !context.host.chain().arbos_initialized {
-        return host::blockhash(context);
-    }
-    let Some(number) = context.interpreter.stack.data_mut().last_mut() else {
-        context.interpreter.halt(InstructionResult::StackUnderflow);
-        return;
-    };
+fn blockhash<CTX: ArbitrumContextTr>(
+    context: InstructionContext<'_, CTX, EthInterpreter>,
+) -> InstructionExecResult {
+    let number = context
+        .interpreter
+        .stack
+        .top()
+        .ok_or(InstructionResult::StackUnderflow)?;
     let Ok(requested) = u64::try_from(*number) else {
         *number = U256::ZERO;
-        return;
+        return Ok(());
     };
-    let chain = context.host.chain();
-    let synthetic = chain.synthetic_block_hashes && chain.rpc_block_number.is_none();
-    if synthetic || !chain.block_hash_overrides.is_empty() {
-        let current = context.host.block_number();
-        if *number >= current || current - *number > U256::from(256) {
-            *number = U256::ZERO;
-            return;
-        }
-        if let Some(hash) = chain.block_hash_overrides.get(&requested) {
-            *number = U256::from_be_bytes(hash.0);
-            return;
-        }
-    }
     match context
         .host
         .arb_state(None, true)
@@ -82,23 +94,11 @@ fn blockhash<CTX: ArbitrumContextTr>(context: InstructionContext<'_, CTX, EthInt
         .block_hash(requested)
     {
         Ok(hash) => *number = U256::from_be_bytes(hash.0),
-        Err(ArbosStateError::InvalidBlockNumberForBlockHash) => {
-            *number = if synthetic {
-                revm::primitives::keccak256(requested.to_string().as_bytes()).into()
-            } else {
-                U256::ZERO
-            };
-        }
+        Err(ArbosStateError::InvalidBlockNumberForBlockHash) => *number = U256::ZERO,
         Err(error) => {
             *context.host.error() = Err(ContextError::Custom(error.to_string()));
-            context.interpreter.halt_fatal();
+            return Err(InstructionResult::FatalExternalError);
         }
     }
-}
-
-fn blob_basefee<CTX: ArbitrumContextTr>(context: InstructionContext<'_, CTX, EthInterpreter>) {
-    if !context.host.chain().arbos_initialized {
-        return block_info::blob_basefee(context);
-    }
-    context.interpreter.halt(InstructionResult::NotActivated);
+    Ok(())
 }

@@ -61,7 +61,7 @@ impl<'a, CTX: ArbitrumContextTr> MerkleAccumulator<'a, CTX> {
         // Storage.Keccak charges Keccak256Gas + two Keccak256WordGas units for
         // the 64-byte accumulator node.
         if let Some(gas) = self.gas.as_deref_mut()
-            && !gas.record_cost(42)
+            && !gas.record_regular_cost(42)
         {
             return Err(ArbosStateError::OutOfGas);
         }

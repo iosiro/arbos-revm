@@ -35,7 +35,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbBlsPrecompile {
     ) -> Option<InterpreterResult> {
         Some(InterpreterResult {
             result: revm::interpreter::InstructionResult::Revert,
-            gas: Gas::new_spent(gas_limit),
+            gas: Gas::new_spent_with_reservoir(gas_limit, 0),
             output: Default::default(),
         })
     }

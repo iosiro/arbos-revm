@@ -55,7 +55,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbosTestPrecompile {
             gas.spend_all();
             interpreter_revert!(gas, Bytes::from_static(b"not a uint64"));
         };
-        if !gas.record_cost(amount) {
+        if !gas.record_regular_cost(amount) {
             // Nitro deliberately ignores Burn's out-of-gas error here.
             gas.spend_all();
         }

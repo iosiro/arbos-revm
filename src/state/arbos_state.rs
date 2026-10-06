@@ -1,5 +1,5 @@
 use revm::{
-    context::{Block, Cfg, JournalTr},
+    context::{Block, Cfg, JournalTr, journaled_state::account::JournaledAccountTr},
     interpreter::{Gas, gas::COLD_ACCOUNT_ACCESS_COST},
     primitives::{Address, B256, Bytes, I256, U256, address},
     state::Bytecode,
@@ -341,7 +341,6 @@ where
         self.programs()
             .initialize(&params.stylus_params, &params.data_pricer_params)?;
 
-        self.context.chain_mut().arbos_initialized = params.arbos_version != 0;
         Ok(())
     }
 
@@ -766,7 +765,7 @@ where
             .map(|s| s.data)
             .unwrap_or_default();
         if let Some(gas) = self.gas.as_deref_mut()
-            && !gas.record_cost(COLD_ACCOUNT_ACCESS_COST)
+            && !gas.record_regular_cost(COLD_ACCOUNT_ACCESS_COST)
         {
             return Err(ArbosStateError::OutOfGas);
         }

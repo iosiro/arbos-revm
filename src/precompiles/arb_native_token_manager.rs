@@ -11,7 +11,7 @@ use crate::{
 
 use alloy_sol_types::{SolCall, sol};
 use revm::{
-    context::JournalTr,
+    context::{JournalTr, journaled_state::account::JournaledAccountTr},
     interpreter::{Gas, InterpreterResult},
     precompile::PrecompileId,
     primitives::{Address, Bytes, Log, U256, address, alloy_primitives::IntoLogData},

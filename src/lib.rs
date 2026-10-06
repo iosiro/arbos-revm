@@ -27,15 +27,16 @@ pub mod utils;
 
 pub use evm::ArbitrumEvm;
 pub use instructions::ArbitrumInstructions;
-pub use result::ArbitrumHaltReason;
+pub use result::{ArbitrumCommittedFailure, ArbitrumExecutionOutcome, ArbitrumHaltReason};
 
 //pub use precompiles::ArbitrumPrecompiles;
 //pub use spec::*;
+pub use chain::{ArbitrumChain, ArbitrumChainTr};
 pub use context::{ArbitrumContext, ArbitrumContextTr};
 use revm::primitives::hex;
 pub use transaction::{
-    ArbitrumDepositTx, ArbitrumInternalTx, ArbitrumTransaction, ArbitrumTransactionError,
-    ArbitrumTxTr, ArbitrumTypedTransaction,
+    ArbitrumDepositTx, ArbitrumInternalTx, ArbitrumRetryTx, ArbitrumTransaction,
+    ArbitrumTransactionError, ArbitrumTxProvenance, ArbitrumTxTr, ArbitrumTypedTransaction,
 };
 
 pub trait Utf8OrHex {

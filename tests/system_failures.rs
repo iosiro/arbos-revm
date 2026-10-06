@@ -9,16 +9,20 @@ use test_utils::{create_evm, execute_tx, setup_context};
 
 use alloy_sol_types::{SolCall, sol};
 use arbos_revm::{
+    ArbitrumCommittedFailure, ArbitrumEvm, ArbitrumInstructions,
     constants::{
         ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBOS_ADDRESS,
         ARBOS_L1_PRICER_FUNDS_ADDRESS, HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE_ARBITRUM,
     },
+    precompiles::ArbitrumPrecompileProvider,
     state::{ArbState, ArbStateGetter, arbos_state::ArbosStateParams, types::StorageBackedTr},
     transaction::ArbitrumTransaction,
 };
 use revm::{
-    ExecuteEvm,
+    Database, DatabaseCommit, ExecuteEvm,
     context::{ContextTr, Host, JournalTr, TxEnv, result::ExecutionResult},
+    database::InMemoryDB,
+    inspector::NoOpInspector,
     primitives::{Address, B256, Bytes, I256, TxKind, U256},
 };
 
@@ -42,6 +46,66 @@ sol! {
         address beneficiary,
         address retryTo,
         bytes retryData
+    );
+}
+
+#[test]
+fn start_block_history_survives_database_commit() {
+    let mut context = setup_context().with_db(InMemoryDB::default());
+    // NUMBER exposes the L1 height, while block hashes are indexed by the RPC L2 height.
+    context.block.number = U256::from(999);
+    let parent_hash = B256::repeat_byte(0x42);
+    context.chain.set_rpc_block(5, parent_hash);
+    context
+        .arb_state(None, false)
+        .initialize(&ArbosStateParams::for_arbos_version(60))
+        .unwrap();
+    // Finalize initialization so it cannot leave the history account touched for startBlock.
+    let initialized = context.journaled_state.finalize();
+    context.journaled_state.database.commit(initialized);
+    // A fork DB serving the BLOCKHASH opcode may expose L1 hashes at the same numeric key.
+    context
+        .journaled_state
+        .database
+        .cache
+        .block_hashes
+        .insert(U256::from(4), B256::repeat_byte(0x99));
+    let spec = context.cfg.inner.spec;
+    let mut evm = ArbitrumEvm::new_with_inspector(
+        context,
+        NoOpInspector,
+        ArbitrumInstructions::new(spec),
+        ArbitrumPrecompileProvider::new(spec),
+    );
+    let result = evm
+        .transact(ArbitrumTransaction::new(TxEnv {
+            tx_type: ARBITRUM_INTERNAL_TX_TYPE,
+            caller: ARBOS_ADDRESS,
+            data: startBlockCall {
+                l1BaseFee: U256::ZERO,
+                l1BlockNumber: 10,
+                l2BlockNumber: 5,
+                timeLastBlock: 0,
+            }
+            .abi_encode()
+            .into(),
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(result.result.is_success());
+    assert!(
+        result.state[&HISTORY_STORAGE_ADDRESS].is_touched(),
+        "history writes must be included in the database changeset"
+    );
+    evm.0.ctx.journaled_state.database.commit(result.state);
+    assert_eq!(
+        evm.0
+            .ctx
+            .journaled_state
+            .database
+            .storage(HISTORY_STORAGE_ADDRESS, U256::from(4))
+            .unwrap(),
+        U256::from_be_bytes(parent_hash.0)
     );
 }
 
@@ -351,7 +415,7 @@ fn submit_retryable_early_failures_retain_nitro_state_and_isolate_next_tx() {
     );
     assert!(matches!(
         result,
-        ExecutionResult::Revert { gas_used: 0, .. }
+        ExecutionResult::Revert { ref gas, .. } if gas.tx_gas_used() == 0
     ));
     assert_eq!(balance(&mut evm, caller), U256::from(100));
 
@@ -362,7 +426,7 @@ fn submit_retryable_early_failures_retain_nitro_state_and_isolate_next_tx() {
     );
     assert!(matches!(
         result,
-        ExecutionResult::Revert { gas_used: 0, .. }
+        ExecutionResult::Revert { ref gas, .. } if gas.tx_gas_used() == 0
     ));
     assert_eq!(balance(&mut evm, caller), U256::from(1_100));
 
@@ -403,7 +467,7 @@ fn submit_retryable_callvalue_failure_compensates_before_failed_receipt() {
     );
     assert!(matches!(
         result,
-        ExecutionResult::Revert { gas_used: 0, .. }
+        ExecutionResult::Revert { ref gas, .. } if gas.tx_gas_used() == 0
     ));
     assert_eq!(balance(&mut evm, network), U256::ZERO);
     assert_eq!(balance(&mut evm, caller), U256::from(150_000));
@@ -419,18 +483,22 @@ fn malformed_internal_failure_is_receipt_level_and_does_not_dirty_next_tx() {
         .unwrap();
     let mut evm = create_evm(context);
 
-    let result = execute_tx(
-        &mut evm,
-        TxEnv {
+    let outcome = evm
+        .transact_one_arbitrum(ArbitrumTransaction::from(TxEnv {
             tx_type: ARBITRUM_INTERNAL_TX_TYPE,
             caller: ARBOS_ADDRESS,
             data: Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]),
             ..Default::default()
-        },
+        }))
+        .unwrap();
+    assert_eq!(
+        outcome.committed_failure,
+        Some(ArbitrumCommittedFailure::Internal)
     );
+    let result = outcome.result;
     assert!(matches!(
         result,
-        ExecutionResult::Revert { gas_used: 0, .. }
+        ExecutionResult::Revert { ref gas, .. } if gas.tx_gas_used() == 0
     ));
 
     let recipient = Address::repeat_byte(0x88);
