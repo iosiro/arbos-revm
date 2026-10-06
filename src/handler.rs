@@ -8,9 +8,9 @@ use crate::{
         ARBITRUM_CONTRACT_TX_TYPE, ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE,
         ARBITRUM_RETRY_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBITRUM_UNSIGNED_TX_TYPE,
         ARBOS_ADDRESS, ARBOS_L1_PRICER_FUNDS_ADDRESS, HISTORY_SERVE_WINDOW,
-        HISTORY_STORAGE_ADDRESS,
+        HISTORY_STORAGE_ADDRESS, MAX_ARBOS_VERSION_SUPPORTED,
     },
-    context::ArbitrumContextMutTr,
+    context::{ArbitrumContextMutTr, ArbitrumContextTr},
     l1_fee,
     local_context::ArbitrumLocalContextTr,
     state::{ArbState, ArbStateGetter, types::StorageBackedTr},
@@ -77,7 +77,7 @@ use revm::{
         result::{ExecutionResult, FromStringError, HaltReason, InvalidTransaction, SuccessReason},
     },
     handler::{
-        EthFrame, EvmTr, FrameResult, FrameTr, Handler, MainnetHandler,
+        EthFrame, EvmTr, FrameResult, FrameTr, Handler, MainnetHandler, PrecompileProvider,
         handler::EvmTrError,
         pre_execution::{calculate_caller_fee, validate_account_nonce_and_code_with_components},
     },
@@ -120,6 +120,33 @@ where
         >,
     ERROR: EvmTrError<EVM> + FromStringError,
 {
+    /// Refreshes persisted execution rules before validation.
+    fn sync_arbos_version(&mut self, evm: &mut EVM) -> Result<u64, ERROR> {
+        let version = evm
+            .ctx()
+            .arb_state(None, false)
+            .arbos_version()
+            .get()
+            .map_err(|err| ERROR::from_string(err.to_string()))?;
+        if version > MAX_ARBOS_VERSION_SUPPORTED {
+            return Err(ERROR::from_string(format!(
+                "unsupported ArbOS version {version}"
+            )));
+        }
+        evm.ctx().chain_mut().arbos_initialized = version != 0;
+        if version != 0 {
+            evm.ctx().set_live_arbos_version(version);
+            let spec = evm.ctx().cfg().spec();
+            let (context, precompiles) = evm.ctx_precompiles();
+            if precompiles.set_spec(spec) {
+                context
+                    .journal_mut()
+                    .warm_precompiles(precompiles.warm_addresses().collect());
+            }
+        }
+        Ok(version)
+    }
+
     /// Executes an Arbitrum deposit transaction.
     ///
     /// Deposit transactions mint ETH from L1 to L2:
@@ -234,7 +261,7 @@ where
         if selector == ArbitrumInternalTx::START_BLOCK_METHOD {
             let call = startBlockCall::abi_decode(&input)
                 .map_err(|err| ERROR::from_string(format!("invalid startBlock calldata: {err}")))?;
-            let block_number = ctx.block().number().saturating_to::<u64>();
+            let block_number = ctx.arb_block_number().saturating_to::<u64>();
             let previous_hash = if block_number == 0 {
                 Default::default()
             } else {
@@ -737,15 +764,7 @@ where
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
         // Persisted ArbOS state is authoritative. Foundry may reuse an EVM
         // context across transactions, including across a scheduled upgrade.
-        let persisted_version = evm
-            .ctx()
-            .arb_state(None, false)
-            .arbos_version()
-            .get()
-            .map_err(|err| ERROR::from_string(err.to_string()))?;
-        if persisted_version != 0 {
-            evm.ctx().set_live_arbos_version(persisted_version);
-        }
+        let persisted_version = self.sync_arbos_version(evm)?;
         let tx_type = evm.ctx().tx().tx_type();
 
         match tx_type {
@@ -1255,17 +1274,9 @@ where
         &mut self,
         evm: &mut Self::Evm,
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
-        let persisted_version = evm
-            .ctx()
-            .arb_state(None, false)
-            .arbos_version()
-            .get()
-            .map_err(|err| ERROR::from_string(err.to_string()))?;
+        let persisted_version = self.sync_arbos_version(evm)?;
         if persisted_version == 0 {
             return InspectorHandler::inspect_run(&mut self.mainnet, evm);
-        }
-        if persisted_version != 0 {
-            evm.ctx().set_live_arbos_version(persisted_version);
         }
 
         match evm.ctx().tx().tx_type() {

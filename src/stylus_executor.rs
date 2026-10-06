@@ -80,7 +80,7 @@ pub fn build_evm_data<CTX>(
     reentrant: bool,
 ) -> EvmData
 where
-    CTX: ArbitrumContextTr,
+    CTX: crate::context::ArbitrumContextMutTr,
 {
     let config_env = context.cfg();
     let arbos_env = context.cfg();
@@ -195,7 +195,7 @@ fn restore_open_pages_on_error<T, E>(
 
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
-    CTX: ArbitrumContextTr,
+    CTX: crate::context::ArbitrumContextMutTr,
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
@@ -507,8 +507,8 @@ where
 
         let recent_cache_hit =
             if self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT {
-                let block_number = self.ctx().block().number().saturating_to();
-                self.ctx().local_mut().insert_recent_wasm(
+                let block_number = self.ctx().arb_block_number().saturating_to();
+                self.ctx().chain_mut().insert_recent_wasm(
                     code_hash,
                     stylus_params.block_cache_size,
                     block_number,
@@ -742,7 +742,7 @@ where
 
 impl<CTX, INSP, P, I> ArbitrumEvm<CTX, INSP, P, I>
 where
-    CTX: ArbitrumContextTr,
+    CTX: crate::context::ArbitrumContextMutTr,
     CTX::Journal: JournalExt,
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,

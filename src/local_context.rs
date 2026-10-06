@@ -1,8 +1,8 @@
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
 use revm::{
     context::LocalContextTr,
-    primitives::{Address, B256, U256},
+    primitives::{Address, U256},
 };
 
 pub trait ArbitrumLocalContextTr: LocalContextTr {
@@ -10,7 +10,6 @@ pub trait ArbitrumLocalContextTr: LocalContextTr {
     fn stylus_pages_open(&self) -> u16;
     fn add_stylus_pages_open(&mut self, pages: u16);
     fn set_stylus_pages_open(&mut self, pages: u16);
-    fn insert_recent_wasm(&mut self, code_hash: B256, retain: u16, block_number: u64) -> bool;
     fn enter_stylus(&mut self, address: Address) -> bool;
     fn exit_stylus(&mut self, address: Address);
 
@@ -39,9 +38,6 @@ pub struct ArbitrumLocalContext {
     pub stylus_pages_ever: u16,
     /// Stylus pages currently open.
     pub stylus_pages_open: u16,
-    /// Recently invoked Stylus wasm code hashes (block-local LRU).
-    pub recent_wasms: VecDeque<B256>,
-    pub recent_wasms_block_number: Option<u64>,
     /// Addresses of currently executing Stylus frames, used for EVM API metadata.
     pub active_stylus_addresses: Vec<Address>,
     /// Cached L1 transaction cost (set during validation, cleared after execution)
@@ -61,8 +57,6 @@ impl Default for ArbitrumLocalContext {
             precompile_error_message: None,
             stylus_pages_ever: 0,
             stylus_pages_open: 0,
-            recent_wasms: VecDeque::new(),
-            recent_wasms_block_number: None,
             active_stylus_addresses: Vec::new(),
             tx_l1_cost: None,
             poster_gas: None,
@@ -122,35 +116,6 @@ impl ArbitrumLocalContextTr for ArbitrumLocalContext {
         if self.stylus_pages_open > self.stylus_pages_ever {
             self.stylus_pages_ever = self.stylus_pages_open;
         }
-    }
-
-    fn insert_recent_wasm(&mut self, code_hash: B256, retain: u16, block_number: u64) -> bool {
-        if self.recent_wasms_block_number != Some(block_number) {
-            self.recent_wasms.clear();
-            self.recent_wasms_block_number = Some(block_number);
-        }
-        if let Some(pos) = self
-            .recent_wasms
-            .iter()
-            .position(|existing| *existing == code_hash)
-        {
-            // Move existing entry to the back to track recency.
-            if pos + 1 != self.recent_wasms.len()
-                && let Some(found) = self.recent_wasms.remove(pos)
-            {
-                self.recent_wasms.push_back(found);
-            }
-            return true;
-        }
-
-        self.recent_wasms.push_back(code_hash);
-
-        let retain = retain as usize;
-        if retain > 0 && self.recent_wasms.len() > retain {
-            self.recent_wasms.pop_front();
-        }
-
-        false
     }
 
     fn enter_stylus(&mut self, address: Address) -> bool {
@@ -228,17 +193,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transaction_clear_resets_pages_but_recent_cache_is_block_scoped() {
+    fn transaction_clear_resets_pages() {
         let mut local = ArbitrumLocalContext::default();
-        let hash = B256::repeat_byte(0x11);
         local.add_stylus_pages_open(12);
-        assert!(!local.insert_recent_wasm(hash, 4, 7));
-        assert!(local.insert_recent_wasm(hash, 4, 7));
 
         local.clear();
         assert_eq!(local.stylus_pages_open(), 0);
         assert_eq!(local.stylus_pages_ever(), 0);
-        assert!(local.insert_recent_wasm(hash, 4, 7));
-        assert!(!local.insert_recent_wasm(hash, 4, 8));
     }
 }

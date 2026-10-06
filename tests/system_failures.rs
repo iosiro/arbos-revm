@@ -19,7 +19,7 @@ use arbos_revm::{
 use revm::{
     ExecuteEvm,
     context::{ContextTr, Host, JournalTr, TxEnv, result::ExecutionResult},
-    primitives::{Address, B256, Bytes, TxKind, U256},
+    primitives::{Address, B256, Bytes, I256, TxKind, U256},
 };
 
 sol! {
@@ -157,6 +157,35 @@ fn arbos_40_installs_callable_history_contract_on_initialization_and_upgrade() {
 
 #[test]
 fn scheduled_upgrades_apply_nitro_pricing_owner_and_brotli_migrations() {
+    let mut context = setup_context();
+    context
+        .arb_state(None, false)
+        .initialize(&ArbosStateParams::for_arbos_version(1))
+        .unwrap();
+    context
+        .arb_state(None, false)
+        .upgrade_arbos_version(2)
+        .unwrap();
+    assert_eq!(
+        context
+            .arb_state(None, false)
+            .l1_pricing()
+            .last_surplus()
+            .get()
+            .unwrap(),
+        I256::ZERO
+    );
+    context
+        .arb_state(None, false)
+        .upgrade_arbos_version(3)
+        .unwrap();
+    let mut state = context.arb_state(None, false);
+    assert_eq!(state.l1_pricing().per_batch_gas_cost().get().unwrap(), 0);
+    assert_eq!(
+        state.l1_pricing().amortized_cost_cap_bips().get().unwrap(),
+        u64::MAX
+    );
+
     let owner = Address::repeat_byte(0x42);
     let mut context = setup_context();
     let mut params = ArbosStateParams::for_arbos_version(9);

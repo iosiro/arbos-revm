@@ -214,7 +214,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
         match selector {
             ArbSys::arbBlockNumberCall::SELECTOR => {
                 let output =
-                    ArbSys::arbBlockNumberCall::abi_encode_returns(&context.block_number());
+                    ArbSys::arbBlockNumberCall::abi_encode_returns(&context.arb_block_number());
 
                 interpreter_return!(gas, Bytes::from(output));
             }
@@ -233,7 +233,7 @@ impl<CTX: ArbitrumContextTr> ArbPrecompileLogic<CTX> for ArbSysPrecompile {
             ArbSys::arbBlockHashCall::SELECTOR => {
                 let call = decode_call!(gas, ArbSys::arbBlockHashCall, input);
 
-                let current_block = context.block_number().saturating_to::<u64>();
+                let current_block = context.arb_block_number().saturating_to::<u64>();
                 let requested_block: u64 = call.arbBlockNum.saturating_to();
 
                 if requested_block >= current_block || requested_block + 256 < current_block {
@@ -418,7 +418,7 @@ fn send_tx_to_l1<CTX: ArbitrumContextTr>(
         }
     }
 
-    let l2_block = context.block_number();
+    let l2_block = context.arb_block_number();
     let timestamp = context.block().timestamp();
     let hash_input_len = 20usize * 2 + 32usize * 4 + data.len();
     try_record_cost!(

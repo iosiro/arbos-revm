@@ -1,7 +1,7 @@
 use revm::{
     context::{Block, Cfg, JournalTr},
     interpreter::{Gas, gas::COLD_ACCOUNT_ACCESS_COST},
-    primitives::{Address, B256, Bytes, U256, address},
+    primitives::{Address, B256, Bytes, I256, U256, address},
     state::Bytecode,
 };
 
@@ -341,6 +341,7 @@ where
         self.programs()
             .initialize(&params.stylus_params, &params.data_pricer_params)?;
 
+        self.context.chain_mut().arbos_initialized = params.arbos_version != 0;
         Ok(())
     }
 
@@ -378,6 +379,13 @@ where
         while current < upgrade_to {
             let next = current + 1;
             match next {
+                2 => {
+                    self.l1_pricing().last_surplus().set(I256::ZERO)?;
+                }
+                3 => {
+                    self.l1_pricing().per_batch_gas_cost().set(0)?;
+                    self.l1_pricing().amortized_cost_cap_bips().set(u64::MAX)?;
+                }
                 10 => {
                     let balance = self
                         .context
