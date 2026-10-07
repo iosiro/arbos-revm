@@ -105,7 +105,18 @@ where
         let is_stylus = code.starts_with(STYLUS_DISCRIMINANT)
             || (self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
                 && code.starts_with(STYLUS_ROOT_DISCRIMINANT));
-        if is_stylus && let Some(next_action) = self.inspect_frame_run_stylus() {
+        // initialize_interp may stop execution before any Wasm or activation work.
+        let stylus_action = if is_stylus {
+            let interpreter = &mut self.frame_stack.get().interpreter;
+            if interpreter.bytecode.action.is_some() {
+                Some(interpreter.take_next_action())
+            } else {
+                self.inspect_frame_run_stylus()
+            }
+        } else {
+            None
+        };
+        if let Some(next_action) = stylus_action {
             let frame = self.0.frame_stack.get();
             let context = &mut self.0.ctx;
             let mut result = frame.process_next_action(context, next_action);
