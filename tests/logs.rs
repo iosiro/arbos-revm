@@ -4,15 +4,140 @@
 //! Log emission tests for Stylus programs.
 
 use revm::{
-    context::result::ExecutionResult,
-    primitives::{Address, U256},
+    InspectEvm, Inspector,
+    context::{ContextTr, JournalTr, result::ExecutionResult},
+    interpreter::{
+        InstructionResult, Interpreter, InterpreterAction, interpreter_types::LoopControl,
+    },
+    primitives::{Address, Bytes, Log, U256},
 };
 
 mod test_utils;
 use test_utils::{
-    create_call_tx, create_evm, deploy_wat_program, execute_tx, fund_account,
+    TestContext, create_call_tx, create_evm, deploy_wat_program, execute_tx, fund_account,
     setup_context_with_arbos_state,
 };
+
+#[derive(Default)]
+struct LogInspector {
+    logs: Vec<Log>,
+    stop: bool,
+}
+
+impl Inspector<TestContext> for LogInspector {
+    fn log_full(&mut self, interpreter: &mut Interpreter, _: &mut TestContext, log: Log) {
+        assert_eq!(interpreter.input.target_address, log.address);
+        self.logs.push(log);
+        if self.stop {
+            interpreter
+                .bytecode
+                .set_action(InterpreterAction::new_return(
+                    InstructionResult::Revert,
+                    Bytes::from_static(b"inspector rejected log"),
+                    interpreter.gas,
+                ));
+        }
+    }
+}
+
+#[test]
+fn inspected_stylus_logs_use_full_callback() {
+    let mut context = setup_context_with_arbos_state();
+    let program = deploy_wat_program(&mut context, include_bytes!("../test-data/log.wat"));
+    fund_account(
+        &mut context,
+        Address::repeat_byte(1),
+        U256::from(1_000_000_000),
+    );
+    let mut evm = create_evm(context).with_inspector(LogInspector::default());
+    let result = evm
+        .inspect_one_tx(create_call_tx(program, vec![0, 42], 1_000_000).into())
+        .unwrap();
+    let ExecutionResult::Success { logs, .. } = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(logs, evm.0.inspector.logs);
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].data.data.as_ref(), &[42]);
+}
+
+#[test]
+fn log_inspector_revert_stops_wasm_and_rolls_back_storage() {
+    let mut context = setup_context_with_arbos_state();
+    let program = deploy_wat_program(
+        &mut context,
+        br#"
+        (module
+            (import "vm_hooks" "emit_log" (func $log (param i32 i32 i32)))
+            (import "vm_hooks" "storage_cache_bytes32" (func $store (param i32 i32)))
+            (import "vm_hooks" "storage_flush_cache" (func $flush (param i32)))
+            (memory (export "memory") 1 1)
+            (func (export "user_entrypoint") (param i32) (result i32)
+                (i32.store8 (i32.const 63) (i32.const 1))
+                (call $store (i32.const 0) (i32.const 32))
+                (call $flush (i32.const 0))
+                (call $log (i32.const 0) (i32.const 0) (i32.const 0))
+                (call $log (i32.const 0) (i32.const 0) (i32.const 0))
+                ;; If execution continues after rejection it burns all remaining gas.
+                (loop $forever (br $forever))
+                i32.const 0))
+    "#,
+    );
+    fund_account(
+        &mut context,
+        Address::repeat_byte(1),
+        U256::from(1_000_000_000),
+    );
+    let mut evm = create_evm(context).with_inspector(LogInspector {
+        stop: true,
+        ..Default::default()
+    });
+    let result = evm
+        .inspect_one_tx(create_call_tx(program, vec![], 1_000_000).into())
+        .unwrap();
+    let ExecutionResult::Revert { output, gas, .. } = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(output.as_ref(), b"inspector rejected log");
+    assert!(
+        gas.tx_gas_used() < 500_000,
+        "execution continued after the inspector stopped it"
+    );
+    assert_eq!(evm.0.inspector.logs.len(), 1);
+    assert_eq!(
+        evm.0
+            .ctx
+            .journal_mut()
+            .sload(program, U256::ZERO)
+            .unwrap()
+            .data,
+        U256::ZERO
+    );
+}
+
+#[test]
+fn inspected_stylus_logs_preserve_legacy_callback() {
+    #[derive(Default)]
+    struct LegacyInspector(usize);
+    impl Inspector<TestContext> for LegacyInspector {
+        fn log(&mut self, _: &mut TestContext, _: Log) {
+            self.0 += 1;
+        }
+    }
+    let mut context = setup_context_with_arbos_state();
+    let program = deploy_wat_program(&mut context, include_bytes!("../test-data/log.wat"));
+    fund_account(
+        &mut context,
+        Address::repeat_byte(1),
+        U256::from(1_000_000_000),
+    );
+    let mut evm = create_evm(context).with_inspector(LegacyInspector::default());
+    let result = evm
+        .inspect_one_tx(create_call_tx(program, vec![0], 1_000_000).into())
+        .unwrap();
+    assert!(result.is_success());
+    assert_eq!(evm.0.inspector.0, 1);
+}
 
 #[test]
 fn test_e2e_log_no_topics() {

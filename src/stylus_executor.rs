@@ -663,7 +663,7 @@ where
             "Stylus program finished"
         );
 
-        let (result, output) = match kind {
+        let (mut result, mut output) = match kind {
             UserOutcomeKind::Success => (
                 revm::interpreter::InstructionResult::Return,
                 Bytes::from(data),
@@ -693,6 +693,17 @@ where
         self.ctx()
             .local_mut()
             .set_stylus_pages_open(stylus_open_pages);
+
+        // A log inspector can terminate the frame. The host request traps the
+        // Wasm instance; preserve the inspector's status and return data rather
+        // than replacing them with the runtime's generic host-error result.
+        let action = &mut self.frame_stack().get().interpreter.bytecode.action;
+        if matches!(action, Some(InterpreterAction::Return(_)))
+            && let Some(InterpreterAction::Return(inspector_result)) = action.take()
+        {
+            result = inspector_result.result;
+            output = inspector_result.output;
+        }
 
         if !output.is_empty() && self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_FIXES {
             let evm_cost = self
@@ -796,11 +807,25 @@ where
             ),
 
             EvmApiMethod::EmitLog => {
-                self.handle_emit_log(input, is_static, data, |(evm, log): (&mut Self, Log)| {
-                    let (context, inspector) = evm.ctx_inspector();
-                    context.log(log.clone());
-                    inspector.log(context, log);
-                })
+                let response =
+                    self.handle_emit_log(input, is_static, data, |(evm, log): (&mut Self, Log)| {
+                        let (context, inspector, frame) = evm.ctx_inspector_frame();
+                        context.log(log.clone());
+                        inspector.log_full(&mut frame.interpreter, context, log);
+                    });
+                if matches!(
+                    self.frame_stack().get().interpreter.bytecode.action,
+                    Some(InterpreterAction::Return(_))
+                ) {
+                    // A nonempty emit-log response stops Wasm at this host call,
+                    // before subsequent instructions or host effects can run.
+                    return (
+                        b"execution stopped by log inspector".to_vec(),
+                        VecReader::new(vec![]),
+                        ArbGas(0),
+                    );
+                }
+                response
             }
             _ => self.request_inner(input, is_static, req_type, data),
         }
