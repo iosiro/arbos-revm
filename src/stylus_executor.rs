@@ -18,6 +18,7 @@ use arbutil::{
 use lru::LruCache;
 use revm::{
     Inspector,
+    bytecode::opcode,
     context::{Block, Cfg, ContextSetters, ContextTr, JournalTr, LocalContextTr, Transaction},
     handler::{EvmTr, PrecompileProvider, instructions::InstructionProvider},
     inspector::{InspectorEvmTr, JournalExt},
@@ -45,7 +46,7 @@ use stylus::{
 use tracing::{debug, trace, warn};
 
 use crate::{
-    ArbitrumEvm, Utf8OrHex,
+    ArbitrumEvm, Utf8OrHex, buffer,
     config::ArbitrumConfigTr,
     constants::{
         ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, ARBOS_VERSION_STYLUS_FIXES, COST_SCALAR_PERCENT,
@@ -659,7 +660,7 @@ where
             "Stylus program finished"
         );
 
-        let (result, output) = match kind {
+        let (mut result, mut output) = match kind {
             UserOutcomeKind::Success => (
                 revm::interpreter::InstructionResult::Return,
                 Bytes::from(data),
@@ -689,6 +690,16 @@ where
         self.ctx()
             .local_mut()
             .set_stylus_pages_open(stylus_open_pages);
+
+        // Host errors stop Wasm immediately; preserve the inspector's status
+        // and return data instead of the runtime's generic host-error result.
+        let action = &mut self.frame_stack().get().interpreter.bytecode.action;
+        if matches!(action, Some(InterpreterAction::Return(_)))
+            && let Some(InterpreterAction::Return(inspector_result)) = action.take()
+        {
+            result = inspector_result.result;
+            output = inspector_result.output;
+        }
 
         if !output.is_empty() && self.ctx().cfg().arbos_version() >= ARBOS_VERSION_STYLUS_FIXES {
             let evm_cost = memory_gas(output.len().div_ceil(32));
@@ -773,6 +784,55 @@ where
         data: Vec<u8>,
     ) -> (Vec<u8>, VecReader, ArbGas) {
         match req_type {
+            EvmApiMethod::GetBytes32 => {
+                let key = U256::from_be_slice(&data);
+                let gas = self.frame_stack().get().interpreter.gas.remaining();
+                match self.inspect_host_operation(opcode::SLOAD, &[key], gas, |evm| {
+                    let response = evm.request_inner(input, is_static, req_type, data);
+                    let word = (response.0.len() == 32).then(|| U256::from_be_slice(&response.0));
+                    let failure = word
+                        .is_none()
+                        .then_some(InstructionResult::FatalExternalError);
+                    (response, word, failure)
+                }) {
+                    Some((mut response, Some(word))) => {
+                        response.0 = word.to_be_bytes_vec();
+                        response
+                    }
+                    // Invalid length makes the requestor trap at this host read.
+                    _ => (vec![], VecReader::new(vec![]), ArbGas(0)),
+                }
+            }
+            EvmApiMethod::SetTrieSlots if !is_static => {
+                let mut data = data;
+                let gas_left = buffer::take_u64(&mut data);
+                let mut cost = 0;
+                while !data.is_empty() {
+                    let key = buffer::take_u256(&mut data);
+                    let value = buffer::take_u256(&mut data);
+                    let gas = gas_left.saturating_sub(cost);
+                    let mut request = gas.to_be_bytes().to_vec();
+                    request.extend(key.to_be_bytes::<32>());
+                    request.extend(value.to_be_bytes::<32>());
+                    let response =
+                        self.inspect_host_operation(opcode::SSTORE, &[value, key], gas, |evm| {
+                            let response =
+                                evm.request_inner(input.clone(), is_static, req_type, request);
+                            let failure = match response.0.as_slice() {
+                                [0] => None,
+                                [2] => Some(InstructionResult::OutOfGas),
+                                _ => Some(InstructionResult::FatalExternalError),
+                            };
+                            (response, None, failure)
+                        });
+                    let Some((response, _)) = response else {
+                        // The requestor treats an empty status as a host error.
+                        return (vec![], VecReader::new(vec![]), ArbGas(cost));
+                    };
+                    cost += response.2.0;
+                }
+                (vec![0], VecReader::new(vec![]), ArbGas(cost))
+            }
             EvmApiMethod::ContractCall | EvmApiMethod::DelegateCall | EvmApiMethod::StaticCall => {
                 self.handle_contract_call(input, is_static, req_type, data, |evm, frame_init| {
                     evm.inspect_run_exec_loop(frame_init)
@@ -788,11 +848,24 @@ where
             ),
 
             EvmApiMethod::EmitLog => {
-                self.handle_emit_log(input, data, |(evm, log): (&mut Self, Log)| {
-                    let (context, inspector) = evm.ctx_inspector();
+                let response = self.handle_emit_log(input, data, |(evm, log): (&mut Self, Log)| {
+                    let (context, inspector, frame) = evm.ctx_inspector_frame();
                     context.log(log.clone());
-                    inspector.log(context, log);
-                })
+                    inspector.log_full(&mut frame.interpreter, context, log);
+                });
+                if matches!(
+                    self.frame_stack().get().interpreter.bytecode.action,
+                    Some(InterpreterAction::Return(_))
+                ) {
+                    // A nonempty emit-log response stops Wasm at this host call,
+                    // before subsequent instructions or host effects can run.
+                    return (
+                        b"execution stopped by log inspector".to_vec(),
+                        VecReader::new(vec![]),
+                        ArbGas(0),
+                    );
+                }
+                response
             }
             _ => self.request_inner(input, is_static, req_type, data),
         }

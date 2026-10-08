@@ -22,6 +22,7 @@ pub mod result;
 pub mod state;
 pub mod stylus_api;
 pub mod stylus_executor;
+mod stylus_inspector;
 pub mod transaction;
 pub mod utils;
 
