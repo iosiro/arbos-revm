@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-10-09
+
+### Fixed
+
+- Match Nitro's Stylus account-code-hash semantics: return zero for nonexistent
+  accounts while preserving the empty-code hash for existing empty accounts,
+  including accounts touched within the current transaction.
+
 ## [0.1.0] - 2024-02-05
 
 ### Added

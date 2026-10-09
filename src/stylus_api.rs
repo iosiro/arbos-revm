@@ -15,7 +15,7 @@ use revm::{
         InterpreterAction, InterpreterResult, gas::warm_cold_cost, interpreter::EthInterpreter,
         interpreter_action::FrameInit,
     },
-    primitives::{Address, Log, U256, hardfork::SpecId},
+    primitives::{Address, B256, Log, U256, hardfork::SpecId},
 };
 use tracing::{debug, trace, warn};
 
@@ -723,13 +723,16 @@ where
 
             EvmApiMethod::AccountCodeHash => {
                 let address = buffer::take_address(&mut data);
-                // Use load_account to get the raw code_hash (KECCAK_EMPTY for no-code
-                // accounts) instead of Host::load_account_code_hash which applies
-                // EIP-1052 EXTCODEHASH semantics (B256::ZERO for empty accounts).
-                // The Stylus host wraps StateDB.GetCodeHash, not the EXTCODEHASH opcode.
+                // Nitro's StateDB.GetCodeHash returns zero for a missing account, but
+                // KECCAK_EMPTY for an existing empty account. Loading a missing account
+                // into REVM's journal alone does not make it exist; touching it does.
                 let account = context.journal_mut().load_account(address).unwrap();
                 let is_cold = account.is_cold;
-                let code_hash = account.data.info.code_hash;
+                let code_hash = if account.data.is_loaded_as_not_existing_not_touched() {
+                    B256::ZERO
+                } else {
+                    account.data.info.code_hash
+                };
                 let gas = wasm_account_touch(&mut *context, is_cold, false);
                 (code_hash.to_vec(), VecReader::new(vec![]), ArbGas(gas))
             }
