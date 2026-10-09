@@ -4,19 +4,107 @@
 //! Account info tests for Stylus programs (balance, code hash).
 
 use revm::{
-    context::result::ExecutionResult,
+    context::{JournalTr, journaled_state::account::JournaledAccountTr, result::ExecutionResult},
     primitives::{Address, B256, U256, keccak256},
+    state::AccountInfo,
 };
 
 mod test_utils;
 use test_utils::{
-    create_call_tx, create_evm, deploy_wat_program, execute_tx, fund_account,
+    TestContext, create_call_tx, create_evm, deploy_wat_program, execute_tx, fund_account,
     setup_context_with_arbos_state,
 };
 
 // ============================================================================
 // Account Balance Tests
 // ============================================================================
+
+fn assert_account_codehash(prepare: impl FnOnce(&mut TestContext, Address), expected: B256) {
+    let mut context = setup_context_with_arbos_state();
+    let program = deploy_wat_program(
+        &mut context,
+        include_bytes!("../test-data/account-info.wat"),
+    );
+    fund_account(
+        &mut context,
+        Address::repeat_byte(0x01),
+        U256::from(1_000_000_000_u64),
+    );
+    let address = Address::repeat_byte(0xDD);
+    prepare(&mut context, address);
+    let mut args = vec![0x01];
+    args.extend_from_slice(address.as_slice());
+    let result = execute_tx(
+        &mut create_evm(context),
+        create_call_tx(program, args, 10_000_000),
+    );
+    let ExecutionResult::Success { output, .. } = result else {
+        panic!("codehash call failed: {result:?}");
+    };
+    assert_eq!(output.data().as_ref(), expected.as_slice());
+}
+
+#[test]
+fn test_e2e_account_codehash_loaded_missing() {
+    assert_account_codehash(
+        |context, address| {
+            context.journaled_state.load_account(address).unwrap();
+        },
+        B256::ZERO,
+    );
+}
+
+#[test]
+fn test_e2e_account_codehash_existing_empty() {
+    assert_account_codehash(
+        |context, address| {
+            context
+                .journaled_state
+                .state
+                .insert(address, AccountInfo::default().into());
+        },
+        keccak256([]),
+    );
+}
+
+#[test]
+fn test_e2e_account_codehash_touched_empty() {
+    assert_account_codehash(
+        |context, address| {
+            context.journaled_state.load_account(address).unwrap();
+            context.journaled_state.touch_account(address);
+        },
+        keccak256([]),
+    );
+}
+
+#[test]
+fn test_e2e_account_codehash_reverted_touch() {
+    assert_account_codehash(
+        |context, address| {
+            context.journaled_state.load_account(address).unwrap();
+            let checkpoint = context.journaled_state.checkpoint();
+            context.journaled_state.touch_account(address);
+            context.journaled_state.checkpoint_revert(checkpoint);
+        },
+        B256::ZERO,
+    );
+}
+
+#[test]
+fn test_e2e_account_codehash_nonce_only() {
+    assert_account_codehash(
+        |context, address| {
+            context
+                .journaled_state
+                .load_account_mut(address)
+                .unwrap()
+                .data
+                .bump_nonce();
+        },
+        keccak256([]),
+    );
+}
 
 #[test]
 fn test_e2e_account_balance_zero() {
@@ -286,15 +374,10 @@ fn test_e2e_account_codehash_nonexistent() {
                 "codehash output should be 32 bytes"
             );
             let code_hash = B256::from_slice(output.data().as_ref());
-            // Stylus account_codehash wraps StateDB.GetCodeHash (not the EXTCODEHASH opcode).
-            // Non-existent accounts have code_hash = KECCAK_EMPTY in their default AccountInfo,
-            // so the Stylus host should return KECCAK_EMPTY, NOT B256::ZERO.
-            // (EIP-1052 EXTCODEHASH returns zero for non-existent accounts, but that's the
-            // opcode semantics — the Stylus host bypasses that and returns the raw field.)
-            let expected_empty_hash: B256 = keccak256([]);
             assert_eq!(
-                code_hash, expected_empty_hash,
-                "non-existent account code hash should be KECCAK_EMPTY (not B256::ZERO)"
+                code_hash,
+                B256::ZERO,
+                "Nitro returns zero for a non-existent account"
             );
         }
         ExecutionResult::Revert { output, .. } => {
