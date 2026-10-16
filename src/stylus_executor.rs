@@ -406,6 +406,15 @@ where
             }
         };
 
+        let inputs = InputsImpl {
+            target_address: stylus_ctx.target_address,
+            caller_address: stylus_ctx.caller_address,
+            input: CallInput::Bytes(stylus_ctx.calldata.clone()),
+            call_value: stylus_ctx.call_value,
+            bytecode_address: Some(stylus_ctx.bytecode_address),
+            depth: self.frame_stack().get().depth,
+        };
+
         let (stylus_config, compile_config, mut evm_data) = {
             let context = self.ctx();
 
@@ -434,13 +443,7 @@ where
 
             let evm_data = build_evm_data(
                 self.ctx(),
-                InputsImpl {
-                    target_address: stylus_ctx.target_address,
-                    caller_address: stylus_ctx.caller_address,
-                    input: CallInput::Bytes(stylus_ctx.calldata.clone()),
-                    call_value: stylus_ctx.call_value,
-                    bytecode_address: Some(stylus_ctx.target_address),
-                },
+                inputs.clone(),
                 module_hash,
                 l1_block_number,
                 reentrant,
@@ -525,14 +528,6 @@ where
                 false
             };
         let cached = program_info.cached || recent_cache_hit;
-
-        let inputs = InputsImpl {
-            target_address: stylus_ctx.target_address,
-            caller_address: stylus_ctx.caller_address,
-            input: CallInput::Bytes(Bytes::from(stylus_ctx.calldata.to_vec())),
-            call_value: stylus_ctx.call_value,
-            bytecode_address: Some(stylus_ctx.target_address),
-        };
 
         let (call_cost, stylus_open_pages) = {
             let context = self.ctx();

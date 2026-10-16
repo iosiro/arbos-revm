@@ -2,7 +2,7 @@
 
 use revm::{
     InspectEvm, Inspector,
-    bytecode::opcode,
+    bytecode::{Bytecode, opcode},
     context::{ContextTr, JournalTr},
     interpreter::{
         InstructionResult, Interpreter, InterpreterAction,
@@ -230,4 +230,141 @@ fn storage_read_inspector_termination_stops_wasm() {
         .unwrap();
     assert_eq!(result.output().unwrap().as_ref(), b"stop after load");
     assert_eq!(evm.0.inspector.logs, 0);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FrameLocation {
+    depth: usize,
+    target: Address,
+    bytecode: Option<Address>,
+    caller: Address,
+    is_static: bool,
+}
+
+impl FrameLocation {
+    fn from_interpreter(interp: &Interpreter) -> Self {
+        Self {
+            depth: interp.input.depth,
+            target: interp.input.target_address,
+            bytecode: interp.input.bytecode_address,
+            caller: interp.input.caller_address,
+            is_static: interp.runtime_flag.is_static,
+        }
+    }
+}
+
+#[derive(Default)]
+struct DepthInspector {
+    frames: Vec<FrameLocation>,
+    loads: Vec<FrameLocation>,
+}
+
+impl Inspector<TestContext> for DepthInspector {
+    fn initialize_interp(&mut self, interp: &mut Interpreter, _: &mut TestContext) {
+        self.frames.push(FrameLocation::from_interpreter(interp));
+    }
+
+    fn step(&mut self, interp: &mut Interpreter, _: &mut TestContext) {
+        if interp.bytecode.opcode() == opcode::SLOAD {
+            self.loads.push(FrameLocation::from_interpreter(interp));
+        }
+    }
+}
+
+#[test]
+fn nested_stylus_calls_preserve_inspector_depth_and_storage_owner() {
+    for evm_leaf in [false, true] {
+        for mode in 0..=2 {
+            let mut ctx = setup_context_with_arbos_state();
+            let router = deploy_wat_program(&mut ctx, include_bytes!("../test-data/call.wat"));
+            let leaf = if evm_leaf {
+                let address = Address::repeat_byte(0x44);
+                ctx.journal_mut().load_account(address).unwrap();
+                ctx.journal_mut().set_code(
+                    address,
+                    Bytecode::new_legacy(Bytes::from_static(&[
+                        opcode::PUSH0,
+                        opcode::SLOAD,
+                        opcode::PUSH0,
+                        opcode::MSTORE,
+                        opcode::PUSH1,
+                        32,
+                        opcode::PUSH0,
+                        opcode::RETURN,
+                    ])),
+                );
+                address
+            } else {
+                deploy_wat_program(
+                    &mut ctx,
+                    br#"(module
+                        (import "vm_hooks" "storage_load_bytes32" (func $load (param i32 i32)))
+                        (import "vm_hooks" "write_result" (func $result (param i32 i32)))
+                        (memory (export "memory") 1 1)
+                        (func (export "user_entrypoint") (param i32) (result i32)
+                            (call $load (i32.const 0) (i32.const 32))
+                            (call $result (i32.const 32) (i32.const 32))
+                            i32.const 0))"#,
+                )
+            };
+            ctx.journal_mut()
+                .sstore(router, U256::ZERO, U256::from(99))
+                .unwrap();
+            ctx.journal_mut()
+                .sstore(leaf, U256::ZERO, U256::from(42))
+                .unwrap();
+            let sender = Address::repeat_byte(1);
+            fund_account(&mut ctx, sender, U256::from(10_000_000_000u64));
+
+            // Route through the same Stylus contract twice before entering the leaf.
+            // Every host call temporarily replaces the EVM frame stack.
+            let mut args = vec![mode];
+            args.extend_from_slice(router.as_slice());
+            args.push(mode);
+            args.extend_from_slice(leaf.as_slice());
+            let tx = create_call_tx(router, args, 10_000_000);
+            let mut plain = create_evm(ctx.clone());
+            let expected = execute_tx(&mut plain, tx.clone());
+            let mut inspected = create_evm(ctx).with_inspector(DepthInspector::default());
+            let actual = inspected.inspect_one_tx(tx.into()).unwrap();
+            assert!(
+                actual.is_success(),
+                "mode {mode}, EVM leaf {evm_leaf}: {actual:?}"
+            );
+            assert_eq!(actual, expected, "inspection must preserve output and gas");
+            assert_eq!(
+                U256::from_be_slice(actual.output().unwrap()),
+                U256::from(if mode == 2 { 99 } else { 42 })
+            );
+            let leaf_location = FrameLocation {
+                depth: 2,
+                target: if mode == 2 { router } else { leaf },
+                bytecode: Some(leaf),
+                caller: if mode == 2 { sender } else { router },
+                is_static: mode == 1,
+            };
+            assert_eq!(
+                inspected.0.inspector.frames,
+                vec![
+                    FrameLocation {
+                        depth: 0,
+                        target: router,
+                        bytecode: Some(router),
+                        caller: sender,
+                        is_static: false,
+                    },
+                    FrameLocation {
+                        depth: 1,
+                        target: router,
+                        bytecode: Some(router),
+                        caller: if mode == 2 { sender } else { router },
+                        is_static: mode == 1,
+                    },
+                    leaf_location.clone(),
+                ]
+            );
+            assert_eq!(inspected.0.inspector.loads, vec![leaf_location]);
+            assert_eq!(inspected.0.ctx.journal().state, plain.0.ctx.journal().state);
+        }
+    }
 }
