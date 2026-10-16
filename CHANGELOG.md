@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Upgrade to REVM 43.0.3, Alloy EVM 0.39.0, and Alloy consensus/EIPs 2.5.0.
+  Downstream integrations using exposed REVM types must upgrade alongside this crate.
+- Preserve frame depth and the executing bytecode address in Stylus host inputs,
+  including nested calls and delegate calls.
+
 ### Fixed
 
 - Match Nitro's Stylus account-code-hash semantics: return zero for nonexistent
